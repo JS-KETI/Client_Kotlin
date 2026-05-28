@@ -7,22 +7,30 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 
 /**
  * Cellular path 를 warm 상태로 유지하기 위한 UDP keepalive loop.
  *
- * 의도: 셀룰러 라디오의 idle 절전으로 인한 attach 지연을 방지.
- * 셀룰러 [Network] 가 살아있는 동안 [intervalMs] 마다 작은 UDP 패킷을 서버 측 relay 포트로 전송.
+ * 의도 (셀룰러 radio attach 유지): 셀룰러 라디오의 idle 절전 → 다음 attach 시 지연 발생 방지.
+ * Network 가 살아있는 동안 [intervalMs] 간격으로 작은 UDP 패킷을 relay 포트로 전송.
  *
- * 응답은 받지 않으며 패킷이 drop 되어도 무방 — 목적은 path 활성 유지.
+ * **NAT mapping 은 유지되지 않는다**: 매 tick 마다 새 [DatagramSocket] 을 생성하여
+ * `.use` 로 즉시 close. radio attach 만이 목적이며, Phase 6 의 rebind 직전에는
+ * 별도로 socket 을 생성한다 (codex Phase 5 medium #7 의도된 trade-off).
+ *
+ * 1-byte UDP payload — relay (UDP 4443) 입장에서는 invalid QUIC datagram 으로 인지되지만
+ * 단순 drop 되어 무해 (server-contract.md §11 묵시적 허용; codex Phase 5 low #9).
+ *
+ * 라이프사이클: 본 객체는 일회용 (one-shot). stop() 호출 후 동일 인스턴스 재사용 금지.
+ * start/stop 은 app lifecycle 에서 호출되며 동시 호출은 가정하지 않는다.
  *
  * 사용:
  *   val warmup = CellularWarmup(networkManager.cellularNetwork)
@@ -44,22 +52,27 @@ class CellularWarmup(
         loopJob = scope.launch { runLoop() }
     }
 
+    /** 일회용 — 호출 후 본 인스턴스 재사용 불가. */
     fun stop() {
         loopJob?.cancel()
         loopJob = null
+        scope.cancel()
     }
 
     private suspend fun runLoop() {
         Log.i(TAG, "warmup loop start (interval=${intervalMs}ms target=$targetHost:$targetPort)")
+        // 첫 tick 즉시 — 셀룰러를 처음부터 attach 상태로 시도 (codex low #8)
         while (currentCoroutineContext().isActive) {
+            cellularNetwork.value?.let { sendKeepAlive(it) }
             delay(intervalMs)
-            val network = cellularNetwork.value ?: continue   // 셀룰러 없으면 skip (정상 상태)
-            withContext(Dispatchers.IO) { sendKeepAlive(network) }
         }
     }
 
-    private fun sendKeepAlive(network: Network) {
-        // DNS resolve 도 cellular network 통해 — 다음 UDP 도 같은 path 로 라우팅 보장
+    /**
+     * IO 작업 — 본 클래스는 `scope = CoroutineScope(Dispatchers.IO)` 이므로 IO context 보장.
+     * suspend 시그니처로 IO 경계 명시화 (codex medium #6).
+     */
+    private suspend fun sendKeepAlive(network: Network) {
         val addresses = network.getAllByName(targetHost)
         check(addresses.isNotEmpty()) { "DNS resolve empty for $targetHost via cellular" }
 
@@ -75,7 +88,7 @@ class CellularWarmup(
         private const val TAG = "CellularWarmup"
         private const val DEFAULT_INTERVAL_MS: Long = 15_000
 
-        // 1-byte UDP payload — minimum keepalive packet
+        // 1-byte UDP payload — minimum keepalive packet (relay drops as invalid QUIC).
         private val KEEPALIVE_PAYLOAD = ByteArray(1)
     }
 }
