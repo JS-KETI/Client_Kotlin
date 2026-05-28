@@ -1,0 +1,91 @@
+# ─── Claude Code 개인 설정 (커스텀 슬래시 명령 + 환경 변수) ───
+.claude/
+
+# ─── 환경 변수 / 비밀 ───
+.env
+.env.*
+!.env.example
+*.env
+secrets/
+credentials/
+
+# ─── 서명 키 / 인증서 ───
+*.keystore
+*.jks
+*.key
+*.pem
+*.p12
+*.pfx
+keystore.properties
+release.properties
+signing.properties
+
+# ─── Android Studio / IntelliJ ───
+.idea/
+*.iml
+*.ipr
+*.iws
+.gradle/
+.cxx/
+local.properties
+captures/
+
+# ─── Gradle ───
+build/
+**/build/
+.gradletasknamecache
+gradle-app.setting
+
+# ─── Android 빌드 산출물 ───
+*.apk
+*.aab
+*.ap_
+*.dex
+out/
+release/
+debug/
+app/release/
+app/debug/
+
+# ─── 네이티브 / NDK ───
+.externalNativeBuild/
+.cxx/
+obj/
+
+# ─── Google Services / Firebase ───
+google-services.json
+**/google-services.json
+firebase-adminsdk-*.json
+GoogleService-Info.plist
+
+# ─── moq-ffi 패치 작업 영역 (Phase 1, 별도 클론) ───
+external/
+
+# ─── 시연용 산출물 (별도 배포 채널로 관리) ───
+dist/
+
+# ─── 로그 ───
+*.log
+hs_err_pid*
+*.dump
+crash-*.txt
+
+# ─── Kotlin ───
+.kotlin/
+
+# ─── OS ───
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+
+# ─── 에디터 ───
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─── 임시 파일 ───
+*.tmp
+*.bak
+*.orig
