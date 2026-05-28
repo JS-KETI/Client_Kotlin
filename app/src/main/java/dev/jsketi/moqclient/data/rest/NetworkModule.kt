@@ -57,4 +57,6 @@ object NetworkModule {
     }
 
     val deviceApi: DeviceApi by lazy { retrofit.create(DeviceApi::class.java) }
+
+    val deviceRepository: DeviceRepository by lazy { DeviceRepositoryImpl(deviceApi) }
 }
