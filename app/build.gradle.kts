@@ -1,4 +1,4 @@
-plugins {
+﻿plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
@@ -18,7 +18,7 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Server / MoQ relay endpoints — see plan/paths.md §3.
+        // Server / MoQ relay endpoints ??see plan/paths.md 짠3.
         buildConfigField("String", "SERVER_HOST", "\"moq.myyak.xyz\"")
         buildConfigField("int",    "REST_PORT",   "8443")
         buildConfigField("int",    "RELAY_PORT",  "4443")
@@ -63,6 +63,7 @@ android {
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.activity.compose)
 
     implementation(platform(libs.androidx.compose.bom))
@@ -74,7 +75,16 @@ dependencies {
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
 
-    // Networking — Retrofit + OkHttp + kotlinx-serialization (Phase 2~)
+    // CameraX
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
+
+    // MoQ — Phase 4 publisher adapter (stock Maven artifact; Phase 1 rebind AAR replaces this later)
+    implementation(libs.dev.moq)
+
+    // Networking ??Retrofit + OkHttp + kotlinx-serialization (Phase 2~)
     implementation(libs.retrofit)
     implementation(libs.retrofit.converter.kotlinx.serialization)
     implementation(libs.okhttp.logging.interceptor)
@@ -96,3 +106,5 @@ dependencies {
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
 }
+
+

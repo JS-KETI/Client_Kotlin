@@ -1,4 +1,4 @@
-[versions]
+﻿[versions]
 # Android Gradle Plugin / Kotlin
 agp = "8.7.3"
 kotlin = "2.0.21"
@@ -6,7 +6,9 @@ kotlin = "2.0.21"
 # AndroidX core
 coreKtx = "1.13.1"
 lifecycleRuntimeKtx = "2.8.7"
+lifecycleViewmodelCompose = "2.8.7"
 activityCompose = "1.9.3"
+camerax = "1.4.0"
 
 # Compose
 composeBom = "2024.10.01"
@@ -22,6 +24,9 @@ retrofit = "2.11.0"
 okhttp = "4.12.0"
 kotlinxSerialization = "1.7.3"
 
+# MoQ
+devMoq = "0.2.0"
+
 # Testing
 junit = "4.13.2"
 junitExt = "1.2.1"
@@ -30,6 +35,7 @@ espresso = "3.6.1"
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntimeKtx" }
+androidx-lifecycle-viewmodel-compose = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "lifecycleViewmodelCompose" }
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
 
 # Compose BOM — pins all compose-* artifact versions for us.
@@ -56,6 +62,9 @@ retrofit = { group = "com.squareup.retrofit2", name = "retrofit", version.ref = 
 retrofit-converter-kotlinx-serialization = { group = "com.squareup.retrofit2", name = "converter-kotlinx-serialization", version.ref = "retrofit" }
 okhttp-logging-interceptor = { group = "com.squareup.okhttp3", name = "logging-interceptor", version.ref = "okhttp" }
 kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
+
+# MoQ
+dev-moq = { group = "dev.moq", name = "moq", version.ref = "devMoq" }
 
 # Test
 junit = { group = "junit", name = "junit", version.ref = "junit" }
