@@ -1,12 +1,14 @@
 package dev.jsketi.moqclient.service
 
 import android.os.SystemClock
+import android.util.Log
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.LifecycleOwner
 import dev.jsketi.moqclient.data.camera.CameraEncoder
 import dev.jsketi.moqclient.data.moq.MoqPublisher
 import dev.jsketi.moqclient.data.network.CellularWarmup
 import dev.jsketi.moqclient.data.network.NetworkManager
+import dev.jsketi.moqclient.data.rest.TelemetryReporter
 import dev.jsketi.moqclient.data.rest.dto.DeviceSummary
 import dev.jsketi.moqclient.domain.model.PublishState
 import dev.jsketi.moqclient.domain.model.PublisherStatus
@@ -33,7 +35,8 @@ class PublisherRuntime(
     val networkManager: NetworkManager,
     private val cellularWarmupFactory: () -> CellularWarmup,
     val moqPublisher: MoqPublisher,
-    private val cameraEncoder: CameraEncoder
+    private val cameraEncoder: CameraEncoder,
+    private val telemetryReporter: TelemetryReporter
 ) {
     private val _status = MutableStateFlow(PublisherStatus())
     val status: StateFlow<PublisherStatus> = _status.asStateFlow()
@@ -72,6 +75,10 @@ class PublisherRuntime(
                 broadcastPath = summary.broadcastPath,
                 publishState = PublishState.CONNECTED
             )
+        }
+        val scope = checkNotNull(serviceScope) { "PublisherService is not running" }
+        scope.launch(Dispatchers.IO) {
+            reportTelemetry(_status.value)
         }
     }
 
@@ -182,13 +189,22 @@ class PublisherRuntime(
                 previousBytes = currentBytes
                 secondsSinceBpsSample = 0
                 updateStatus { it.copy(uptimeSeconds = uptimeSeconds, txBps = bps) }
+                reportTelemetry(_status.value)
             } else {
                 updateStatus { it.copy(uptimeSeconds = uptimeSeconds) }
             }
         }
     }
 
+    private suspend fun reportTelemetry(status: PublisherStatus) {
+        if (status.deviceId.isBlank()) return
+        telemetryReporter.report(status).onFailure { error ->
+            Log.w(TAG, "telemetry report skipped: ${error.message}", error)
+        }
+    }
+
     companion object {
+        private const val TAG = "PublisherRuntime"
         private const val CODEC_CONFIG_TIMEOUT_MS = 5_000L
         private const val TELEMETRY_INTERVAL_SECONDS = 3
     }

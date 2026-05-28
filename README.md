@@ -45,19 +45,32 @@ MoQ(Media over QUIC) 기반 publisher 안드로이드 앱. 기존 Jetson + Rust 
    adb install -r app/build/outputs/apk/debug/app-debug.apk
    ```
 
-4. **릴리즈 APK** (서명 설정 — Phase 9):
+4. **릴리즈 APK**:
 
    ```bash
    ./gradlew assembleRelease
    ```
+
+   서명된 APK가 필요하면 기본 경로 `~/.keystores/moqclient.keystore`에 keystore를 두고
+   아래 환경 변수를 설정한다. `MOQCLIENT_KEYSTORE_PATH`는 생략 가능하다.
+
+   ```powershell
+   $env:MOQCLIENT_KEYSTORE_PATH="$env:USERPROFILE\.keystores\moqclient.keystore"
+   $env:MOQCLIENT_KEYSTORE_PASSWORD="<store-password>"
+   $env:MOQCLIENT_KEY_ALIAS="<key-alias>"
+   $env:MOQCLIENT_KEY_PASSWORD="<key-password>"
+   .\gradlew.bat assembleRelease copyReleaseApkToDist
+   ```
+
+   서명 정보가 없으면 `app-release-unsigned.apk`가 생성된다.
 
 산출물 경로:
 
 | 산출물 | 위치 |
 |---|---|
 | 디버그 APK | `app/build/outputs/apk/debug/app-debug.apk` |
-| 릴리즈 APK | `app/build/outputs/apk/release/app-release.apk` |
-| 시연 배포본 | `dist/moqclient-<version>.apk` (수동 복사) |
+| 릴리즈 APK | `app/build/outputs/apk/release/app-release.apk` 또는 `app-release-unsigned.apk` |
+| 시연 배포본 | `dist/moqclient-<version>.apk` (`copyReleaseApkToDist`) |
 
 ## BuildConfig 상수
 

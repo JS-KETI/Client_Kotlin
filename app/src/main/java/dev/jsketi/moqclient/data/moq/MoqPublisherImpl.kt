@@ -41,6 +41,10 @@ class MoqPublisherImpl : MoqPublisher {
             _sessionState.value = MoqSessionState.CONNECTING
             Log.d(TAG, "connect(): relay=$relayUrl broadcast=$broadcastPath")
 
+            check(isMoqBindingAvailable()) {
+                "uniffi.moq.MoqClient is missing. Build Phase 1 moq-rebind AAR and add it to app/libs before real MoQ publish."
+            }
+
             // Restore when uniffi.moq AAR is on the classpath:
             // val moqClient = uniffi.moq.MoqClient()
             // val prod      = uniffi.moq.MoqOriginProducer()
@@ -59,6 +63,9 @@ class MoqPublisherImpl : MoqPublisher {
         }
 
     override suspend fun publishMedia(codecString: String, sps: ByteArray, pps: ByteArray) {
+        check(isMoqBindingAvailable()) {
+            "uniffi.moq bindings missing; publishMedia cannot run without Phase 1 AAR"
+        }
         val initBytes = CatalogBuilder.buildInitBytes(sps, pps)
         Log.d(TAG, "publishMedia(): codec=$codecString initSize=${initBytes.size}")
 
@@ -72,6 +79,9 @@ class MoqPublisherImpl : MoqPublisher {
         presentationTimeUs: Long,
         isKeyframe: Boolean,
     ) {
+        check(isMoqBindingAvailable()) {
+            "uniffi.moq bindings missing; writeFrame cannot run without Phase 1 AAR"
+        }
         // Restore when uniffi.moq AAR is on the classpath:
         // val producer = requireNotNull(mediaProducer as? uniffi.moq.MoqMediaProducer)
         // producer.writeFrame(payload, presentationTimeUs.toULong())
@@ -86,6 +96,10 @@ class MoqPublisherImpl : MoqPublisher {
         throw NotImplementedError(
             "rebind() requires Phase 1 moq-ffi rebind patch AAR; will be wired in Phase 6"
         )
+    }
+
+    private fun isMoqBindingAvailable(): Boolean {
+        return runCatching { Class.forName("uniffi.moq.MoqClient") }.isSuccess
     }
 
     override suspend fun finish() {

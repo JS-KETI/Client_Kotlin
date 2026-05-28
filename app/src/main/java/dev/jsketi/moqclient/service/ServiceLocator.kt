@@ -7,6 +7,7 @@ import dev.jsketi.moqclient.data.network.CellularWarmup
 import dev.jsketi.moqclient.data.network.NetworkManagerImpl
 import dev.jsketi.moqclient.data.rest.DeviceIdentityStore
 import dev.jsketi.moqclient.data.rest.NetworkModule
+import dev.jsketi.moqclient.data.rest.TelemetryReporter
 import dev.jsketi.moqclient.domain.usecase.ConnectUseCase
 import dev.jsketi.moqclient.domain.usecase.StreamToggleUseCase
 import dev.jsketi.moqclient.domain.usecase.SwitchNetworkUseCase
@@ -48,7 +49,8 @@ object ServiceLocator {
             networkManager = networkManager,
             cellularWarmupFactory = { CellularWarmup(networkManager.cellularNetwork) },
             moqPublisher = MoqPublisherImpl(),
-            cameraEncoder = CameraEncoderImpl(appContext)
+            cameraEncoder = CameraEncoderImpl(appContext),
+            telemetryReporter = TelemetryReporter(appContext, NetworkModule.deviceRepository)
         )
     }
 }

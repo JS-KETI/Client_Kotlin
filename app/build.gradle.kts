@@ -5,6 +5,25 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
+val appVersionName = "0.1.0"
+val releaseKeystorePath = providers.environmentVariable("MOQCLIENT_KEYSTORE_PATH")
+    .orElse(providers.gradleProperty("MOQCLIENT_KEYSTORE_PATH"))
+    .orElse("${System.getProperty("user.home")}\\.keystores\\moqclient.keystore")
+    .get()
+val releaseKeystorePassword = providers.environmentVariable("MOQCLIENT_KEYSTORE_PASSWORD")
+    .orElse(providers.gradleProperty("MOQCLIENT_KEYSTORE_PASSWORD"))
+    .orNull
+val releaseKeyAlias = providers.environmentVariable("MOQCLIENT_KEY_ALIAS")
+    .orElse(providers.gradleProperty("MOQCLIENT_KEY_ALIAS"))
+    .orNull
+val releaseKeyPassword = providers.environmentVariable("MOQCLIENT_KEY_PASSWORD")
+    .orElse(providers.gradleProperty("MOQCLIENT_KEY_PASSWORD"))
+    .orNull
+val hasReleaseSigning = file(releaseKeystorePath).isFile &&
+    !releaseKeystorePassword.isNullOrBlank() &&
+    !releaseKeyAlias.isNullOrBlank() &&
+    !releaseKeyPassword.isNullOrBlank()
+
 android {
     namespace = "dev.jsketi.moqclient"
     compileSdk = 34
@@ -14,7 +33,7 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 1
-        versionName = "0.1.0"
+        versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -26,12 +45,27 @@ android {
         buildConfigField("String", "STREAM_ID",   "\"main\"")
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseKeystorePath)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
         }
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -102,4 +136,12 @@ dependencies {
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+}
+
+tasks.register<Copy>("copyReleaseApkToDist") {
+    dependsOn("assembleRelease")
+    val releaseApkName = if (hasReleaseSigning) "app-release.apk" else "app-release-unsigned.apk"
+    from(layout.buildDirectory.file("outputs/apk/release/$releaseApkName"))
+    into(rootProject.layout.projectDirectory.dir("dist"))
+    rename { "moqclient-$appVersionName.apk" }
 }
