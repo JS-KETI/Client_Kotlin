@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.util.Size
+import android.view.Surface
 import androidx.annotation.MainThread
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -141,14 +142,18 @@ class CameraEncoderImpl(
                         )
                     )
                     .build()
+                val targetRotation = previewView.display?.rotation ?: Surface.ROTATION_0
 
                 val preview = Preview.Builder()
                     .setResolutionSelector(resolutionSelector)
+                    .setTargetRotation(targetRotation)
                     .build()
                     .apply { setSurfaceProvider(previewView.surfaceProvider) }
 
                 val analysis = ImageAnalysis.Builder()
                     .setResolutionSelector(resolutionSelector)
+                    .setTargetRotation(targetRotation)
+                    .setOutputImageRotationEnabled(true)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                     .build()
