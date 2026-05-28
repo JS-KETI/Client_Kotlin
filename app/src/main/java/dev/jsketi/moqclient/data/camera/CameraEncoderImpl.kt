@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.util.Size
 import androidx.annotation.MainThread
@@ -53,6 +55,7 @@ import java.util.concurrent.Executors
  * 라이프사이클 안전성:
  *   - 모든 start/stop/feed/init 경로는 lifecycleLock 으로 직렬화.
  *   - stopping flag 로 stop() 진입 즉시 후속 호출 short-circuit.
+ *   - generation 카운터로 stale providerFuture 콜백 방지.
  *   - MediaCodec 호출은 IllegalStateException 을 release 와의 race 로만 한정 swallow.
  */
 class CameraEncoderImpl(
@@ -76,6 +79,8 @@ class CameraEncoderImpl(
     private val lifecycleLock = Any()
 
     @Volatile private var stopping: Boolean = false
+    // Incremented on each start() so stale providerFuture callbacks from a previous session bail out.
+    @Volatile private var generation: Int = 0
     @Volatile private var encoder: MediaCodec? = null
     @Volatile private var encoderWidth: Int = 0
     @Volatile private var encoderHeight: Int = 0
@@ -94,6 +99,7 @@ class CameraEncoderImpl(
                 "CameraEncoder already started; call stop() before reusing"
             }
             stopping = false
+            generation++
             spsBytes = null
             ppsBytes = null
             _codecConfig.value = null
@@ -101,9 +107,10 @@ class CameraEncoderImpl(
             cameraExecutor = Executors.newSingleThreadExecutor()
             encoderScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+            val capturedGen = generation
             val providerFuture = ProcessCameraProvider.getInstance(context)
             providerFuture.addListener(
-                { onProviderReady(providerFuture, lifecycleOwner, previewView) },
+                { onProviderReady(providerFuture, lifecycleOwner, previewView, capturedGen) },
                 ContextCompat.getMainExecutor(context)
             )
         }
@@ -113,14 +120,19 @@ class CameraEncoderImpl(
     private fun onProviderReady(
         providerFuture: ListenableFuture<ProcessCameraProvider>,
         lifecycleOwner: LifecycleOwner,
-        previewView: PreviewView
+        previewView: PreviewView,
+        expectedGen: Int
     ) {
         synchronized(lifecycleLock) {
-            if (stopping) return
+            // stop() → start() before providerFuture resolved: stale callback, bail out.
+            if (generation != expectedGen || stopping) return
             val executor = cameraExecutor
                 ?: error("cameraExecutor null in onProviderReady (start() 이후 stop() 없이 호출되어야 함)")
             try {
                 val provider = providerFuture.get()
+                // Assign early so cleanupInternalLocked() can unbind even if bindToLifecycle throws.
+                cameraProvider = provider
+
                 val resolutionSelector = ResolutionSelector.Builder()
                     .setResolutionStrategy(
                         ResolutionStrategy(
@@ -149,7 +161,6 @@ class CameraEncoderImpl(
                     preview,
                     analysis
                 )
-                cameraProvider = provider
             } catch (t: Throwable) {
                 Log.e(TAG, "camera bind failed; cleaning up before rethrow", t)
                 cleanupInternalLocked()
@@ -193,22 +204,33 @@ class CameraEncoderImpl(
     /**
      * ImageAnalysis 콜백 — cameraExecutor 단일 스레드.
      * 첫 frame 도착 시점에 encoder lazy init.
+     *
+     * lifecycleLock 을 encoder 페칭부터 queueImage 완료까지 유지한다.
+     * stop() 이 중간에 codec 을 release 하면 queueImage 내부의 IllegalStateException 으로
+     * 안전하게 short-circuit 된다.
      */
     private fun feedFrame(image: ImageProxy) {
         try {
             if (stopping) return
-            val codec = synchronized(lifecycleLock) {
-                if (stopping) return@synchronized null
+            synchronized(lifecycleLock) {
+                if (stopping) return
                 if (encoder == null) initializeEncoderLocked(image.width, image.height)
-                encoder
-            } ?: return
+                val codec = encoder ?: return
 
-            // lazy init 후 해상도는 첫 frame 으로 고정. 이후 frame 이 다른 해상도면 즉시 fail-fast.
-            check(image.width == encoderWidth && image.height == encoderHeight) {
-                "ImageProxy resolution changed: ${image.width}x${image.height} vs encoder ${encoderWidth}x$encoderHeight"
+                // lazy init 후 해상도는 첫 frame 으로 고정. 이후 frame 이 다른 해상도면 즉시 fail-fast.
+                check(image.width == encoderWidth && image.height == encoderHeight) {
+                    "ImageProxy resolution changed: ${image.width}x${image.height} vs encoder ${encoderWidth}x$encoderHeight"
+                }
+
+                try {
+                    queueImage(codec, image)
+                } catch (e: IllegalStateException) {
+                    // codec released concurrently during stop() — safe to ignore
+                } catch (t: Throwable) {
+                    Log.e(TAG, "unexpected error in feedFrame; stopping encoder", t)
+                    Handler(Looper.getMainLooper()).post { stop() }
+                }
             }
-
-            queueImage(codec, image)
         } finally {
             image.close()
         }
@@ -247,14 +269,19 @@ class CameraEncoderImpl(
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
             )
         }
-        return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
-            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        try {
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        } catch (t: Throwable) {
+            codec.release()
+            throw t
         }
+        return codec
     }
 
     /**
      * dequeueInputBuffer 가 성공한 뒤에는 try/finally 로 queueInputBuffer 를 무조건 호출하여
-     * 인코더 input slot 을 복구한다 (codex high #4 mitigation).
+     * 인코더 input slot 을 복구한다.
      */
     private fun queueImage(codec: MediaCodec, image: ImageProxy) {
         val inputIndex = try {
@@ -283,6 +310,7 @@ class CameraEncoderImpl(
     private suspend fun drainEncoderOutput(codec: MediaCodec) {
         val info = MediaCodec.BufferInfo()
         while (currentCoroutineContext().isActive) {
+            if (stopping) return
             val index = try {
                 codec.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US)
             } catch (e: IllegalStateException) {
@@ -292,6 +320,7 @@ class CameraEncoderImpl(
             when {
                 index == MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                 index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    if (stopping) return
                     val format = try {
                         codec.outputFormat
                     } catch (e: IllegalStateException) {
@@ -299,7 +328,10 @@ class CameraEncoderImpl(
                     }
                     handleFormatChange(format)
                 }
-                index >= 0 -> handleOutputBuffer(codec, index, info)
+                index >= 0 -> {
+                    if (stopping) return
+                    handleOutputBuffer(codec, index, info)
+                }
             }
         }
     }
@@ -309,6 +341,7 @@ class CameraEncoderImpl(
         index: Int,
         info: MediaCodec.BufferInfo
     ) {
+        if (stopping) return
         val buffer = try {
             codec.getOutputBuffer(index)
         } catch (e: IllegalStateException) {
@@ -331,12 +364,14 @@ class CameraEncoderImpl(
         val isKeyframe = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
 
         if (isCodecConfig) {
+            if (stopping) return
             val (sps, pps) = parseSpsPpsFromPayload(payload)
                 ?: error("CODEC_CONFIG payload yielded no SPS(7)+PPS(8) (size=${payload.size})")
             publishCodecConfig(sps, pps)
             return
         }
 
+        if (stopping) return
         val emitted = _encodedFrames.tryEmit(
             EncodedFrame(
                 payload = payload,
@@ -351,6 +386,7 @@ class CameraEncoderImpl(
     }
 
     private fun handleFormatChange(format: MediaFormat) {
+        if (stopping) return
         val spsBuf = format.getByteBuffer("csd-0")
             ?: error("OUTPUT_FORMAT_CHANGED but csd-0 (SPS) missing")
         val ppsBuf = format.getByteBuffer("csd-1")
@@ -364,7 +400,7 @@ class CameraEncoderImpl(
 
     /**
      * BUFFER_FLAG_CODEC_CONFIG payload 를 NALU 들로 split 한 후 NAL header 의 low 5 bits 로
-     * SPS(7) / PPS(8) 을 식별. AUD/SEI 가 섞여 있어도 안전 (codex medium #6 mitigation).
+     * SPS(7) / PPS(8) 을 식별. AUD/SEI 가 섞여 있어도 안전.
      */
     private fun parseSpsPpsFromPayload(payload: ByteArray): Pair<ByteArray, ByteArray>? {
         var sps: ByteArray? = null
@@ -425,6 +461,7 @@ class CameraEncoderImpl(
     }
 
     private fun publishCodecConfig(spsClean: ByteArray, ppsClean: ByteArray) {
+        if (stopping) return
         if (spsBytes != null) return  // 한 번만 publish
         spsBytes = spsClean
         ppsBytes = ppsClean
