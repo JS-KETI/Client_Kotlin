@@ -1,6 +1,7 @@
 package dev.jsketi.moqclient.ui.components
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.Button
@@ -18,39 +19,59 @@ fun ActionButtons(
     publishState: PublishState,
     onConnect: () -> Unit,
     onToggleStream: () -> Unit,
+    onDisconnect: () -> Unit,
     onSwitchNetwork: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val isConnected = publishState == PublishState.CONNECTED || publishState == PublishState.STREAMING
     val isStreaming = publishState == PublishState.STREAMING
     val isConnecting = publishState == PublishState.CONNECTING
+    val canDisconnect = isConnected || publishState == PublishState.ERROR
 
-    Row(
+    Column(
         modifier = modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Button(
-            onClick = onConnect,
-            enabled = publishState == PublishState.IDLE || publishState == PublishState.ERROR,
-            modifier = Modifier.weight(1f)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text(if (isConnecting) "연결 중..." else "Connect 수립")
+            Button(
+                onClick = onConnect,
+                enabled = publishState == PublishState.IDLE || publishState == PublishState.ERROR,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(if (isConnecting) "연결 중..." else "Connect 수립")
+            }
+
+            OutlinedButton(
+                onClick = onDisconnect,
+                enabled = canDisconnect,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Connection 중단")
+            }
         }
 
-        Button(
-            onClick = onToggleStream,
-            enabled = isConnected,
-            modifier = Modifier.weight(1f)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text(if (isStreaming) "송출 중단" else "영상 송출 시작")
-        }
+            Button(
+                onClick = onToggleStream,
+                enabled = isConnected,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(if (isStreaming) "영상 송출 중단" else "영상 송출 시작")
+            }
 
-        OutlinedButton(
-            onClick = onSwitchNetwork,
-            enabled = isConnected,
-            modifier = Modifier.weight(1f)
-        ) {
-            Text("네트워크 전환")
+            OutlinedButton(
+                onClick = onSwitchNetwork,
+                enabled = isConnected,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("네트워크 전환")
+            }
         }
     }
 }
@@ -63,6 +84,7 @@ private fun ActionButtonsIdlePreview() {
             publishState = PublishState.IDLE,
             onConnect = {},
             onToggleStream = {},
+            onDisconnect = {},
             onSwitchNetwork = {}
         )
     }
@@ -76,6 +98,7 @@ private fun ActionButtonsStreamingPreview() {
             publishState = PublishState.STREAMING,
             onConnect = {},
             onToggleStream = {},
+            onDisconnect = {},
             onSwitchNetwork = {}
         )
     }

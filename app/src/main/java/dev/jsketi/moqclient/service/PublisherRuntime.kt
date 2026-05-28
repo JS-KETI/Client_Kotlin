@@ -31,8 +31,11 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import retrofit2.HttpException
 
 class PublisherRuntime(
     val networkManager: NetworkManager,
@@ -55,6 +58,8 @@ class PublisherRuntime(
     private var startedAtElapsedMs: Long = 0L
     private var streamStarted: Boolean = false
     private var serverRegistered: Boolean = false
+    private var moqCatalogPublished: Boolean = false
+    private val operationMutex = Mutex()
 
     fun attachServiceLifecycleOwner(owner: LifecycleOwner) {
         lifecycleOwner = owner
@@ -113,8 +118,16 @@ class PublisherRuntime(
 
     suspend fun stopServiceLifecycle() {
         try {
-            stopStream().getOrThrow()
-            moqPublisher.finish()
+            operationMutex.withLock {
+                stopStreamLocked().getOrThrow()
+                deleteServerRegistration(_status.value.deviceId)
+                    .onFailure { error ->
+                        Log.w(TAG, "device delete skipped during service stop: ${error.message}", error)
+                    }
+                serverRegistered = false
+                moqCatalogPublished = false
+                moqPublisher.finish()
+            }
         } finally {
             metricsJob?.cancelAndJoin()
             metricsJob = null
@@ -129,7 +142,11 @@ class PublisherRuntime(
         }
     }
 
-    suspend fun startStream(): Result<Unit> = runCatching {
+    suspend fun startStream(): Result<Unit> = operationMutex.withLock {
+        startStreamLocked()
+    }
+
+    private suspend fun startStreamLocked(): Result<Unit> = runCatching {
         check(!streamStarted) { "stream already started" }
         val owner = checkNotNull(lifecycleOwner) { "PublisherService lifecycle owner is not attached" }
         val preview = checkNotNull(previewView) { "Camera PreviewView is not attached" }
@@ -142,9 +159,16 @@ class PublisherRuntime(
             val config = withTimeout(CODEC_CONFIG_TIMEOUT_MS) {
                 cameraEncoder.codecConfig.filterNotNull().first()
             }
-            moqPublisher.publishMedia(config.codecString, config.sps, config.pps)
+            if (!moqCatalogPublished) {
+                moqPublisher.publishMedia(config.codecString, config.sps, config.pps)
+            }
             frameJob = scope.launch(Dispatchers.IO) {
+                var hasSentKeyframe = false
                 cameraEncoder.encodedFrames.collect { frame ->
+                    if (!hasSentKeyframe && !frame.isKeyframe) {
+                        return@collect
+                    }
+                    hasSentKeyframe = true
                     moqPublisher.writeFrame(
                         payload = frame.payload,
                         presentationTimeUs = frame.presentationTimeUs,
@@ -155,10 +179,8 @@ class PublisherRuntime(
             withTimeout(MOQ_SESSION_CONNECTED_TIMEOUT_MS) {
                 moqPublisher.sessionState.first { it == MoqSessionState.CONNECTED }
             }
-            val summary = deviceRepository
-                .register(identityStore.buildRegisterRequest())
-                .getOrThrow()
-            serverRegistered = true
+            moqCatalogPublished = true
+            val summary = ensureServerRegistered()
             streamStarted = true
             updateStatus {
                 it.copy(
@@ -169,22 +191,48 @@ class PublisherRuntime(
             }
             reportTelemetry(_status.value)
         } catch (t: Throwable) {
+            frameJob?.cancelAndJoin()
+            frameJob = null
             withContext(Dispatchers.Main.immediate) {
                 cameraEncoder.stop()
             }
             moqPublisher.finish()
+            moqCatalogPublished = false
             throw t
         }
     }
 
-    suspend fun stopStream(): Result<Unit> = runCatching {
+    suspend fun disconnect(): Result<Unit> = operationMutex.withLock {
+        disconnectLocked()
+    }
+
+    private suspend fun disconnectLocked(): Result<Unit> = runCatching {
+        stopStreamLocked().getOrThrow()
+        deleteServerRegistration(_status.value.deviceId).getOrThrow()
+        moqPublisher.finish()
+        serverRegistered = false
+        moqCatalogPublished = false
+        updateStatus {
+            it.copy(
+                deviceId = "",
+                broadcastPath = "",
+                publishState = PublishState.IDLE,
+                txBps = 0L
+            )
+        }
+    }
+
+    suspend fun stopStream(): Result<Unit> = operationMutex.withLock {
+        stopStreamLocked()
+    }
+
+    private suspend fun stopStreamLocked(): Result<Unit> = runCatching {
         frameJob?.cancelAndJoin()
         frameJob = null
         if (streamStarted) {
             withContext(Dispatchers.Main.immediate) {
                 cameraEncoder.stop()
             }
-            moqPublisher.finish()
             streamStarted = false
             updateStatus {
                 it.copy(
@@ -192,6 +240,37 @@ class PublisherRuntime(
                 )
             }
         }
+    }
+
+    private suspend fun deleteServerRegistration(deviceId: String): Result<Unit> = runCatching {
+        if (deviceId.isBlank()) return@runCatching
+        deviceRepository.delete(deviceId).getOrThrow()
+        Log.i(TAG, "device deleted from monitoring: $deviceId")
+    }
+
+    private suspend fun ensureServerRegistered(): DeviceSummary {
+        val request = identityStore.buildRegisterRequest()
+
+        if (serverRegistered) {
+            deviceRepository.findById(request.deviceId)
+                .onSuccess { return it }
+                .onFailure { error ->
+                    Log.w(TAG, "server registration was stale; registering again: ${error.message}")
+                    serverRegistered = false
+                }
+        }
+
+        return deviceRepository.register(request)
+            .recoverCatching { error ->
+                if (error is HttpException && error.code() == HTTP_CONFLICT) {
+                    Log.i(TAG, "device already registered; reusing server summary")
+                    deviceRepository.findById(request.deviceId).getOrThrow()
+                } else {
+                    throw error
+                }
+            }
+            .getOrThrow()
+            .also { serverRegistered = true }
     }
 
     private suspend fun runMetricsLoop() {
@@ -229,5 +308,6 @@ class PublisherRuntime(
         private const val CODEC_CONFIG_TIMEOUT_MS = 5_000L
         private const val MOQ_SESSION_CONNECTED_TIMEOUT_MS = 10_000L
         private const val TELEMETRY_INTERVAL_SECONDS = 3
+        private const val HTTP_CONFLICT = 409
     }
 }

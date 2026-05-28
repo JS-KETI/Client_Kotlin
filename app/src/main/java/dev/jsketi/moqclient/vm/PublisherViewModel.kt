@@ -65,6 +65,19 @@ class PublisherViewModel(
         }
     }
 
+    fun onDisconnect() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(errorMessage = null) }
+            runtime.disconnect()
+                .onFailure { error ->
+                    runtime.updateStatus { it.copy(publishState = PublishState.ERROR) }
+                    _uiState.update {
+                        it.copy(errorMessage = error.message)
+                    }
+                }
+        }
+    }
+
     fun onSwitchNetwork() {
         viewModelScope.launch {
             switchNetworkUseCase()

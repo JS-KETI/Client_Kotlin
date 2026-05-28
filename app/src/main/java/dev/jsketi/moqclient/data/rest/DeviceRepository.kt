@@ -22,4 +22,6 @@ interface DeviceRepository {
         request: DeviceTelemetryRequest
     ): Result<DeviceSummary>
     suspend fun findById(deviceId: String): Result<DeviceSummary>
+
+    suspend fun delete(deviceId: String): Result<Unit>
 }
