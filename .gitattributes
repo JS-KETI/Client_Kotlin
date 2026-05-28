@@ -1,0 +1,42 @@
+# Line ending normalization for cross-platform development.
+# Goal: keep repo blobs as LF, let Windows working trees handle CRLF only where required.
+
+* text=auto eol=lf
+
+# Shell scripts must remain LF (executed on Linux/macOS CI and developer machines).
+gradlew         text eol=lf
+*.sh            text eol=lf
+
+# Windows batch / cmd scripts must remain CRLF.
+gradlew.bat     text eol=crlf
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+
+# Kotlin / Java / Android sources — LF.
+*.kt            text eol=lf
+*.kts           text eol=lf
+*.java          text eol=lf
+*.xml           text eol=lf
+
+# Config / docs — LF.
+*.properties    text eol=lf
+*.toml          text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+*.json          text eol=lf
+*.md            text eol=lf
+
+# Binary assets — never touch.
+*.jar           binary
+*.aar           binary
+*.apk           binary
+*.aab           binary
+*.keystore      binary
+*.jks           binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.webp          binary
+*.ico           binary
+*.so            binary
