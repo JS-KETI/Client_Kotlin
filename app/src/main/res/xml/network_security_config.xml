@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+        Default: cleartext (HTTP) traffic is denied. moq-relay (QUIC/UDP) and
+        Spring Boot REST (HTTPS) both terminate TLS at moq.myyak.xyz, so HTTP
+        should never be needed in production builds.
+    -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

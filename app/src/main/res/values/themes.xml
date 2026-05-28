@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose UI handles theming at runtime; this stub satisfies the manifest reference. -->
+    <style name="Theme.MoqClient" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
