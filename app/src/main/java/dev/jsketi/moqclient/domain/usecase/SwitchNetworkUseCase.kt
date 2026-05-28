@@ -21,32 +21,23 @@ import java.net.DatagramSocket
  * 실패는 silent 하지 않고 Result.failure 로 호출자에게 그대로 전파.
  *
  * **Wiring**:
- * [networkManager] 와 [moqPublisher] 는 ServiceLocator / Hilt / Application 에서 주입.
- * 둘 다 nullable 인 이유는 Phase 7 에서 만든 `PublisherViewModel.Factory` 의 default
- * `SwitchNetworkUseCase()` 호출과 호환 유지 위함. 실제 호출 시 의존성 부재면
- * checkNotNull() 로 fail-fast (Phase 8 에서 ServiceLocator 도입하며 완전 해소).
+ * [networkManager] 와 [moqPublisher] 는 ServiceLocator 에서 주입한다. Phase 8 이후
+ * nullable default constructor 는 제거되어 의존성 누락이 컴파일 단계에서 드러난다.
  */
 class SwitchNetworkUseCase(
-    private val networkManager: NetworkManager? = null,
-    private val moqPublisher: MoqPublisher? = null
+    private val networkManager: NetworkManager,
+    private val moqPublisher: MoqPublisher
 ) {
 
     suspend operator fun invoke(): Result<NetworkPath> = runCatching {
-        val nm = checkNotNull(networkManager) {
-            "SwitchNetworkUseCase: NetworkManager dependency missing — wire from Application/Service (Phase 8)"
-        }
-        val mp = checkNotNull(moqPublisher) {
-            "SwitchNetworkUseCase: MoqPublisher dependency missing — wire from Application/Service (Phase 8)"
-        }
-
-        val active = nm.activePath.value
+        val active = networkManager.activePath.value
         val target = when (active) {
             NetworkPath.WIFI -> NetworkPath.CELLULAR
             NetworkPath.CELLULAR -> NetworkPath.WIFI
         }
         val targetNetwork: Network = when (target) {
-            NetworkPath.WIFI -> nm.wifiNetwork.value
-            NetworkPath.CELLULAR -> nm.cellularNetwork.value
+            NetworkPath.WIFI -> networkManager.wifiNetwork.value
+            NetworkPath.CELLULAR -> networkManager.cellularNetwork.value
         } ?: error("cannot switch to $target — Network handle is not available")
 
         val socket = DatagramSocket()
@@ -56,9 +47,9 @@ class SwitchNetworkUseCase(
                 ?: error("DatagramSocket localSocketAddress is null after bind")
 
             // rebind 가 NotImplementedError 인 경우 그대로 throw → runCatching 이 Result.failure 로 감쌈.
-            mp.rebind(localAddress.toString()).getOrThrow()
+            moqPublisher.rebind(localAddress.toString()).getOrThrow()
 
-            nm.selectPath(target)
+            networkManager.selectPath(target)
             target
         } finally {
             socket.close()

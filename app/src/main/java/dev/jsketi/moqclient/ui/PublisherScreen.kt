@@ -1,5 +1,6 @@
 package dev.jsketi.moqclient.ui
 
+import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -18,6 +19,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.jsketi.moqclient.domain.model.NetworkPath
 import dev.jsketi.moqclient.domain.model.NetworkPathState
@@ -33,7 +35,9 @@ import dev.jsketi.moqclient.vm.PublisherViewModel
 
 @Composable
 fun PublisherScreen(
-    vm: PublisherViewModel = viewModel(factory = PublisherViewModel.Factory())
+    previewView: PreviewView,
+    viewModelFactory: ViewModelProvider.Factory,
+    vm: PublisherViewModel = viewModel(factory = viewModelFactory)
 ) {
     val uiState by vm.uiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -44,6 +48,7 @@ fun PublisherScreen(
 
     PublisherScreenContent(
         uiState = uiState,
+        previewView = previewView,
         snackbarHostState = snackbarHostState,
         onConnect = vm::onConnect,
         onToggleStream = vm::onToggleStream,
@@ -54,6 +59,7 @@ fun PublisherScreen(
 @Composable
 private fun PublisherScreenContent(
     uiState: PublisherUiState,
+    previewView: PreviewView?,
     snackbarHostState: SnackbarHostState,
     onConnect: () -> Unit,
     onToggleStream: () -> Unit,
@@ -77,7 +83,7 @@ private fun PublisherScreenContent(
             verticalArrangement = Arrangement.spacedBy(0.dp)
         ) {
             CameraPreview(
-                previewView = null,
+                previewView = previewView,
                 modifier = Modifier.fillMaxWidth()
             )
 
@@ -124,6 +130,7 @@ private fun PublisherScreenPreview() {
                 migrationCount = 2,
                 uptimeSeconds = 305L
             ),
+            previewView = null,
             snackbarHostState = SnackbarHostState(),
             onConnect = {},
             onToggleStream = {},

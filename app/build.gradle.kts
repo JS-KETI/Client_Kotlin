@@ -63,6 +63,7 @@ android {
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.service)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.activity.compose)
 
@@ -91,12 +92,6 @@ dependencies {
     // Phase 1 will build the patched AAR. When ready, replace this comment with:
     //   implementation(files("libs/moq-rebind-0.2.0+rebind.aar"))
     // MoqPublisherImpl stubs out the uniffi.moq.* calls until then.
-
-    // CameraX — Preview + ImageAnalysis (Phase 3~)
-    implementation(libs.androidx.camera.core)
-    implementation(libs.androidx.camera.camera2)
-    implementation(libs.androidx.camera.lifecycle)
-    implementation(libs.androidx.camera.view)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
