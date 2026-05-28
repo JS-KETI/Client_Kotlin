@@ -1,0 +1,111 @@
+diff --git a/rs/moq-ffi/src/session.rs b/rs/moq-ffi/src/session.rs
+index e7210d20..52ec9934 100644
+--- a/rs/moq-ffi/src/session.rs
++++ b/rs/moq-ffi/src/session.rs
+@@ -11,10 +11,11 @@ struct Client {
+ 	config: moq_native::ClientConfig,
+ 	publish: Option<Arc<MoqOriginProducer>>,
+ 	consume: Option<Arc<MoqOriginProducer>>,
++	native: Option<moq_native::Client>,
+ }
+ 
+ impl Client {
+-	async fn connect(&self, url: Url) -> Result<Arc<MoqSession>, MoqError> {
++	async fn connect(&mut self, url: Url) -> Result<Arc<MoqSession>, MoqError> {
+ 		let client = self
+ 			.config
+ 			.clone()
+@@ -31,11 +32,28 @@ impl Client {
+ 			.await
+ 			.map_err(|err| MoqError::Connect(format!("{err}")))?;
+ 
++		self.native = Some(client);
++
+ 		Ok(Arc::new(MoqSession {
+ 			inner: Some(session.clone()),
+ 			closed: Task::new(session),
+ 		}))
+ 	}
++
++	fn rebind(&self, addr: String) -> Result<(), MoqError> {
++		let parsed: std::net::SocketAddr = addr
++			.parse()
++			.map_err(|err| MoqError::Bind(format!("invalid rebind address: {err}")))?;
++		let socket = std::net::UdpSocket::bind(parsed)
++			.map_err(|err| MoqError::Bind(format!("socket bind failed: {err}")))?;
++		let native = self
++			.native
++			.as_ref()
++			.ok_or_else(|| MoqError::Connect("cannot rebind before connect".to_string()))?;
++		native
++			.rebind(socket)
++			.map_err(|err| MoqError::Bind(format!("{err}")))
++	}
+ }
+ 
+ #[derive(uniffi::Object)]
+@@ -54,6 +72,7 @@ impl MoqClient {
+ 				config: moq_native::ClientConfig::default(),
+ 				publish: None,
+ 				consume: None,
++				native: None,
+ 			}),
+ 		})
+ 	}
+@@ -85,7 +104,17 @@ impl MoqClient {
+ 	pub async fn connect(&self, url: String) -> Result<Arc<MoqSession>, MoqError> {
+ 		let url = Url::parse(&url)?;
+ 
+-		self.task.run(|state| async move { state.connect(url).await }).await
++		self.task.run(|mut state| async move { state.connect(url).await }).await
++	}
++
++	/// Rebind the active QUIC endpoint to a new local UDP socket address.
++	pub fn rebind(&self, addr: String) -> Result<(), MoqError> {
++		let _guard = crate::ffi::RUNTIME.enter();
++		let state = self
++			.task
++			.lock()
++			.ok_or_else(|| MoqError::Cancelled)?;
++		state.rebind(addr)
+ 	}
+ 
+ 	/// Cancel all current and future `connect()` calls.
+diff --git a/rs/moq-native/src/client.rs b/rs/moq-native/src/client.rs
+index 01951a49..bd2c614a 100644
+--- a/rs/moq-native/src/client.rs
++++ b/rs/moq-native/src/client.rs
+@@ -274,6 +274,18 @@ impl Client {
+ 		self
+ 	}
+ 
++	pub fn rebind(&self, socket: net::UdpSocket) -> anyhow::Result<()> {
++		#[cfg(feature = "quinn")]
++		if let Some(quinn) = self.quinn.as_ref() {
++			return quinn.rebind(socket);
++		}
++
++		#[cfg(not(feature = "quinn"))]
++		let _ = socket;
++
++		anyhow::bail!("rebind requires the quinn backend");
++	}
++
+ 	#[cfg(not(any(feature = "noq", feature = "quinn", feature = "quiche", feature = "iroh")))]
+ 	pub async fn connect(&self, _url: Url) -> anyhow::Result<moq_lite::Session> {
+ 		anyhow::bail!("no QUIC backend compiled; enable noq, quinn, quiche, or iroh feature");
+diff --git a/rs/moq-native/src/quinn.rs b/rs/moq-native/src/quinn.rs
+index 3ac07bd6..a9cb6da0 100644
+--- a/rs/moq-native/src/quinn.rs
++++ b/rs/moq-native/src/quinn.rs
+@@ -135,6 +135,10 @@ impl QuinnClient {
+ 
+ 		Ok(session)
+ 	}
++
++	pub fn rebind(&self, socket: std::net::UdpSocket) -> anyhow::Result<()> {
++		self.quic.rebind(socket).context("failed to rebind QUIC endpoint")
++	}
+ }
+ 
+ // ── Server ──────────────────────────────────────────────────────────
