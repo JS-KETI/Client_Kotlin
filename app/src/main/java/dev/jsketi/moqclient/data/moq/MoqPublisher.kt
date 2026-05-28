@@ -15,14 +15,15 @@ interface MoqPublisher {
     val sessionState: StateFlow<MoqSessionState>
 
     /**
-     * Establish a QUIC+MoQ session to the relay and declare the broadcast.
+     * Prepare the relay URL and broadcast path returned by REST registration.
+     * The actual QUIC+MoQ session is opened by publishMedia(), after codec init bytes exist.
      * @param relayUrl  value from DeviceSummary.relayUrl (e.g. "https://host:4443/anon")
      * @param broadcastPath value from DeviceSummary.broadcastPath (e.g. "ANDROID-A7F3/main")
      */
     suspend fun connect(relayUrl: String, broadcastPath: String): Result<Unit>
 
     /**
-     * Publish the media catalog (init segment) for the stream.
+     * Open the MoQ session and publish the media catalog (init segment) for the stream.
      * Must be called once after connect(), before the first writeFrame().
      * @param codecString  WebCodecs-compatible codec string, e.g. "avc1.640028"
      * @param sps          raw SPS NAL unit bytes (without start code)

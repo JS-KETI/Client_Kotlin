@@ -3,6 +3,7 @@ package dev.jsketi.moqclient.data.moq
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.withTimeout
 import uniffi.moq.MoqBroadcastProducer
 import uniffi.moq.MoqClient
 import uniffi.moq.MoqMediaProducer
@@ -14,7 +15,8 @@ private const val TAG = "MoqPublisherImpl"
 /**
  * Adapter: wraps moq-ffi UniFFI Kotlin bindings to the MoqPublisher port.
  *
- * Lifecycle: connect() -> publishMedia() -> writeFrame()* -> finish()
+ * Lifecycle: connect() prepares relay metadata, publishMedia() opens the MoQ session
+ * after the H.264 init bytes are available, then writeFrame()* -> finish().
  */
 class MoqPublisherImpl : MoqPublisher {
 
@@ -29,28 +31,17 @@ class MoqPublisherImpl : MoqPublisher {
     private var origin: MoqOriginProducer? = null
     private var broadcast: MoqBroadcastProducer? = null
     private var mediaProducer: MoqMediaProducer? = null
+    private var pendingRelayUrl: String? = null
+    private var pendingBroadcastPath: String? = null
 
     override suspend fun connect(relayUrl: String, broadcastPath: String): Result<Unit> =
         runCatching {
-            check(client == null) { "MoQ client is already connected" }
+            check(client == null) { "MoQ session is already connected" }
             _sessionState.value = MoqSessionState.CONNECTING
-            Log.d(TAG, "connect(): relay=$relayUrl broadcast=$broadcastPath")
-
-            val moqClient = MoqClient()
-            val producer = MoqOriginProducer()
-            val broadcastProducer = MoqBroadcastProducer()
-
-            producer.publish(broadcastPath, broadcastProducer)
-            moqClient.setPublish(producer)
-            client = moqClient
-            origin = producer
-            broadcast = broadcastProducer
-
-            val moqSession = moqClient.connect(relayUrl)
-
-            session = moqSession
+            pendingRelayUrl = relayUrl
+            pendingBroadcastPath = broadcastPath
             _sessionState.value = MoqSessionState.CONNECTED
-            Log.d(TAG, "connect(): session established")
+            Log.d(TAG, "connect(): prepared relay=$relayUrl broadcast=$broadcastPath")
             Unit
         }.onFailure { e ->
             closeHandles()
@@ -60,11 +51,39 @@ class MoqPublisherImpl : MoqPublisher {
         }
 
     override suspend fun publishMedia(codecString: String, sps: ByteArray, pps: ByteArray) {
-        check(mediaProducer == null) { "MoQ media track is already published" }
-        val broadcastProducer = checkNotNull(broadcast) { "MoQ broadcast is not connected" }
+        check(client == null) { "MoQ session is already connected" }
+        val relayUrl = checkNotNull(pendingRelayUrl) { "MoQ relay URL is not prepared" }
+        val broadcastPath = checkNotNull(pendingBroadcastPath) { "MoQ broadcast path is not prepared" }
         val initBytes = CatalogBuilder.buildInitBytes(sps, pps)
-        Log.d(TAG, "publishMedia(): codec=$codecString initSize=${initBytes.size}")
-        mediaProducer = broadcastProducer.publishMedia(codecString, initBytes)
+
+        _sessionState.value = MoqSessionState.CONNECTING
+        Log.d(TAG, "publishMedia(): relay=$relayUrl broadcast=$broadcastPath codec=$codecString initSize=${initBytes.size}")
+
+        try {
+            val moqClient = MoqClient()
+            val producer = MoqOriginProducer()
+            val broadcastProducer = MoqBroadcastProducer()
+            val media = broadcastProducer.publishMedia(codecString, initBytes)
+
+            producer.publish(broadcastPath, broadcastProducer)
+            moqClient.setPublish(producer)
+
+            client = moqClient
+            origin = producer
+            broadcast = broadcastProducer
+            mediaProducer = media
+
+            session = withTimeout(CONNECT_TIMEOUT_MS) {
+                moqClient.connect(relayUrl)
+            }
+            _sessionState.value = MoqSessionState.CONNECTED
+            Log.d(TAG, "publishMedia(): session established")
+        } catch (t: Throwable) {
+            closeHandles()
+            clearHandles()
+            _sessionState.value = MoqSessionState.FAILED
+            throw t
+        }
     }
 
     override suspend fun writeFrame(
@@ -117,5 +136,9 @@ class MoqPublisherImpl : MoqPublisher {
         origin = null
         session = null
         client = null
+    }
+
+    companion object {
+        private const val CONNECT_TIMEOUT_MS = 10_000L
     }
 }

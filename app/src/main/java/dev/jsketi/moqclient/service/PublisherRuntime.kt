@@ -154,6 +154,7 @@ class PublisherRuntime(
             withContext(Dispatchers.Main.immediate) {
                 cameraEncoder.stop()
             }
+            moqPublisher.finish()
             throw t
         }
     }
@@ -165,6 +166,7 @@ class PublisherRuntime(
             withContext(Dispatchers.Main.immediate) {
                 cameraEncoder.stop()
             }
+            moqPublisher.finish()
             streamStarted = false
             updateStatus {
                 it.copy(
