@@ -12,3 +12,14 @@ enum class NetworkPath {
     WIFI,
     CELLULAR
 }
+
+/**
+ * UI 표시용 path 상태 스냅샷.
+ *
+ * available 은 [NetworkManager.wifiNetwork] / [NetworkManager.cellularNetwork] 의
+ * Network 핸들 보유 여부와 1:1 대응.
+ */
+data class NetworkPathState(
+    val path: NetworkPath,
+    val available: Boolean
+)
