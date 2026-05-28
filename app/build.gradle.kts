@@ -43,6 +43,10 @@ android {
         buildConfigField("int",    "RELAY_PORT",  "4443")
         buildConfigField("String", "RELAY_PATH",  "\"/anon\"")
         buildConfigField("String", "STREAM_ID",   "\"main\"")
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     signingConfigs {
@@ -122,10 +126,9 @@ dependencies {
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
 
-    // MoQ: dev.moq:moq is not yet published to Maven Central.
-    // Phase 1 will build the patched AAR. When ready, replace this comment with:
-    //   implementation(files("libs/moq-rebind-0.2.0+rebind.aar"))
-    // MoqPublisherImpl stubs out the uniffi.moq.* calls until then.
+    // MoQ UniFFI bindings + native lib built from moq-ffi-v0.2.0 with rebind() patch.
+    implementation(files("libs/moq-rebind-0.2.0+rebind.aar"))
+    implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
 
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)

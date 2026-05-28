@@ -23,6 +23,7 @@ kotlinxSerialization = "1.7.3"
 
 # MoQ
 devMoq = "0.2.0"
+jna = "5.17.0"
 
 # Testing
 junit = "4.13.2"
@@ -63,6 +64,7 @@ kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 
 # MoQ
 dev-moq = { group = "dev.moq", name = "moq", version.ref = "devMoq" }
+jna = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
 
 # Test
 junit = { group = "junit", name = "junit", version.ref = "junit" }

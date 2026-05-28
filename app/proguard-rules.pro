@@ -5,6 +5,11 @@
 -dontwarn uniffi.moq.**
 -dontwarn org.mozilla.uniffi.**
 
+# UniFFI Kotlin bindings use JNA Native.register() and callback reflection.
+-keep class com.sun.jna.** { *; }
+-keepclassmembers class * implements com.sun.jna.Library { *; }
+-dontwarn com.sun.jna.**
+
 # Retrofit suspend interfaces and generic response envelopes.
 -keepattributes Signature, InnerClasses, EnclosingMethod, RuntimeVisibleAnnotations, RuntimeVisibleParameterAnnotations
 -keep interface dev.jsketi.moqclient.data.rest.DeviceApi { *; }

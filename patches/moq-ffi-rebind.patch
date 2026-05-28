@@ -1,5 +1,5 @@
 diff --git a/rs/moq-ffi/src/session.rs b/rs/moq-ffi/src/session.rs
-index e7210d20..52ec9934 100644
+index e7210d20..798bb414 100644
 --- a/rs/moq-ffi/src/session.rs
 +++ b/rs/moq-ffi/src/session.rs
 @@ -11,10 +11,11 @@ struct Client {
@@ -15,7 +15,18 @@ index e7210d20..52ec9934 100644
  		let client = self
  			.config
  			.clone()
-@@ -31,11 +32,28 @@ impl Client {
+@@ -24,18 +25,37 @@ impl Client {
+ 		let publish = self.publish.as_ref().map(|o| o.inner().consume());
+ 		let consume = self.consume.as_ref().map(|o| o.inner().clone());
+ 
+-		let session = client
++		let client = client
+ 			.with_publish(publish)
+-			.with_consume(consume)
++			.with_consume(consume);
++
++		let session = client
+ 			.connect(url)
  			.await
  			.map_err(|err| MoqError::Connect(format!("{err}")))?;
  
@@ -30,21 +41,21 @@ index e7210d20..52ec9934 100644
 +	fn rebind(&self, addr: String) -> Result<(), MoqError> {
 +		let parsed: std::net::SocketAddr = addr
 +			.parse()
-+			.map_err(|err| MoqError::Bind(format!("invalid rebind address: {err}")))?;
++			.map_err(|err| MoqError::Connect(format!("rebind: invalid address: {err}")))?;
 +		let socket = std::net::UdpSocket::bind(parsed)
-+			.map_err(|err| MoqError::Bind(format!("socket bind failed: {err}")))?;
++			.map_err(|err| MoqError::Connect(format!("rebind: socket bind failed: {err}")))?;
 +		let native = self
 +			.native
 +			.as_ref()
 +			.ok_or_else(|| MoqError::Connect("cannot rebind before connect".to_string()))?;
 +		native
 +			.rebind(socket)
-+			.map_err(|err| MoqError::Bind(format!("{err}")))
++			.map_err(|err| MoqError::Connect(format!("rebind failed: {err}")))
 +	}
  }
  
  #[derive(uniffi::Object)]
-@@ -54,6 +72,7 @@ impl MoqClient {
+@@ -54,6 +74,7 @@ impl MoqClient {
  				config: moq_native::ClientConfig::default(),
  				publish: None,
  				consume: None,
@@ -52,7 +63,7 @@ index e7210d20..52ec9934 100644
  			}),
  		})
  	}
-@@ -85,7 +104,17 @@ impl MoqClient {
+@@ -85,7 +106,17 @@ impl MoqClient {
  	pub async fn connect(&self, url: String) -> Result<Arc<MoqSession>, MoqError> {
  		let url = Url::parse(&url)?;
  

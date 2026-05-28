@@ -4,8 +4,8 @@ import kotlinx.coroutines.flow.StateFlow
 
 /**
  * Port (adapter pattern) for MoQ broadcast publishing.
- * MoqPublisherImpl adapts dev.moq:moq:0.2.0 to this interface.
- * rebind() requires the Phase 1 moq-ffi patched AAR and is stubbed until then.
+ * MoqPublisherImpl adapts the moq-ffi UniFFI AAR to this interface.
+ * rebind() requires the Phase 1 patched AAR.
  */
 interface MoqPublisher {
 
@@ -40,7 +40,7 @@ interface MoqPublisher {
 
     /**
      * Migrate the active QUIC session to a different network socket address.
-     * Requires Phase 1 moq-ffi rebind patch AAR — NOT available in stock dev.moq:moq:0.2.0.
+     * Requires Phase 1 moq-ffi rebind patch AAR, not available in stock dev.moq:moq:0.2.0.
      * @param socketAddress  local socket address to bind the new QUIC path, e.g. "[::]:0"
      */
     suspend fun rebind(socketAddress: String): Result<Unit>
