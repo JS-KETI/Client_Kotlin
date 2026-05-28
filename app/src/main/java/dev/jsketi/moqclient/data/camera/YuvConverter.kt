@@ -23,6 +23,10 @@ object YuvConverter {
         require(src.width == dst.width && src.height == dst.height) {
             "size mismatch src=${src.width}x${src.height} dst=${dst.width}x${dst.height}"
         }
+        // YUV_420_888 chroma planes require even dimensions; odd values cause U/V under-copy.
+        require(src.width % 2 == 0 && src.height % 2 == 0) {
+            "YUV_420_888 requires even dimensions; got ${src.width}x${src.height}"
+        }
         val srcPlanes = src.planes
         val dstPlanes = dst.planes
         check(srcPlanes.size == 3 && dstPlanes.size == 3) {
