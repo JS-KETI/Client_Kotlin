@@ -16,9 +16,6 @@ composeBom = "2024.10.01"
 # Coroutines (REST suspend, MoQ publisher 등)
 kotlinxCoroutines = "1.9.0"
 
-# CameraX
-camerax = "1.4.0"
-
 # Networking
 retrofit = "2.11.0"
 okhttp = "4.12.0"
