@@ -6,8 +6,11 @@ import androidx.camera.view.PreviewView
 import androidx.lifecycle.LifecycleOwner
 import dev.jsketi.moqclient.data.camera.CameraEncoder
 import dev.jsketi.moqclient.data.moq.MoqPublisher
+import dev.jsketi.moqclient.data.moq.MoqSessionState
 import dev.jsketi.moqclient.data.network.CellularWarmup
 import dev.jsketi.moqclient.data.network.NetworkManager
+import dev.jsketi.moqclient.data.rest.DeviceIdentityStore
+import dev.jsketi.moqclient.data.rest.DeviceRepository
 import dev.jsketi.moqclient.data.rest.TelemetryReporter
 import dev.jsketi.moqclient.data.rest.dto.DeviceSummary
 import dev.jsketi.moqclient.domain.model.PublishState
@@ -36,6 +39,8 @@ class PublisherRuntime(
     private val cellularWarmupFactory: () -> CellularWarmup,
     val moqPublisher: MoqPublisher,
     private val cameraEncoder: CameraEncoder,
+    private val deviceRepository: DeviceRepository,
+    private val identityStore: DeviceIdentityStore,
     private val telemetryReporter: TelemetryReporter
 ) {
     private val _status = MutableStateFlow(PublisherStatus())
@@ -49,6 +54,7 @@ class PublisherRuntime(
     private var frameJob: Job? = null
     private var startedAtElapsedMs: Long = 0L
     private var streamStarted: Boolean = false
+    private var serverRegistered: Boolean = false
 
     fun attachServiceLifecycleOwner(owner: LifecycleOwner) {
         lifecycleOwner = owner
@@ -69,16 +75,13 @@ class PublisherRuntime(
     }
 
     fun markConnected(summary: DeviceSummary) {
+        serverRegistered = false
         updateStatus {
             it.copy(
                 deviceId = summary.deviceId,
                 broadcastPath = summary.broadcastPath,
                 publishState = PublishState.CONNECTED
             )
-        }
-        val scope = checkNotNull(serviceScope) { "PublisherService is not running" }
-        scope.launch(Dispatchers.IO) {
-            reportTelemetry(_status.value)
         }
     }
 
@@ -121,6 +124,7 @@ class PublisherRuntime(
             serviceScope?.cancel()
             serviceScope = null
             lifecycleOwner = null
+            serverRegistered = false
             updateStatus { it.copy(publishState = PublishState.IDLE, txBps = 0L) }
         }
     }
@@ -148,8 +152,22 @@ class PublisherRuntime(
                     )
                 }
             }
+            withTimeout(MOQ_SESSION_CONNECTED_TIMEOUT_MS) {
+                moqPublisher.sessionState.first { it == MoqSessionState.CONNECTED }
+            }
+            val summary = deviceRepository
+                .register(identityStore.buildRegisterRequest())
+                .getOrThrow()
+            serverRegistered = true
             streamStarted = true
-            updateStatus { it.copy(publishState = PublishState.STREAMING) }
+            updateStatus {
+                it.copy(
+                    deviceId = summary.deviceId,
+                    broadcastPath = summary.broadcastPath,
+                    publishState = PublishState.STREAMING
+                )
+            }
+            reportTelemetry(_status.value)
         } catch (t: Throwable) {
             withContext(Dispatchers.Main.immediate) {
                 cameraEncoder.stop()
@@ -200,6 +218,7 @@ class PublisherRuntime(
 
     private suspend fun reportTelemetry(status: PublisherStatus) {
         if (status.deviceId.isBlank()) return
+        if (!serverRegistered) return
         telemetryReporter.report(status).onFailure { error ->
             Log.w(TAG, "telemetry report skipped: ${error.message}", error)
         }
@@ -208,6 +227,7 @@ class PublisherRuntime(
     companion object {
         private const val TAG = "PublisherRuntime"
         private const val CODEC_CONFIG_TIMEOUT_MS = 5_000L
+        private const val MOQ_SESSION_CONNECTED_TIMEOUT_MS = 10_000L
         private const val TELEMETRY_INTERVAL_SECONDS = 3
     }
 }

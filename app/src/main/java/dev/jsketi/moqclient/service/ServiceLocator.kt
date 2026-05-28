@@ -29,7 +29,6 @@ object ServiceLocator {
         val runtime = runtime(appContext)
         return PublisherViewModel.Factory(
             connectUseCase = ConnectUseCase(
-                deviceRepository = NetworkModule.deviceRepository,
                 identityStore = DeviceIdentityStore(appContext),
                 moqPublisher = runtime.moqPublisher
             ),
@@ -45,11 +44,14 @@ object ServiceLocator {
 
     private fun createRuntime(appContext: Context): PublisherRuntime {
         val networkManager = NetworkManagerImpl(appContext)
+        val identityStore = DeviceIdentityStore(appContext)
         return PublisherRuntime(
             networkManager = networkManager,
             cellularWarmupFactory = { CellularWarmup(networkManager.cellularNetwork) },
             moqPublisher = MoqPublisherImpl(),
             cameraEncoder = CameraEncoderImpl(appContext),
+            deviceRepository = NetworkModule.deviceRepository,
+            identityStore = identityStore,
             telemetryReporter = TelemetryReporter(appContext, NetworkModule.deviceRepository)
         )
     }
