@@ -55,7 +55,7 @@ class DeviceIdentityStore(
             if (it.isLowerCase()) it.titlecase(Locale.US) else it.toString()
         }
         val model = Build.MODEL.orEmpty()
-        return "$manufacturer $model 후방".trim()
+        return "$manufacturer $model Rear".trim()
     }
 
     companion object {

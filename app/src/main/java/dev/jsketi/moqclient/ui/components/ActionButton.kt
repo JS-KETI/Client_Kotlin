@@ -41,7 +41,7 @@ fun ActionButtons(
                 enabled = publishState == PublishState.IDLE || publishState == PublishState.ERROR,
                 modifier = Modifier.weight(1f)
             ) {
-                Text(if (isConnecting) "연결 중..." else "Connect 수립")
+                Text(if (isConnecting) "Connecting..." else "Connect")
             }
 
             OutlinedButton(
@@ -49,7 +49,7 @@ fun ActionButtons(
                 enabled = canDisconnect,
                 modifier = Modifier.weight(1f)
             ) {
-                Text("Connection 중단")
+                Text("Disconnect")
             }
         }
 
@@ -62,7 +62,7 @@ fun ActionButtons(
                 enabled = isConnected,
                 modifier = Modifier.weight(1f)
             ) {
-                Text(if (isStreaming) "영상 송출 중단" else "영상 송출 시작")
+                Text(if (isStreaming) "Stop streaming" else "Start streaming")
             }
 
             OutlinedButton(
@@ -70,7 +70,7 @@ fun ActionButtons(
                 enabled = isConnected,
                 modifier = Modifier.weight(1f)
             ) {
-                Text("네트워크 전환")
+                Text("Switch network")
             }
         }
     }

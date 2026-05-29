@@ -36,7 +36,7 @@ fun TelemetryFooter(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
-                text = "마이그레이션 ${migrationCount}회",
+                text = "Migrations: ${migrationCount}",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
