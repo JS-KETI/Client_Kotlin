@@ -19,9 +19,10 @@ fun CameraPreview(
     previewView: PreviewView?,
     modifier: Modifier = Modifier
 ) {
+    // Width is controlled by the caller (small by default, full when expanded);
+    // height follows the 16:9 aspect ratio.
     Box(
         modifier = modifier
-            .fillMaxWidth()
             .aspectRatio(16f / 9f)
             .background(MaterialTheme.colorScheme.surfaceVariant),
         contentAlignment = Alignment.Center
@@ -45,6 +46,6 @@ fun CameraPreview(
 @Composable
 private fun CameraPreviewPlaceholderPreview() {
     MoqClientTheme {
-        CameraPreview(previewView = null)
+        CameraPreview(previewView = null, modifier = Modifier.fillMaxWidth())
     }
 }
