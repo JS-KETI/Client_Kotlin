@@ -34,6 +34,13 @@ class MainActivity : ComponentActivity() {
         requestPermissionsThenStartService()
     }
 
+    override fun onDestroy() {
+        if (isFinishing && !isChangingConfigurations) {
+            PublisherService.stop(this)
+        }
+        super.onDestroy()
+    }
+
     private fun requestPermissionsThenStartService() {
         val missingPermissions = startupPermissions().filter { permission ->
             ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED

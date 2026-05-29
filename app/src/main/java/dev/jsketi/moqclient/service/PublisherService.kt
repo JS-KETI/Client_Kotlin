@@ -47,13 +47,21 @@ class PublisherService : LifecycleService() {
             stopSelf()
             return Service.START_NOT_STICKY
         }
-        return Service.START_STICKY
+        return Service.START_NOT_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
-        runBlocking {
-            runtime.stopServiceLifecycle()
+        if (::runtime.isInitialized) {
+            runBlocking {
+                runtime.stopServiceLifecycle()
+            }
         }
+        stopForegroundCompat()
         super.onDestroy()
     }
 
@@ -68,6 +76,18 @@ class PublisherService : LifecycleService() {
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun stopForegroundCompat() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(Service.STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        if (::notificationManager.isInitialized) {
+            notificationManager.cancel(NOTIFICATION_ID)
         }
     }
 
@@ -133,6 +153,10 @@ class PublisherService : LifecycleService() {
         fun start(context: Context) {
             val intent = Intent(context, PublisherService::class.java)
             ContextCompat.startForegroundService(context, intent)
+        }
+
+        fun stop(context: Context) {
+            context.stopService(Intent(context, PublisherService::class.java))
         }
     }
 }
