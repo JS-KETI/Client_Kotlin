@@ -30,7 +30,7 @@ fun NetworkStatusCard(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Text(
-                text = "네트워크",
+                text = "Network",
                 style = MaterialTheme.typography.titleSmall
             )
             NetworkPathRow(
@@ -75,7 +75,7 @@ private fun NetworkPathRow(
             }
         }
         Text(
-            text = if (state.available) "사용 가능" else "사용 불가",
+            text = if (state.available) "Available" else "Unavailable",
             style = MaterialTheme.typography.bodySmall,
             color = if (state.available) MaterialTheme.colorScheme.tertiary
                     else MaterialTheme.colorScheme.error

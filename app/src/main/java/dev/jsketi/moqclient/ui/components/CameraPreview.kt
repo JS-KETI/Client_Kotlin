@@ -33,7 +33,7 @@ fun CameraPreview(
             )
         } else {
             Text(
-                text = "카메라 준비 중...",
+                text = "Preparing camera...",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

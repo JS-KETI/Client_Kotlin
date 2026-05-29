@@ -36,7 +36,7 @@ fun DeviceIdCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = deviceId.ifEmpty { "미등록" },
+                    text = deviceId.ifEmpty { "Unregistered" },
                     style = MaterialTheme.typography.titleMedium
                 )
                 ConnectionBadge(publishState = publishState)
