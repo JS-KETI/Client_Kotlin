@@ -5,6 +5,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -86,57 +88,79 @@ private fun PublisherScreenContent(
             )
         }
     ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(0.dp)
-        ) {
+        if (previewExpanded) {
+            // Fullscreen camera — tap anywhere on the preview to return to the two-pane layout.
             Box(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 12.dp),
+                    .fillMaxSize()
+                    .padding(innerPadding),
                 contentAlignment = Alignment.Center
             ) {
                 CameraPreview(
                     previewView = previewView,
-                    modifier = (
-                        if (previewExpanded) Modifier.fillMaxWidth()
-                        else Modifier.fillMaxWidth(0.5f)
-                    ).clickable { previewExpanded = !previewExpanded }
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { previewExpanded = false }
                 )
             }
-            Text(
-                text = if (previewExpanded) "Tap camera to shrink" else "Tap camera to enlarge",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(start = 16.dp, top = 4.dp)
-            )
-
-            Column(
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+        } else {
+            // Two-pane landscape layout: camera on the left, controls on the right
+            // so the action buttons stay visible without scrolling.
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                DeviceIdCard(
-                    deviceId = uiState.deviceId,
-                    publishState = uiState.publishState,
-                    broadcastPath = uiState.broadcastPath
-                )
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .padding(start = 12.dp, top = 12.dp, bottom = 12.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CameraPreview(
+                        previewView = previewView,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { previewExpanded = true }
+                    )
+                }
 
-                NetworkStatusCard(
-                    wifiState = uiState.wifiState,
-                    cellularState = uiState.cellularState,
-                    activePath = uiState.activePath
-                )
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .verticalScroll(rememberScrollState())
+                        .padding(end = 16.dp, top = 12.dp, bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    DeviceIdCard(
+                        deviceId = uiState.deviceId,
+                        publishState = uiState.publishState,
+                        broadcastPath = uiState.broadcastPath
+                    )
 
-                ActionButtons(
-                    publishState = uiState.publishState,
-                    onConnect = onConnect,
-                    onToggleStream = onToggleStream,
-                    onDisconnect = onDisconnect,
-                    onSwitchNetwork = onSwitchNetwork
-                )
+                    NetworkStatusCard(
+                        wifiState = uiState.wifiState,
+                        cellularState = uiState.cellularState,
+                        activePath = uiState.activePath
+                    )
+
+                    ActionButtons(
+                        publishState = uiState.publishState,
+                        onConnect = onConnect,
+                        onToggleStream = onToggleStream,
+                        onDisconnect = onDisconnect,
+                        onSwitchNetwork = onSwitchNetwork
+                    )
+
+                    Text(
+                        text = "Tap the camera to enlarge",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
         }
     }
