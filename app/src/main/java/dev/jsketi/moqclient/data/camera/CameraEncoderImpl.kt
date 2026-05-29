@@ -14,6 +14,7 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -61,7 +62,7 @@ import java.util.concurrent.Executors
  */
 class CameraEncoderImpl(
     private val context: Context,
-    private val preferredWidth: Int = 1280,
+    private val preferredWidth: Int = 960,
     private val preferredHeight: Int = 720,
     private val targetFps: Int = 30,
     private val targetBitrateBps: Int = 2_000_000,
@@ -135,6 +136,8 @@ class CameraEncoderImpl(
                 cameraProvider = provider
 
                 val resolutionSelector = ResolutionSelector.Builder()
+                    // Force 4:3 capture so the encoded stream matches the 4:3 control-page cells.
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                     .setResolutionStrategy(
                         ResolutionStrategy(
                             Size(preferredWidth, preferredHeight),

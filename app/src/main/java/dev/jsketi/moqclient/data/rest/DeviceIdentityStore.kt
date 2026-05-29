@@ -63,7 +63,7 @@ class DeviceIdentityStore(
         private const val KEY_DEVICE_ID = "device_id"
 
         private const val DEFAULT_CAMERA_ID = "cam-back"
-        private const val DEFAULT_WIDTH = 1280
+        private const val DEFAULT_WIDTH = 960
         private const val DEFAULT_HEIGHT = 720
         private const val DEFAULT_FPS = 30
         private const val DEFAULT_ENCODING_PROFILE = "high 4.0"

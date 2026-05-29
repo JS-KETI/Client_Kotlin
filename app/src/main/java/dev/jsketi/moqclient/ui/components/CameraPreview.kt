@@ -23,7 +23,7 @@ fun CameraPreview(
     // height follows the 16:9 aspect ratio.
     Box(
         modifier = modifier
-            .aspectRatio(16f / 9f)
+            .aspectRatio(4f / 3f)
             .background(MaterialTheme.colorScheme.surfaceVariant),
         contentAlignment = Alignment.Center
     ) {
