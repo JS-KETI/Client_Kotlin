@@ -47,13 +47,21 @@ class PublisherService : LifecycleService() {
             stopSelf()
             return Service.START_NOT_STICKY
         }
-        return Service.START_STICKY
+        return Service.START_NOT_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
-        runBlocking {
-            runtime.stopServiceLifecycle()
+        if (::runtime.isInitialized) {
+            runBlocking {
+                runtime.stopServiceLifecycle()
+            }
         }
+        stopForegroundCompat()
         super.onDestroy()
     }
 
@@ -68,6 +76,18 @@ class PublisherService : LifecycleService() {
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun stopForegroundCompat() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(Service.STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        if (::notificationManager.isInitialized) {
+            notificationManager.cancel(NOTIFICATION_ID)
         }
     }
 
@@ -87,7 +107,7 @@ class PublisherService : LifecycleService() {
             .setOngoing(status.publishState == PublishState.STREAMING)
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .addAction(0, "중지", stopIntent)
+            .addAction(0, "Stop", stopIntent)
             .build()
     }
 
@@ -98,13 +118,13 @@ class PublisherService : LifecycleService() {
             "MoQ Publisher",
             NotificationManager.IMPORTANCE_LOW
         ).apply {
-            description = "MoQ 영상 publisher foreground service"
+            description = "MoQ video publisher foreground service"
         }
         notificationManager.createNotificationChannel(channel)
     }
 
     private fun formatDeviceId(deviceId: String): String {
-        return deviceId.ifBlank { "미등록" }
+        return deviceId.ifBlank { "Unregistered" }
     }
 
     private fun formatBps(bps: Long): String {
@@ -117,11 +137,11 @@ class PublisherService : LifecycleService() {
 
     private fun PublishState.toNotificationText(): String {
         return when (this) {
-            PublishState.IDLE -> "대기"
-            PublishState.CONNECTING -> "연결 중"
-            PublishState.CONNECTED -> "연결됨"
-            PublishState.STREAMING -> "송출 중"
-            PublishState.ERROR -> "오류"
+            PublishState.IDLE -> "Idle"
+            PublishState.CONNECTING -> "Connecting"
+            PublishState.CONNECTED -> "Connected"
+            PublishState.STREAMING -> "Streaming"
+            PublishState.ERROR -> "Error"
         }
     }
 
@@ -133,6 +153,10 @@ class PublisherService : LifecycleService() {
         fun start(context: Context) {
             val intent = Intent(context, PublisherService::class.java)
             ContextCompat.startForegroundService(context, intent)
+        }
+
+        fun stop(context: Context) {
+            context.stopService(Intent(context, PublisherService::class.java))
         }
     }
 }

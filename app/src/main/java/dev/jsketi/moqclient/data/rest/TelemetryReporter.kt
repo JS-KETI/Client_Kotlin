@@ -2,24 +2,29 @@ package dev.jsketi.moqclient.data.rest
 
 import android.content.Context
 import android.os.BatteryManager
+import dev.jsketi.moqclient.data.location.LocationProvider
 import dev.jsketi.moqclient.data.rest.dto.DeviceTelemetryRequest
 import dev.jsketi.moqclient.domain.model.PublishState
 import dev.jsketi.moqclient.domain.model.PublisherStatus
 
 class TelemetryReporter(
     context: Context,
-    private val deviceRepository: DeviceRepository
+    private val deviceRepository: DeviceRepository,
+    private val locationProvider: LocationProvider
 ) {
     private val batteryManager: BatteryManager =
         context.applicationContext.getSystemService(BatteryManager::class.java)
 
     suspend fun report(status: PublisherStatus): Result<Unit> = runCatching {
         require(status.deviceId.isNotBlank()) { "deviceId is required before telemetry report" }
+        val location = locationProvider.current
         deviceRepository.updateTelemetry(
             deviceId = status.deviceId,
             request = DeviceTelemetryRequest(
                 battery = batteryPercent(),
                 location = DEFAULT_LOCATION,
+                latitude = location?.latitude,
+                longitude = location?.longitude,
                 missionId = DEFAULT_MISSION_ID,
                 missionStatus = status.publishState.toMissionStatus(),
                 publisherTxBps = status.txBps

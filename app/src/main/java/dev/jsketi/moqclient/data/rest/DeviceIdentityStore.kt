@@ -14,7 +14,10 @@ class DeviceIdentityStore(
     private val appContext = context.applicationContext
     private val preferences = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    fun buildRegisterRequest(): DeviceRegisterRequest {
+    fun buildRegisterRequest(
+        latitude: Double? = null,
+        longitude: Double? = null
+    ): DeviceRegisterRequest {
         return DeviceRegisterRequest(
             deviceId = getOrCreateDeviceId(),
             cameraId = DEFAULT_CAMERA_ID,
@@ -25,6 +28,8 @@ class DeviceIdentityStore(
             fps = DEFAULT_FPS,
             encodingProfile = DEFAULT_ENCODING_PROFILE,
             location = DEFAULT_LOCATION,
+            latitude = latitude,
+            longitude = longitude,
             missionId = DEFAULT_MISSION_ID
         )
     }
@@ -55,7 +60,7 @@ class DeviceIdentityStore(
             if (it.isLowerCase()) it.titlecase(Locale.US) else it.toString()
         }
         val model = Build.MODEL.orEmpty()
-        return "$manufacturer $model 후방".trim()
+        return "$manufacturer $model Rear".trim()
     }
 
     companion object {
@@ -63,7 +68,7 @@ class DeviceIdentityStore(
         private const val KEY_DEVICE_ID = "device_id"
 
         private const val DEFAULT_CAMERA_ID = "cam-back"
-        private const val DEFAULT_WIDTH = 1280
+        private const val DEFAULT_WIDTH = 960
         private const val DEFAULT_HEIGHT = 720
         private const val DEFAULT_FPS = 30
         private const val DEFAULT_ENCODING_PROFILE = "high 4.0"

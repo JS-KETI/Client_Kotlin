@@ -32,10 +32,22 @@ class DeviceRepositoryImpl(
         api.findById(deviceId).unwrap()
     }
 
+    override suspend fun delete(deviceId: String): Result<Unit> = runCatching {
+        val response = api.delete(deviceId)
+        if (!response.isSuccessful && response.code() != HTTP_NOT_FOUND) {
+            throw retrofit2.HttpException(response)
+        }
+        Unit
+    }
+
     private fun <T> ApiResponse<T>.unwrap(): T {
         if (!success || data == null) {
             throw ApiException(error)
         }
         return data
+    }
+
+    companion object {
+        private const val HTTP_NOT_FOUND = 404
     }
 }

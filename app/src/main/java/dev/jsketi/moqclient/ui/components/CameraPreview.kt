@@ -19,10 +19,11 @@ fun CameraPreview(
     previewView: PreviewView?,
     modifier: Modifier = Modifier
 ) {
+    // Width is controlled by the caller (small by default, full when expanded);
+    // height follows the 16:9 aspect ratio.
     Box(
         modifier = modifier
-            .fillMaxWidth()
-            .aspectRatio(16f / 9f)
+            .aspectRatio(4f / 3f)
             .background(MaterialTheme.colorScheme.surfaceVariant),
         contentAlignment = Alignment.Center
     ) {
@@ -33,7 +34,7 @@ fun CameraPreview(
             )
         } else {
             Text(
-                text = "카메라 준비 중...",
+                text = "Preparing camera...",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -45,6 +46,6 @@ fun CameraPreview(
 @Composable
 private fun CameraPreviewPlaceholderPreview() {
     MoqClientTheme {
-        CameraPreview(previewView = null)
+        CameraPreview(previewView = null, modifier = Modifier.fillMaxWidth())
     }
 }

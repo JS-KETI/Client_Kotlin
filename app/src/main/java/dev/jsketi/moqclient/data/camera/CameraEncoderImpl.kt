@@ -8,11 +8,13 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.util.Size
+import android.view.Surface
 import androidx.annotation.MainThread
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -60,7 +62,7 @@ import java.util.concurrent.Executors
  */
 class CameraEncoderImpl(
     private val context: Context,
-    private val preferredWidth: Int = 1280,
+    private val preferredWidth: Int = 960,
     private val preferredHeight: Int = 720,
     private val targetFps: Int = 30,
     private val targetBitrateBps: Int = 2_000_000,
@@ -134,6 +136,8 @@ class CameraEncoderImpl(
                 cameraProvider = provider
 
                 val resolutionSelector = ResolutionSelector.Builder()
+                    // Force 4:3 capture so the encoded stream matches the 4:3 control-page cells.
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                     .setResolutionStrategy(
                         ResolutionStrategy(
                             Size(preferredWidth, preferredHeight),
@@ -141,14 +145,18 @@ class CameraEncoderImpl(
                         )
                     )
                     .build()
+                val targetRotation = previewView.display?.rotation ?: Surface.ROTATION_0
 
                 val preview = Preview.Builder()
                     .setResolutionSelector(resolutionSelector)
+                    .setTargetRotation(targetRotation)
                     .build()
                     .apply { setSurfaceProvider(previewView.surfaceProvider) }
 
                 val analysis = ImageAnalysis.Builder()
                     .setResolutionSelector(resolutionSelector)
+                    .setTargetRotation(targetRotation)
+                    .setOutputImageRotationEnabled(true)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                     .build()

@@ -1,21 +1,30 @@
 package dev.jsketi.moqclient.ui
 
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -52,6 +61,7 @@ fun PublisherScreen(
         snackbarHostState = snackbarHostState,
         onConnect = vm::onConnect,
         onToggleStream = vm::onToggleStream,
+        onDisconnect = vm::onDisconnect,
         onSwitchNetwork = vm::onSwitchNetwork
     )
 }
@@ -63,8 +73,11 @@ private fun PublisherScreenContent(
     snackbarHostState: SnackbarHostState,
     onConnect: () -> Unit,
     onToggleStream: () -> Unit,
+    onDisconnect: () -> Unit,
     onSwitchNetwork: () -> Unit
 ) {
+    var previewExpanded by remember { mutableStateOf(false) }
+
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
@@ -75,40 +88,79 @@ private fun PublisherScreenContent(
             )
         }
     ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(0.dp)
-        ) {
-            CameraPreview(
-                previewView = previewView,
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            Column(
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+        if (previewExpanded) {
+            // Fullscreen camera — tap anywhere on the preview to return to the two-pane layout.
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                contentAlignment = Alignment.Center
             ) {
-                DeviceIdCard(
-                    deviceId = uiState.deviceId,
-                    publishState = uiState.publishState,
-                    broadcastPath = uiState.broadcastPath
+                CameraPreview(
+                    previewView = previewView,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { previewExpanded = false }
                 )
+            }
+        } else {
+            // Two-pane landscape layout: camera on the left, controls on the right
+            // so the action buttons stay visible without scrolling.
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .padding(start = 12.dp, top = 12.dp, bottom = 12.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CameraPreview(
+                        previewView = previewView,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { previewExpanded = true }
+                    )
+                }
 
-                NetworkStatusCard(
-                    wifiState = uiState.wifiState,
-                    cellularState = uiState.cellularState,
-                    activePath = uiState.activePath
-                )
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .verticalScroll(rememberScrollState())
+                        .padding(end = 16.dp, top = 12.dp, bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    DeviceIdCard(
+                        deviceId = uiState.deviceId,
+                        publishState = uiState.publishState,
+                        broadcastPath = uiState.broadcastPath
+                    )
 
-                ActionButtons(
-                    publishState = uiState.publishState,
-                    onConnect = onConnect,
-                    onToggleStream = onToggleStream,
-                    onSwitchNetwork = onSwitchNetwork
-                )
+                    NetworkStatusCard(
+                        wifiState = uiState.wifiState,
+                        cellularState = uiState.cellularState,
+                        activePath = uiState.activePath
+                    )
+
+                    ActionButtons(
+                        publishState = uiState.publishState,
+                        onConnect = onConnect,
+                        onToggleStream = onToggleStream,
+                        onDisconnect = onDisconnect,
+                        onSwitchNetwork = onSwitchNetwork
+                    )
+
+                    Text(
+                        text = "Tap the camera to enlarge",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
         }
     }
@@ -134,6 +186,7 @@ private fun PublisherScreenPreview() {
             snackbarHostState = SnackbarHostState(),
             onConnect = {},
             onToggleStream = {},
+            onDisconnect = {},
             onSwitchNetwork = {}
         )
     }

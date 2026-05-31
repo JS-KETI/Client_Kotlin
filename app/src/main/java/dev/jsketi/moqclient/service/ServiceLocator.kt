@@ -2,6 +2,7 @@ package dev.jsketi.moqclient.service
 
 import android.content.Context
 import dev.jsketi.moqclient.data.camera.CameraEncoderImpl
+import dev.jsketi.moqclient.data.location.LocationProviderImpl
 import dev.jsketi.moqclient.data.moq.MoqPublisherImpl
 import dev.jsketi.moqclient.data.network.CellularWarmup
 import dev.jsketi.moqclient.data.network.NetworkManagerImpl
@@ -45,14 +46,16 @@ object ServiceLocator {
     private fun createRuntime(appContext: Context): PublisherRuntime {
         val networkManager = NetworkManagerImpl(appContext)
         val identityStore = DeviceIdentityStore(appContext)
+        val locationProvider = LocationProviderImpl(appContext)
         return PublisherRuntime(
             networkManager = networkManager,
             cellularWarmupFactory = { CellularWarmup(networkManager.cellularNetwork) },
             moqPublisher = MoqPublisherImpl(),
             cameraEncoder = CameraEncoderImpl(appContext),
+            locationProvider = locationProvider,
             deviceRepository = NetworkModule.deviceRepository,
             identityStore = identityStore,
-            telemetryReporter = TelemetryReporter(appContext, NetworkModule.deviceRepository)
+            telemetryReporter = TelemetryReporter(appContext, NetworkModule.deviceRepository, locationProvider)
         )
     }
 }

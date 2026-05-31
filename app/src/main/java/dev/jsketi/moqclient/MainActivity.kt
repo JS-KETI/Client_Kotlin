@@ -34,6 +34,13 @@ class MainActivity : ComponentActivity() {
         requestPermissionsThenStartService()
     }
 
+    override fun onDestroy() {
+        if (isFinishing && !isChangingConfigurations) {
+            PublisherService.stop(this)
+        }
+        super.onDestroy()
+    }
+
     private fun requestPermissionsThenStartService() {
         val missingPermissions = startupPermissions().filter { permission ->
             ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED
@@ -48,6 +55,7 @@ class MainActivity : ComponentActivity() {
     private fun startupPermissions(): List<String> {
         return buildList {
             addAll(CameraPermission.REQUIRED)
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add(Manifest.permission.POST_NOTIFICATIONS)
             }

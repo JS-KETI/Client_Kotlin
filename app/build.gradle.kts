@@ -126,6 +126,9 @@ dependencies {
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
 
+    // Location -- FusedLocationProviderClient for GPS telemetry
+    implementation(libs.play.services.location)
+
     // MoQ UniFFI bindings + native lib built from moq-ffi-v0.2.0 with rebind() patch.
     implementation(files("libs/moq-rebind-0.2.0+rebind.aar"))
     implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
