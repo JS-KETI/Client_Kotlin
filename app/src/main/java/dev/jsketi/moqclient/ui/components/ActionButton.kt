@@ -20,7 +20,6 @@ fun ActionButtons(
     onConnect: () -> Unit,
     onToggleStream: () -> Unit,
     onDisconnect: () -> Unit,
-    onSwitchNetwork: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val isConnected = publishState == PublishState.CONNECTED || publishState == PublishState.STREAMING
@@ -53,25 +52,12 @@ fun ActionButtons(
             }
         }
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        Button(
+            onClick = onToggleStream,
+            enabled = isConnected,
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Button(
-                onClick = onToggleStream,
-                enabled = isConnected,
-                modifier = Modifier.weight(1f)
-            ) {
-                Text(if (isStreaming) "Stop streaming" else "Start streaming")
-            }
-
-            OutlinedButton(
-                onClick = onSwitchNetwork,
-                enabled = isConnected,
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Switch network")
-            }
+            Text(if (isStreaming) "Stop streaming" else "Start streaming")
         }
     }
 }
@@ -84,8 +70,7 @@ private fun ActionButtonsIdlePreview() {
             publishState = PublishState.IDLE,
             onConnect = {},
             onToggleStream = {},
-            onDisconnect = {},
-            onSwitchNetwork = {}
+            onDisconnect = {}
         )
     }
 }
@@ -98,8 +83,7 @@ private fun ActionButtonsStreamingPreview() {
             publishState = PublishState.STREAMING,
             onConnect = {},
             onToggleStream = {},
-            onDisconnect = {},
-            onSwitchNetwork = {}
+            onDisconnect = {}
         )
     }
 }

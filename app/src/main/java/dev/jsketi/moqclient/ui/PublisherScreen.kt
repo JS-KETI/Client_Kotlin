@@ -61,8 +61,7 @@ fun PublisherScreen(
         snackbarHostState = snackbarHostState,
         onConnect = vm::onConnect,
         onToggleStream = vm::onToggleStream,
-        onDisconnect = vm::onDisconnect,
-        onSwitchNetwork = vm::onSwitchNetwork
+        onDisconnect = vm::onDisconnect
     )
 }
 
@@ -73,8 +72,7 @@ private fun PublisherScreenContent(
     snackbarHostState: SnackbarHostState,
     onConnect: () -> Unit,
     onToggleStream: () -> Unit,
-    onDisconnect: () -> Unit,
-    onSwitchNetwork: () -> Unit
+    onDisconnect: () -> Unit
 ) {
     var previewExpanded by remember { mutableStateOf(false) }
 
@@ -151,8 +149,7 @@ private fun PublisherScreenContent(
                         publishState = uiState.publishState,
                         onConnect = onConnect,
                         onToggleStream = onToggleStream,
-                        onDisconnect = onDisconnect,
-                        onSwitchNetwork = onSwitchNetwork
+                        onDisconnect = onDisconnect
                     )
 
                     Text(
@@ -186,8 +183,7 @@ private fun PublisherScreenPreview() {
             snackbarHostState = SnackbarHostState(),
             onConnect = {},
             onToggleStream = {},
-            onDisconnect = {},
-            onSwitchNetwork = {}
+            onDisconnect = {}
         )
     }
 }
