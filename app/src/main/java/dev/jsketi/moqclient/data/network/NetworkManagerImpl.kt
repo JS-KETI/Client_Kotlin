@@ -45,6 +45,7 @@ class NetworkManagerImpl(
 
     private var wifiCallback: ConnectivityManager.NetworkCallback? = null
     private var cellularCallback: ConnectivityManager.NetworkCallback? = null
+    private var defaultCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun start() {
         check(wifiCallback == null && cellularCallback == null) {
@@ -74,6 +75,19 @@ class NetworkManagerImpl(
             wifiCallback = null
             throw t
         }
+
+        // OS 기본 네트워크를 구독해 activePath 가 실제 송신 경로(상태바와 동일)를 반영하게 한다.
+        try {
+            val default = defaultNetworkCallback()
+            connectivityManager.registerDefaultNetworkCallback(default)
+            defaultCallback = default
+        } catch (t: Throwable) {
+            runCatching { connectivityManager.unregisterNetworkCallback(wifi) }
+            cellularCallback?.let { runCatching { connectivityManager.unregisterNetworkCallback(it) } }
+            wifiCallback = null
+            cellularCallback = null
+            throw t
+        }
     }
 
     override fun stop() {
@@ -91,8 +105,16 @@ class NetworkManagerImpl(
                 Log.d(TAG, "cellular callback already unregistered: ${e.message}")
             }
         }
+        defaultCallback?.let { cb ->
+            try {
+                connectivityManager.unregisterNetworkCallback(cb)
+            } catch (e: IllegalArgumentException) {
+                Log.d(TAG, "default callback already unregistered: ${e.message}")
+            }
+        }
         wifiCallback = null
         cellularCallback = null
+        defaultCallback = null
         _wifiNetwork.value = null
         _cellularNetwork.value = null
     }
@@ -105,8 +127,9 @@ class NetworkManagerImpl(
         check(target != null) {
             "cannot select $path — corresponding Network handle is not available"
         }
-        _activePath.value = path
-        Log.i(TAG, "active path → $path")
+        // activePath 는 OS default-network 콜백이 소유한다 (실제 송신 경로 반영). 수동 토글은
+        // 더 이상 태그를 바꾸지 않는다. 실제 강제 전환(bind + rebind)은 별도 작업으로 분리.
+        Log.i(TAG, "selectPath($path) requested (handle present); activePath is OS-driven")
     }
 
     /**
@@ -132,6 +155,30 @@ class NetworkManagerImpl(
             }
         }
     }
+
+    /**
+     * OS 기본 네트워크의 transport 를 [activePath] 로 반영한다. 사용자가 상태바에서 Wi-Fi 를
+     * 끄면 기본 네트워크가 Cellular 로 바뀌고, 이 콜백이 activePath 를 CELLULAR 로 갱신한다.
+     */
+    private fun defaultNetworkCallback(): ConnectivityManager.NetworkCallback =
+        object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities
+            ) {
+                val path = when {
+                    networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ->
+                        NetworkPath.WIFI
+                    networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ->
+                        NetworkPath.CELLULAR
+                    else -> return // VPN/Ethernet 등 — 마지막 값 유지
+                }
+                if (_activePath.value != path) {
+                    _activePath.value = path
+                    Log.i(TAG, "active path (OS default) → $path network=$network")
+                }
+            }
+        }
 
     companion object {
         private const val TAG = "NetworkManagerImpl"
