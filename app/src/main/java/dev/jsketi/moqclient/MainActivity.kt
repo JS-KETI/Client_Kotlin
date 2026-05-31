@@ -55,6 +55,7 @@ class MainActivity : ComponentActivity() {
     private fun startupPermissions(): List<String> {
         return buildList {
             addAll(CameraPermission.REQUIRED)
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add(Manifest.permission.POST_NOTIFICATIONS)
             }

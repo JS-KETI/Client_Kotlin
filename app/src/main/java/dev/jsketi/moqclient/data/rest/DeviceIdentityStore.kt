@@ -14,7 +14,10 @@ class DeviceIdentityStore(
     private val appContext = context.applicationContext
     private val preferences = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    fun buildRegisterRequest(): DeviceRegisterRequest {
+    fun buildRegisterRequest(
+        latitude: Double? = null,
+        longitude: Double? = null
+    ): DeviceRegisterRequest {
         return DeviceRegisterRequest(
             deviceId = getOrCreateDeviceId(),
             cameraId = DEFAULT_CAMERA_ID,
@@ -25,6 +28,8 @@ class DeviceIdentityStore(
             fps = DEFAULT_FPS,
             encodingProfile = DEFAULT_ENCODING_PROFILE,
             location = DEFAULT_LOCATION,
+            latitude = latitude,
+            longitude = longitude,
             missionId = DEFAULT_MISSION_ID
         )
     }

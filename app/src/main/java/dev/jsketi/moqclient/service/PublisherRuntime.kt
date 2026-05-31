@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.LifecycleOwner
 import dev.jsketi.moqclient.data.camera.CameraEncoder
+import dev.jsketi.moqclient.data.location.LocationProvider
 import dev.jsketi.moqclient.data.moq.MoqPublisher
 import dev.jsketi.moqclient.data.moq.MoqSessionState
 import dev.jsketi.moqclient.data.network.CellularWarmup
@@ -42,6 +43,7 @@ class PublisherRuntime(
     private val cellularWarmupFactory: () -> CellularWarmup,
     val moqPublisher: MoqPublisher,
     private val cameraEncoder: CameraEncoder,
+    private val locationProvider: LocationProvider,
     private val deviceRepository: DeviceRepository,
     private val identityStore: DeviceIdentityStore,
     private val telemetryReporter: TelemetryReporter
@@ -103,10 +105,12 @@ class PublisherRuntime(
         try {
             networkManager.start()
             cellularWarmup = cellularWarmupFactory().also { it.start() }
+            locationProvider.start()
             metricsJob = scope.launch { runMetricsLoop() }
         } catch (t: Throwable) {
             metricsJob?.cancel()
             metricsJob = null
+            locationProvider.stop()
             cellularWarmup?.stop()
             cellularWarmup = null
             networkManager.stop()
@@ -131,6 +135,7 @@ class PublisherRuntime(
         } finally {
             metricsJob?.cancelAndJoin()
             metricsJob = null
+            locationProvider.stop()
             cellularWarmup?.stop()
             cellularWarmup = null
             networkManager.stop()
@@ -249,7 +254,11 @@ class PublisherRuntime(
     }
 
     private suspend fun ensureServerRegistered(): DeviceSummary {
-        val request = identityStore.buildRegisterRequest()
+        val location = locationProvider.current
+        val request = identityStore.buildRegisterRequest(
+            latitude = location?.latitude,
+            longitude = location?.longitude
+        )
 
         if (serverRegistered) {
             deviceRepository.findById(request.deviceId)
