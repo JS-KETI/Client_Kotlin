@@ -22,6 +22,7 @@ fun NetworkStatusCard(
     wifiState: NetworkPathState,
     cellularState: NetworkPathState,
     activePath: NetworkPath,
+    publishingPath: NetworkPath?,
     modifier: Modifier = Modifier
 ) {
     Card(modifier = modifier.fillMaxWidth()) {
@@ -33,15 +34,20 @@ fun NetworkStatusCard(
                 text = "Network",
                 style = MaterialTheme.typography.titleSmall
             )
+            // activePath is the OS default network (status-bar route), not necessarily the path the
+            // MoQ session publishes over — so it is tagged "OS default". publishingPath is the real
+            // send path and is tagged "Publishing"; both tags can apply to the same row.
             NetworkPathRow(
                 label = "Wi-Fi",
                 state = wifiState,
-                isActive = activePath == NetworkPath.WIFI
+                isOsDefault = activePath == NetworkPath.WIFI,
+                isPublishing = publishingPath == NetworkPath.WIFI
             )
             NetworkPathRow(
                 label = "Cellular",
                 state = cellularState,
-                isActive = activePath == NetworkPath.CELLULAR
+                isOsDefault = activePath == NetworkPath.CELLULAR,
+                isPublishing = publishingPath == NetworkPath.CELLULAR
             )
         }
     }
@@ -51,7 +57,8 @@ fun NetworkStatusCard(
 private fun NetworkPathRow(
     label: String,
     state: NetworkPathState,
-    isActive: Boolean
+    isOsDefault: Boolean,
+    isPublishing: Boolean
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -66,9 +73,16 @@ private fun NetworkPathRow(
                 text = label,
                 style = MaterialTheme.typography.bodyMedium
             )
-            if (isActive) {
+            if (isOsDefault) {
                 Text(
-                    text = "ACTIVE",
+                    text = "OS default",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (isPublishing) {
+                Text(
+                    text = "Publishing",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -90,7 +104,8 @@ private fun NetworkStatusCardPreview() {
         NetworkStatusCard(
             wifiState = NetworkPathState(NetworkPath.WIFI, available = true),
             cellularState = NetworkPathState(NetworkPath.CELLULAR, available = true),
-            activePath = NetworkPath.WIFI
+            activePath = NetworkPath.WIFI,
+            publishingPath = NetworkPath.WIFI
         )
     }
 }

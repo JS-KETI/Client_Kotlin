@@ -11,6 +11,9 @@ data class PublisherUiState(
     val wifiState: NetworkPathState = NetworkPathState(NetworkPath.WIFI, available = false),
     val cellularState: NetworkPathState = NetworkPathState(NetworkPath.CELLULAR, available = false),
     val activePath: NetworkPath = NetworkPath.WIFI,
+    // activePath is the OS default network, not necessarily the MoQ publishing path.
+    // publishingPath is the network the active MoQ session actually sends over; null when not publishing.
+    val publishingPath: NetworkPath? = null,
     val txBps: Long = 0L,
     val migrationCount: Int = 0,
     val uptimeSeconds: Long = 0L,

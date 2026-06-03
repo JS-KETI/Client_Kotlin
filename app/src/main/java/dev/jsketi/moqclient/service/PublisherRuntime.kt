@@ -14,6 +14,7 @@ import dev.jsketi.moqclient.data.rest.DeviceIdentityStore
 import dev.jsketi.moqclient.data.rest.DeviceRepository
 import dev.jsketi.moqclient.data.rest.TelemetryReporter
 import dev.jsketi.moqclient.data.rest.dto.DeviceSummary
+import dev.jsketi.moqclient.domain.model.NetworkPath
 import dev.jsketi.moqclient.domain.model.PublishState
 import dev.jsketi.moqclient.domain.model.PublisherStatus
 import kotlinx.coroutines.CoroutineScope
@@ -96,6 +97,17 @@ class PublisherRuntime(
         updateStatus { it.copy(migrationCount = it.migrationCount + 1) }
     }
 
+    /**
+     * Records the network path the MoQ session is currently publishing over.
+     *
+     * Distinct from [NetworkManager.activePath], which only tracks the OS default network and is
+     * not necessarily the publishing path. Intended to be called after a successful rebind with the
+     * new target path, or with null when publishing stops.
+     */
+    fun markPublishingPath(path: NetworkPath?) {
+        updateStatus { it.copy(publishingPath = path) }
+    }
+
     fun startServiceLifecycle() {
         check(serviceScope == null) { "PublisherRuntime service lifecycle already started" }
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -143,7 +155,7 @@ class PublisherRuntime(
             serviceScope = null
             lifecycleOwner = null
             serverRegistered = false
-            updateStatus { it.copy(publishState = PublishState.IDLE, txBps = 0L) }
+            updateStatus { it.copy(publishState = PublishState.IDLE, txBps = 0L, publishingPath = null) }
         }
     }
 
@@ -187,11 +199,16 @@ class PublisherRuntime(
             moqCatalogPublished = true
             val summary = ensureServerRegistered()
             streamStarted = true
+            // Best-effort initial publishing path: activePath is the OS default network, used here as
+            // the presumed send path right after the session connects. A future rebind trigger should
+            // call markPublishingPath() with the real target instead of relying on this estimate.
+            val currentPublishingPath = networkManager.activePath.value
             updateStatus {
                 it.copy(
                     deviceId = summary.deviceId,
                     broadcastPath = summary.broadcastPath,
-                    publishState = PublishState.STREAMING
+                    publishState = PublishState.STREAMING,
+                    publishingPath = currentPublishingPath
                 )
             }
             reportTelemetry(_status.value)
@@ -222,7 +239,8 @@ class PublisherRuntime(
                 deviceId = "",
                 broadcastPath = "",
                 publishState = PublishState.IDLE,
-                txBps = 0L
+                txBps = 0L,
+                publishingPath = null
             )
         }
     }
@@ -241,7 +259,8 @@ class PublisherRuntime(
             streamStarted = false
             updateStatus {
                 it.copy(
-                    publishState = if (it.deviceId.isBlank()) PublishState.IDLE else PublishState.CONNECTED
+                    publishState = if (it.deviceId.isBlank()) PublishState.IDLE else PublishState.CONNECTED,
+                    publishingPath = null
                 )
             }
         }

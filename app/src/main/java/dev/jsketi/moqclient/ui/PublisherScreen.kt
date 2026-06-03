@@ -142,7 +142,8 @@ private fun PublisherScreenContent(
                     NetworkStatusCard(
                         wifiState = uiState.wifiState,
                         cellularState = uiState.cellularState,
-                        activePath = uiState.activePath
+                        activePath = uiState.activePath,
+                        publishingPath = uiState.publishingPath
                     )
 
                     ActionButtons(
@@ -175,6 +176,7 @@ private fun PublisherScreenPreview() {
                 wifiState = NetworkPathState(NetworkPath.WIFI, available = true),
                 cellularState = NetworkPathState(NetworkPath.CELLULAR, available = true),
                 activePath = NetworkPath.WIFI,
+                publishingPath = NetworkPath.WIFI,
                 txBps = 1_800_000L,
                 migrationCount = 2,
                 uptimeSeconds = 305L
