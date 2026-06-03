@@ -94,6 +94,10 @@ class AutoNetworkMigrationController(
     private suspend fun evaluate(s: Signals) {
         if (s.publishState != PublishState.STREAMING) return
 
+        // boundTarget 이 가리키는 망의 핸들이 사라졌으면(망 death) controller 의 stale boundTarget 을 리셋.
+        // (NetworkManager 의 실제 binding 도 onLost 에서 해제됨 — 둘을 일치시킨다.)
+        clearStaleBoundTargetIfNeeded()
+
         // (A) 현재 송출 경로가 unusable 이면 즉시 stale Publishing 태그 제거 (전환은 아래에서 debounce).
         if (s.publishingPath != null && isPublishingPathUnusable(s)) {
             Log.i(TAG, "current publishing path unusable; clearing tag (path=${s.publishingPath})")
@@ -104,7 +108,10 @@ class AutoNetworkMigrationController(
         Log.i(
             TAG,
             "auto migration decision target=${decision.target} reason=${decision.reason} " +
-                "publishing=${s.publishingPath} session=${s.session}"
+                "publishing=${s.publishingPath} session=${s.session} " +
+                "wifiPresent=${s.wifi != null} cellularPresent=${s.cellular != null} " +
+                "wifiHealth=${s.wifiHealth} wifiDbm=${networkManager.wifiSignalDbm.value} " +
+                "txStalled=${s.txStalled}"
         )
 
         val target = decision.target
@@ -220,6 +227,15 @@ class AutoNetworkMigrationController(
     private fun isHandlePresent(path: NetworkPath): Boolean = when (path) {
         NetworkPath.WIFI -> networkManager.wifiNetwork.value != null
         NetworkPath.CELLULAR -> networkManager.cellularNetwork.value != null
+    }
+
+    /** boundTarget 의 Network 핸들이 사라졌으면(망 death) stale 이므로 controller boundTarget 을 리셋. */
+    private fun clearStaleBoundTargetIfNeeded() {
+        val bound = boundTarget ?: return
+        if (!isHandlePresent(bound)) {
+            Log.w(TAG, "boundTarget=$bound no longer has a Network handle; clearing controller boundTarget")
+            boundTarget = null
+        }
     }
 
     private data class Decision(

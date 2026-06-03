@@ -3,6 +3,8 @@ package dev.jsketi.moqclient.data.network
 import android.net.Network
 import android.util.Log
 import dev.jsketi.moqclient.BuildConfig
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -44,7 +46,11 @@ class CellularWarmup(
     private val targetHost: String = BuildConfig.SERVER_HOST,
     private val targetPort: Int = BuildConfig.RELAY_PORT
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // 예상 못 한 예외가 앱을 죽이지 않도록 하는 안전망. 핵심 방어는 runLoop() 의 per-tick try/catch.
+    private val exceptionHandler = CoroutineExceptionHandler { _, t ->
+        Log.w(TAG, "warmup scope uncaught exception (swallowed): ${t.javaClass.simpleName}: ${t.message}", t)
+    }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + exceptionHandler)
     private var loopJob: Job? = null
 
     fun start() {
@@ -63,7 +69,18 @@ class CellularWarmup(
         Log.i(TAG, "warmup loop start (interval=${intervalMs}ms target=$targetHost:$targetPort)")
         // 첫 tick 즉시 — 셀룰러를 처음부터 attach 상태로 시도 (codex low #8)
         while (currentCoroutineContext().isActive) {
-            cellularNetwork.value?.let { sendKeepAlive(it) }
+            val network = cellularNetwork.value
+            if (network != null) {
+                try {
+                    sendKeepAlive(network)
+                } catch (e: CancellationException) {
+                    throw e // 정상 cancel 은 방해하지 않는다
+                } catch (t: Throwable) {
+                    // 죽은 망에 process 가 바인딩된 상태 등에서 DatagramSocket() 이 ENONET 으로 실패할 수
+                    // 있다. 어떤 예외에서도 앱을 죽이지 않고 이 tick 만 skip 한다 (loop 는 계속 살아있음).
+                    Log.w(TAG, "warmup tick skipped network=$network error=${t.javaClass.simpleName}: ${t.message}")
+                }
+            }
             delay(intervalMs)
         }
     }

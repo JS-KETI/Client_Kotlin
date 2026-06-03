@@ -71,6 +71,12 @@ class NetworkManagerImpl(
     private var cellularCallback: ConnectivityManager.NetworkCallback? = null
     private var defaultCallback: ConnectivityManager.NetworkCallback? = null
 
+    // 현재 프로세스가 bindProcessToNetwork 로 묶인 망 추적. 바인딩된 망이 죽으면(onLost) 즉시 해제해
+    // 죽은 망 고착(ENONET: 새 소켓 생성 실패)을 막는다. 모든 접근은 bindingLock 으로 보호.
+    private val bindingLock = Any()
+    private var boundPath: NetworkPath? = null
+    private var boundNetwork: Network? = null
+
     override fun start() {
         check(wifiCallback == null && cellularCallback == null) {
             "NetworkManager already started; call stop() before reusing"
@@ -123,8 +129,8 @@ class NetworkManagerImpl(
     override fun stop() {
         pollScope?.cancel()
         pollScope = null
-        // 프로세스 바인딩 해제 → OS 기본 라우팅 복구 (콜백 해제 전에 수행).
-        runCatching { connectivityManager.bindProcessToNetwork(null) }
+        // 프로세스 바인딩 해제 → OS 기본 라우팅 복구 (콜백 해제 전에 수행). tracking 필드도 함께 정리.
+        runCatching { clearProcessBinding() }
             .onFailure { Log.w(TAG, "failed to clear process binding on stop: ${it.message}") }
         wifiCallback?.let { cb ->
             try {
@@ -166,13 +172,37 @@ class NetworkManagerImpl(
         }
         // 실제 강제 전환: 프로세스 전체를 target 망에 바인딩한다. 이후 생성되는 모든 소켓
         // (QUIC rebind 소켓 + REST/telemetry)이 이 망을 탄다 (PoC 에서 허용).
-        connectivityManager.bindProcessToNetwork(target)
+        val ok = connectivityManager.bindProcessToNetwork(target)
+        check(ok) { "bindProcessToNetwork($path) returned false (network=$target)" }
+        synchronized(bindingLock) {
+            boundPath = path
+            boundNetwork = target
+        }
         Log.i(TAG, "process bound to $path network=$target")
     }
 
     override fun clearProcessBinding() {
         connectivityManager.bindProcessToNetwork(null)
+        synchronized(bindingLock) {
+            boundPath = null
+            boundNetwork = null
+        }
         Log.i(TAG, "process binding cleared (back to OS default)")
+    }
+
+    /**
+     * lost 된 망이 현재 프로세스가 bind 한 망이면 즉시 바인딩을 해제한다.
+     * 죽은 망에 묶인 채 새 소켓 생성이 ENONET 으로 실패하는 것(warmup/reconnect/REST)을 막는다.
+     * 핸들 stale 여부와 무관하게 동작하도록 onLost 진입 시 호출한다.
+     */
+    private fun clearProcessBindingIfLost(path: NetworkPath, lostNetwork: Network) {
+        val shouldClear = synchronized(bindingLock) {
+            boundPath == path && boundNetwork == lostNetwork
+        }
+        if (!shouldClear) return
+        Log.w(TAG, "bound $path network lost; clearing process binding network=$lostNetwork")
+        runCatching { clearProcessBinding() }
+            .onFailure { e -> Log.e(TAG, "failed to clear process binding after $path lost", e) }
     }
 
     /**
@@ -201,6 +231,8 @@ class NetworkManagerImpl(
             }
 
             override fun onLost(network: Network) {
+                // 핸들 stale 여부와 무관하게, 이 망에 프로세스가 묶여 있으면 즉시 해제 (죽은 망 고착 방지).
+                clearProcessBindingIfLost(NetworkPath.WIFI, network)
                 val current = _wifiNetwork.value
                 if (current == network) {
                     Log.w(TAG, "WIFI onLost (active): $network")
@@ -284,6 +316,7 @@ class NetworkManagerImpl(
         }
 
         override fun onLost(network: Network) {
+            clearProcessBindingIfLost(label, network)
             val current = target.value
             if (current == network) {
                 Log.w(TAG, "$label onLost (active): $network")
