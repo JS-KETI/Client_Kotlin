@@ -29,6 +29,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -40,6 +41,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * CameraX (Preview + ImageAnalysis) + MediaCodec (H.264) 기반 CameraEncoder 구현.
@@ -74,9 +76,16 @@ class CameraEncoderImpl(
 
     private val _encodedFrames = MutableSharedFlow<EncodedFrame>(
         replay = 0,
-        extraBufferCapacity = ENCODED_BUFFER_CAPACITY
+        extraBufferCapacity = ENCODED_BUFFER_CAPACITY,
+        // Realtime video: never block/crash the encoder on a slow consumer — drop the oldest
+        // buffered frame and keep the freshest. tryEmit() then never fails.
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
     override val encodedFrames: SharedFlow<EncodedFrame> = _encodedFrames.asSharedFlow()
+
+    // Counts encoder-output frames dropped on overflow (best-effort visibility; DROP_OLDEST drops
+    // silently at the flow layer).
+    private val encodedDropCount = AtomicLong(0)
 
     private val lifecycleLock = Any()
 
@@ -95,7 +104,7 @@ class CameraEncoderImpl(
     private var ppsBytes: ByteArray? = null
 
     @MainThread
-    override fun start(lifecycleOwner: LifecycleOwner, previewView: PreviewView) {
+    override fun start(lifecycleOwner: LifecycleOwner, previewView: PreviewView?) {
         synchronized(lifecycleLock) {
             check(encoder == null && cameraProvider == null && cameraExecutor == null) {
                 "CameraEncoder already started; call stop() before reusing"
@@ -122,7 +131,7 @@ class CameraEncoderImpl(
     private fun onProviderReady(
         providerFuture: ListenableFuture<ProcessCameraProvider>,
         lifecycleOwner: LifecycleOwner,
-        previewView: PreviewView,
+        previewView: PreviewView?,
         expectedGen: Int
     ) {
         synchronized(lifecycleLock) {
@@ -145,14 +154,9 @@ class CameraEncoderImpl(
                         )
                     )
                     .build()
-                val targetRotation = previewView.display?.rotation ?: Surface.ROTATION_0
+                val targetRotation = previewView?.display?.rotation ?: Surface.ROTATION_0
 
-                val preview = Preview.Builder()
-                    .setResolutionSelector(resolutionSelector)
-                    .setTargetRotation(targetRotation)
-                    .build()
-                    .apply { setSurfaceProvider(previewView.surfaceProvider) }
-
+                // ImageAnalysis is the REQUIRED publishing use case — it must always bind.
                 val analysis = ImageAnalysis.Builder()
                     .setResolutionSelector(resolutionSelector)
                     .setTargetRotation(targetRotation)
@@ -162,13 +166,51 @@ class CameraEncoderImpl(
                     .build()
                     .also { it.setAnalyzer(executor) { proxy -> feedFrame(proxy) } }
 
+                // Preview is an OPTIONAL UI-only use case. A null/detached PreviewView — or a Preview
+                // bind failure — must never stop publishing, so we fall back to analysis-only binding.
+                val preview = previewView?.let { pv ->
+                    Preview.Builder()
+                        .setResolutionSelector(resolutionSelector)
+                        .setTargetRotation(targetRotation)
+                        .build()
+                        .apply { setSurfaceProvider(pv.surfaceProvider) }
+                }
+
                 provider.unbindAll()
-                provider.bindToLifecycle(
-                    lifecycleOwner,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview,
-                    analysis
-                )
+                val camera = try {
+                    if (preview != null) {
+                        provider.bindToLifecycle(
+                            lifecycleOwner,
+                            CameraSelector.DEFAULT_BACK_CAMERA,
+                            preview,
+                            analysis
+                        )
+                    } else {
+                        provider.bindToLifecycle(
+                            lifecycleOwner,
+                            CameraSelector.DEFAULT_BACK_CAMERA,
+                            analysis
+                        )
+                    }
+                } catch (bindError: Throwable) {
+                    // Preview-related bind failure must not fail the stream: retry analysis-only.
+                    if (preview == null) throw bindError
+                    Log.w(TAG, "camera bind with preview failed; retry analysis-only", bindError)
+                    runCatching { provider.unbindAll() }
+                    provider.bindToLifecycle(
+                        lifecycleOwner,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        analysis
+                    )
+                }
+
+                // Surface camera error / state transitions in logs (open, opening, closed, error).
+                runCatching {
+                    camera.cameraInfo.cameraState.observe(lifecycleOwner) { state ->
+                        val err = state.error?.let { " error=${it.code}" } ?: ""
+                        Log.i(TAG, "camera state: ${state.type}$err")
+                    }
+                }.onFailure { Log.w(TAG, "failed to attach CameraState observer", it) }
             } catch (t: Throwable) {
                 Log.e(TAG, "camera bind failed; cleaning up before rethrow", t)
                 cleanupInternalLocked()
@@ -380,6 +422,8 @@ class CameraEncoderImpl(
         }
 
         if (stopping) return
+        // DROP_OLDEST keeps tryEmit() from ever failing, so a slow downstream consumer must NOT
+        // crash the encoder. The !emitted branch is defensive; the counter gives drop visibility.
         val emitted = _encodedFrames.tryEmit(
             EncodedFrame(
                 payload = payload,
@@ -387,9 +431,11 @@ class CameraEncoderImpl(
                 isKeyframe = isKeyframe
             )
         )
-        check(emitted) {
-            "encodedFrames buffer overflow — downstream consumer is too slow " +
-                "(capacity=$ENCODED_BUFFER_CAPACITY frames)"
+        if (!emitted) {
+            val dropped = encodedDropCount.incrementAndGet()
+            if (dropped == 1L || dropped % 30 == 0L) {
+                Log.w(TAG, "encodedFrames overflow; oldest dropped (count=$dropped, capacity=$ENCODED_BUFFER_CAPACITY)")
+            }
         }
     }
 

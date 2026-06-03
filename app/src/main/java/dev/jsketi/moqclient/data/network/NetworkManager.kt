@@ -1,6 +1,7 @@
 package dev.jsketi.moqclient.data.network
 
 import android.net.Network
+import dev.jsketi.moqclient.domain.model.NetworkHealth
 import dev.jsketi.moqclient.domain.model.NetworkPath
 import kotlinx.coroutines.flow.StateFlow
 
@@ -30,13 +31,27 @@ interface NetworkManager {
     /** 사용자가 선택한 현재 active path. 초기값은 NetworkPath.WIFI. */
     val activePath: StateFlow<NetworkPath>
 
+    /** Wi-Fi 신호 세기(dBm). 신호값을 읽을 수 없거나 Wi-Fi 가 없으면 null. */
+    val wifiSignalDbm: StateFlow<Int?>
+
+    /** Wi-Fi 송출 적합도. availability + 신호 세기(hysteresis)로 산정. */
+    val wifiHealth: StateFlow<NetworkHealth>
+
     fun start()
 
     fun stop()
 
     /**
-     * Active path 를 [path] 로 전환한다.
-     * 실제 QUIC 세션 마이그레이션 (rebind) 은 별도 layer 가 activePath 변화를 구독하여 수행.
+     * 앱 프로세스 전체를 [path] 의 Network 에 바인딩한다 (`bindProcessToNetwork`).
+     *
+     * 이후 프로세스가 새로 만드는 모든 소켓(= QUIC rebind 로 생성되는 소켓 + REST/telemetry)은
+     * 해당 망으로 송출된다. 따라서 `rebind()` **직전에** 호출하면 새 QUIC 소켓이 target 망에 붙는다.
+     * target Network 핸들이 없으면 예외를 던진다(fail-fast).
+     *
+     * 주의: 프로세스 전체 바인딩이라 REST/telemetry 트래픽도 같은 망을 탄다. PoC 에서는 허용한다.
      */
     fun selectPath(path: NetworkPath)
+
+    /** `bindProcessToNetwork(null)` — 프로세스 바인딩을 풀어 OS 기본 라우팅으로 되돌린다. */
+    fun clearProcessBinding()
 }

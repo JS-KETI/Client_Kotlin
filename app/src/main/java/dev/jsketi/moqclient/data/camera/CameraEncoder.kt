@@ -20,6 +20,9 @@ import kotlinx.coroutines.flow.StateFlow
  *   4. stop(): 카메라 unbind + MediaCodec stop. 같은 인스턴스에서 다시 start() 가능.
  *
  * 동시 두 번 start() 는 미지원. 호출자가 라이프사이클을 직렬화해야 한다.
+ *
+ * previewView 는 **선택**이다 (UI 표시 전용). 송출에 필수인 use case 는 ImageAnalysis 이며,
+ * previewView 가 null 이거나 surface 오류 상태여도 송출(ImageAnalysis)은 계속되어야 한다.
  */
 interface CameraEncoder {
 
@@ -29,7 +32,8 @@ interface CameraEncoder {
     /** 모든 keyframe + delta frame NAL 단위 emit. SharedFlow extraBufferCapacity 권장. */
     val encodedFrames: SharedFlow<EncodedFrame>
 
-    fun start(lifecycleOwner: LifecycleOwner, previewView: PreviewView)
+    /** previewView 는 optional — null 이면 Preview 없이 ImageAnalysis 단독으로 bind 한다. */
+    fun start(lifecycleOwner: LifecycleOwner, previewView: PreviewView?)
 
     fun stop()
 }

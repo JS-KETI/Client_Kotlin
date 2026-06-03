@@ -5,6 +5,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <!-- WifiManager RSSI 폴링용 (NetworkCapabilities.signalStrength 가 셀룰러 바인딩 시 freeze 되는 문제 우회) -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
     <!-- Location (텔레메트리의 GPS 좌표용) -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />

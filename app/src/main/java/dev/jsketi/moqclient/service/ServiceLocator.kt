@@ -45,17 +45,27 @@ object ServiceLocator {
 
     private fun createRuntime(appContext: Context): PublisherRuntime {
         val networkManager = NetworkManagerImpl(appContext)
+        val moqPublisher = MoqPublisherImpl()
         val identityStore = DeviceIdentityStore(appContext)
         val locationProvider = LocationProviderImpl(appContext)
+        val switchNetworkUseCase = SwitchNetworkUseCase(networkManager, moqPublisher)
         return PublisherRuntime(
             networkManager = networkManager,
             cellularWarmupFactory = { CellularWarmup(networkManager.cellularNetwork) },
-            moqPublisher = MoqPublisherImpl(),
+            moqPublisher = moqPublisher,
             cameraEncoder = CameraEncoderImpl(appContext),
             locationProvider = locationProvider,
             deviceRepository = NetworkModule.deviceRepository,
             identityStore = identityStore,
-            telemetryReporter = TelemetryReporter(appContext, NetworkModule.deviceRepository, locationProvider)
+            telemetryReporter = TelemetryReporter(appContext, NetworkModule.deviceRepository, locationProvider),
+            migrationControllerFactory = { runtime ->
+                AutoNetworkMigrationController(
+                    networkManager = networkManager,
+                    moqPublisher = moqPublisher,
+                    switchNetworkUseCase = switchNetworkUseCase,
+                    runtime = runtime
+                )
+            }
         )
     }
 }

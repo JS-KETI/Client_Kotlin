@@ -193,6 +193,19 @@ class MoqPublisherImpl : MoqPublisher {
             Log.e(TAG, "rebind() failed: ${e.message}", e)
         }
 
+    override suspend fun requestReconnect(): Result<Unit> =
+        runCatching {
+            val current = checkNotNull(session) { "no active MoQ session to reconnect" }
+            // Cancel the session so startConnectionLoop()'s established.closed() returns and the loop
+            // re-connects (generation unchanged). The new socket binds to the process's current
+            // network (NetworkManager.selectPath), so callers bind the target before this.
+            Log.i(TAG, "requestReconnect(): cancelling session to force reconnect on bound network")
+            current.cancel(0u)
+            Unit
+        }.onFailure { e ->
+            Log.e(TAG, "requestReconnect() failed: ${e.message}", e)
+        }
+
     override suspend fun finish() {
         val callerSnap = Throwable("finish() caller").stackTrace.take(6).joinToString(" | ")
         Log.i(TAG, "[finish] ENTER. session=${if (session == null) "null" else "EXISTS"} " +

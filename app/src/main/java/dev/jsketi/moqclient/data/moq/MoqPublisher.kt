@@ -46,6 +46,14 @@ interface MoqPublisher {
      */
     suspend fun rebind(socketAddress: String): Result<Unit>
 
+    /**
+     * Force the current session to drop so the internal connect loop re-establishes a fresh QUIC
+     * session. Unlike [rebind] (seamless, same connection), this is a brief reconnect — used as a
+     * fallback when rebind() fails to migrate. The new session opens over whatever network the
+     * process is currently bound to (see NetworkManager.selectPath), so bind the target first.
+     */
+    suspend fun requestReconnect(): Result<Unit>
+
     /** Finish the broadcast and close the MoQ session cleanly. */
     suspend fun finish()
 }

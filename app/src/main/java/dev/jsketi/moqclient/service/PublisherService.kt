@@ -23,12 +23,14 @@ class PublisherService : LifecycleService() {
 
     private lateinit var runtime: PublisherRuntime
     private lateinit var notificationManager: NotificationManager
+    private lateinit var wakeLock: StreamingWakeLock
 
     override fun onCreate() {
         super.onCreate()
         runtime = ServiceLocator.runtime(applicationContext)
         runtime.attachServiceLifecycleOwner(this)
         notificationManager = getSystemService(NotificationManager::class.java)
+        wakeLock = StreamingWakeLock(applicationContext)
 
         createNotificationChannel()
         startForegroundCompat(runtime.status.value)
@@ -37,6 +39,8 @@ class PublisherService : LifecycleService() {
         lifecycleScope.launch {
             runtime.status.collect { status ->
                 notificationManager.notify(NOTIFICATION_ID, buildNotification(status))
+                // Hold CPU/Wi-Fi locks only while actively streaming; release on any other state.
+                wakeLock.setStreaming(status.publishState == PublishState.STREAMING)
             }
         }
     }
@@ -56,6 +60,9 @@ class PublisherService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        if (::wakeLock.isInitialized) {
+            wakeLock.release()
+        }
         if (::runtime.isInitialized) {
             runBlocking {
                 runtime.stopServiceLifecycle()
