@@ -72,6 +72,16 @@ MoQ(Media over QUIC) 기반 publisher 안드로이드 앱. 기존 Jetson + Rust 
 | 릴리즈 APK | `app/build/outputs/apk/release/app-release.apk` 또는 `app-release-unsigned.apk` |
 | 시연 배포본 | `dist/moqclient-<version>.apk` (`copyReleaseApkToDist`) |
 
+## 자동 릴리즈 (CI)
+
+`main` 브랜치에 push 되면 [`.github/workflows/release.yml`](.github/workflows/release.yml)이 debug APK를 빌드해 GitHub Release를 자동 갱신한다.
+
+- 빌드: `./gradlew :app:assembleDebug` (서명 시크릿 불필요)
+- 게시: 고정 태그 `apk-en-landscape`의 자산 `moqclient-english-landscape-debug.apk`를 clobber 갱신 → Notion 등에 걸어둔 다운로드 링크가 항상 최신 main 빌드를 가리킨다.
+- 수동 실행: GitHub Actions 탭에서 `workflow_dispatch`로도 트리거 가능
+
+> 위의 수동 릴리즈 빌드(`assembleRelease`)는 서명된 배포본이 필요할 때 사용한다. 일상적인 시연 APK는 CI 자동 릴리즈로 충분하다.
+
 ## BuildConfig 상수
 
 서버 / relay 엔드포인트는 `app/build.gradle.kts`의 `buildConfigField`로 주입된다.
