@@ -354,10 +354,27 @@ class PublisherRuntime(
         var streamingBpsSamples = 0
         var consecutiveLowSamples = 0
         var previousStalled = false
+        // 실측 egress 추적용. bytesSent 는 per-connection 누적이라 reconnect 시 0 으로 리셋된다.
+        var previousBytesSent: Long? = null
+        // migrationCount 가 바뀐(= rebind/reconnect claim 직후) 샘플은 전환 잡음 — 판정을 쉰다.
+        var previousMigrationCount = _status.value.migrationCount
+        // 컨트롤러와 무관한 자발적 reconnect(relay 측 drop 등)는 migrationCount 를 안 바꾼다 —
+        // 세션 상태 변화를 1s tick 마다 latch 해 같은 전환 마스킹을 적용한다.
+        var previousSessionState = moqPublisher.sessionState.value
+        var sessionStateChangedSinceSample = false
+        // 인코더 ABR 사다리 위치. 0 = 기본(2 Mbps). 스트림이 멈추면 0 으로 복귀 — 새 스트림의
+        // 인코더는 어차피 기본 비트레이트로 새로 만들어지므로 적용 호출은 불필요.
+        var abrLadderIndex = 0
+        var abrUpHoldSamples = 0
 
         while (currentCoroutineContext().isActive) {
             delay(1_000)
             secondsSinceBpsSample += 1
+            // 세션 상태는 1s tick 마다 관찰 — 자발적 reconnect 가 3s 샘플 경계 사이에
+            // CONNECTED→CONNECTING→CONNECTED 로 왕복을 끝내도 "changed" 로 latch 되게.
+            val sessionStateNow = moqPublisher.sessionState.value
+            if (sessionStateNow != previousSessionState) sessionStateChangedSinceSample = true
+            previousSessionState = sessionStateNow
             val uptimeSeconds = (SystemClock.elapsedRealtime() - startedAtElapsedMs) / 1_000
 
             if (secondsSinceBpsSample >= TELEMETRY_INTERVAL_SECONDS) {
@@ -369,22 +386,121 @@ class PublisherRuntime(
                 previousFailures = currentFailures
                 secondsSinceBpsSample = 0
 
-                // tx stall: STREAMING 중, grace 이후, near-zero bps 또는 writeFrame 실패가
-                // 연속 [TX_STALL_SAMPLES] 회면 정체로 본다 (RSSI 양호한데 throughput 붕괴 케이스용).
                 val streaming = _status.value.publishState == PublishState.STREAMING
+                val sendStats = if (streaming) moqPublisher.transportSendStats() else null
+                val sendRateBps = sendStats?.estimatedSendRateBps
+
+                // 마이그레이션(rebind/reconnect claim) 또는 세션 상태 변화(자발적 reconnect 포함)
+                // 직후 첫 샘플은 전환 잡음이 섞인다 — cwnd 리셋으로 estimate 가 일시 붕괴하고,
+                // bytesSent delta 는 커넥션 경계에 걸친다.
+                val migrationCount = _status.value.migrationCount
+                val transitionSample = migrationCount != previousMigrationCount ||
+                    sessionStateChangedSinceSample
+                previousMigrationCount = migrationCount
+                sessionStateChangedSinceSample = false
+
+                // 실측 UDP egress(재전송 포함). estimate(cwnd*8/RTT 추정치)와 달리 망이 실제로
+                // 흡수한 양이다. delta < 0 은 reconnect 로 카운터가 리셋된 것 → unknown 처리.
+                val bytesSent = sendStats?.bytesSent
+                var egressBps: Long? = null
+                if (transitionSample) {
+                    previousBytesSent = null
+                } else {
+                    val prevSent = previousBytesSent
+                    if (prevSent != null && bytesSent != null && bytesSent >= prevSent) {
+                        egressBps = (bytesSent - prevSent) * 8 / TELEMETRY_INTERVAL_SECONDS
+                    }
+                    previousBytesSent = bytesSent
+                }
+
                 if (streaming) {
                     streamingBpsSamples += 1
-                    val low = bps <= TX_STALL_LOW_BPS_THRESHOLD || failuresDelta > 0
-                    consecutiveLowSamples = if (low) consecutiveLowSamples + 1 else 0
+                    if (transitionSample) {
+                        // 전환 샘플은 stall/ABR 판정 모두 skip (post-migration/reconnect false positive 방지).
+                        consecutiveLowSamples = 0
+                        abrUpHoldSamples = 0
+                    } else {
+                        // 인코더 ABR — txStalled 보다 먼저 평가되는 1차 방어선. 링크가 현재 목표
+                        // 비트레이트를 못 받으면 인코더 출력 자체를 낮춰 백로그 형성을 줄인다
+                        // (해상도/fps 는 불변, 비트레이트만). 사다리 바닥(500k)이
+                        // TX_STALL_SEND_RATE_BPS(600k)보다 낮으므로 링크가 그 밑까지 무너지면
+                        // txStalled 가 여전히 트립해 stall cut 이 최후 수단으로 남는다.
+                        // 하향은 비관적 min(estimate, egress), 상향은 estimate 만 본다 — egress 는
+                        // 인코더 생산량(≈현재 레벨)에 상한이 묶여, min() 으로는 한 단계 위의 여유가
+                        // 구조적으로 절대 관측되지 않기 때문(egress 로 상향을 gate 하면 영구 고착).
+                        val available = if (sendRateBps != null && egressBps != null) {
+                            minOf(sendRateBps, egressBps)
+                        } else {
+                            sendRateBps ?: egressBps // 둘 다 null 이면 이번 샘플은 무판정
+                        }
+                        val currentTargetBps = ABR_BITRATE_LADDER_BPS[abrLadderIndex]
+                        var abrDownshifted = false
+                        if (available != null && available < currentTargetBps &&
+                            abrLadderIndex < ABR_BITRATE_LADDER_BPS.lastIndex
+                        ) {
+                            // 다운시프트는 즉시(1 샘플) — 백로그가 쌓이기 전에 내린다.
+                            abrLadderIndex += 1
+                            abrUpHoldSamples = 0
+                            abrDownshifted = true
+                            val next = ABR_BITRATE_LADDER_BPS[abrLadderIndex]
+                            cameraEncoder.setTargetBitrate(next.toInt())
+                            Log.i(TAG, "abr down: $currentTargetBps -> $next (available=$available)")
+                        } else if (abrLadderIndex > 0 && sendRateBps != null &&
+                            sendRateBps >= ABR_BITRATE_LADDER_BPS[abrLadderIndex - 1] * 3 / 2
+                        ) {
+                            // 업시프트는 보수적으로: 한 단계 위의 1.5 배 여유(estimate 기준)가
+                            // 3 샘플(~9s) 연속일 때만 한 단계씩 (level skip 금지).
+                            abrUpHoldSamples += 1
+                            if (abrUpHoldSamples >= ABR_UP_HOLD_SAMPLES) {
+                                val next = ABR_BITRATE_LADDER_BPS[abrLadderIndex - 1]
+                                abrLadderIndex -= 1
+                                abrUpHoldSamples = 0
+                                cameraEncoder.setTargetBitrate(next.toInt())
+                                Log.i(TAG, "abr up: $currentTargetBps -> $next (estimate=$sendRateBps)")
+                            }
+                        } else {
+                            abrUpHoldSamples = 0
+                        }
+
+                        // tx stall: grace 이후에 (a) estimate 붕괴 — 단 실측 egress 가 임계 이상으로
+                        // 멀쩡하면 cwnd 일시 수축으로 보고 거부(veto) — 거나 (b) 앱은 거의 풀
+                        // 비트레이트로 쓰는데 실측 egress 가 붕괴(estimate 가 stale-high 로 남는
+                        // 케이스)했거나 (c) writeFrame 자체가 죽었으면 정체. (c)의 bps 는 writeFrame
+                        // "투입량"이라 망이 막혀도 풀 비트레이트로 보인다.
+                        val estimateLow = sendRateBps != null && sendRateBps < TX_STALL_SEND_RATE_BPS
+                        val egressLow = egressBps != null && egressBps < TX_STALL_SEND_RATE_BPS
+                        val egressHigh = egressBps != null && egressBps >= TX_STALL_SEND_RATE_BPS
+                        val sendRateCollapsed = (estimateLow && !egressHigh) ||
+                            (egressLow && bps >= TX_STALL_SEND_RATE_BPS)
+                        val writeDead = bps <= TX_STALL_LOW_BPS_THRESHOLD || failuresDelta > 0
+                        // 절단은 최후수단 — 같은 샘플에서 ABR 강하와 절단이 동시에 발동하지 않게,
+                        // 강하한 샘플은 not-low 취급해 낮춘 비트레이트가 한 샘플(3s) 효과를 낼
+                        // 시간을 준다.
+                        val low = !abrDownshifted && (sendRateCollapsed || writeDead)
+                        consecutiveLowSamples = if (low) consecutiveLowSamples + 1 else 0
+                    }
+                    Log.d(
+                        TAG,
+                        "tx sample writeBps=$bps sendRateBps=$sendRateBps egressBps=$egressBps " +
+                            "rttMs=${sendStats?.rttMs} packetsLost=${sendStats?.packetsLost} " +
+                            "lowStreak=$consecutiveLowSamples abrLevel=$abrLadderIndex"
+                    )
                 } else {
                     streamingBpsSamples = 0
                     consecutiveLowSamples = 0
+                    abrLadderIndex = 0
+                    abrUpHoldSamples = 0
                 }
                 val stalled = streaming &&
                     streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
                     consecutiveLowSamples >= TX_STALL_SAMPLES
                 if (stalled != previousStalled) {
-                    Log.i(TAG, "tx stalled changed: $stalled (bps=$bps failuresDelta=$failuresDelta)")
+                    Log.i(
+                        TAG,
+                        "tx stalled changed: $stalled (writeBps=$bps sendRateBps=$sendRateBps " +
+                            "egressBps=$egressBps rttMs=${sendStats?.rttMs} " +
+                            "packetsLost=${sendStats?.packetsLost} failuresDelta=$failuresDelta)"
+                    )
                     previousStalled = stalled
                 }
 
@@ -411,10 +527,20 @@ class PublisherRuntime(
         private const val TELEMETRY_INTERVAL_SECONDS = 3
         private const val HTTP_CONFLICT = 409
 
-        // tx-stall 판정. bps 샘플은 TELEMETRY_INTERVAL_SECONDS(3s) 주기.
-        // PoC: 백업 트리거. RSSI 선제 전환을 못 잡은 경우를 빠르게(1샘플≈3s) 보완.
-        private const val TX_STALL_LOW_BPS_THRESHOLD = 8_000L // ~near-zero for video
+        // tx-stall 판정. 샘플은 TELEMETRY_INTERVAL_SECONDS(3s) 주기.
+        // RSSI 와 무관한 처리량 붕괴(간섭/혼잡/felt-throttling)를 실측으로 잡는다.
+        private const val TX_STALL_LOW_BPS_THRESHOLD = 8_000L // writeFrame 죽음(near-zero) 백업 판정
         private const val TX_STALL_GRACE_SAMPLES = 1          // 스트림 시작 직후 첫 샘플은 무시
         private const val TX_STALL_SAMPLES = 1                // 1회(~3s) 만 정체여도 stalled
+        // QUIC estimated send rate 가 이 값 미만이면 정체. 인코더 2 Mbps 의 30% — 그 아래면
+        // 백로그가 누적되기 시작한 지 한참이고 시청 품질은 이미 무너져 있다.
+        private const val TX_STALL_SEND_RATE_BPS = 600_000L
+
+        // 인코더 ABR 사다리(비트레이트만 조절 — 해상도/fps/profile 불변). index 0 = 기본값으로,
+        // CameraEncoderImpl 의 시작 비트레이트(2 Mbps)와 일치해야 한다. 바닥(500k)은 의도적으로
+        // TX_STALL_SEND_RATE_BPS 보다 낮다 — ABR 로도 못 버티는 링크는 stall cut 으로 넘긴다.
+        private val ABR_BITRATE_LADDER_BPS = longArrayOf(2_000_000, 1_000_000, 500_000)
+        // 업시프트 보류 샘플 수 — 여유 대역이 이만큼 연속 관측될 때만 한 단계 올린다(~9s).
+        private const val ABR_UP_HOLD_SAMPLES = 3
     }
 }
