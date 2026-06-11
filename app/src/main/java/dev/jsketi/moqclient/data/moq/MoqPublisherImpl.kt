@@ -200,11 +200,34 @@ class MoqPublisherImpl : MoqPublisher {
             // re-connects (generation unchanged). The new socket binds to the process's current
             // network (NetworkManager.selectPath), so callers bind the target before this.
             Log.i(TAG, "requestReconnect(): cancelling session to force reconnect on bound network")
-            current.cancel(0u)
+            // cancel 직후 connect loop 가 CONNECTING 으로 바꿔주기 전까지의 틈에 관찰자(마이그레이션
+            // 컨트롤러)가 취소된 세션을 CONNECTED 로 보고 태그를 잘못 claim 할 수 있다 → 먼저 내린다.
+            // (connect loop 가 곧 다시 CONNECTING 으로 set 하는 것은 무해.)
+            _sessionState.value = MoqSessionState.CONNECTING
+            try {
+                current.cancel(0u)
+            } catch (t: Throwable) {
+                // cancel 실패 시 세션은 여전히 살아있다 — CONNECTING 으로 방치하면 writeFrame 이
+                // (state != CONNECTED 가드에 걸려) 조용히 굶는다. connect loop 가 이미 상태를
+                // 진전시킨 게 아니라면(CAS) CONNECTED 로 되돌리고 실패는 그대로 전파한다.
+                _sessionState.compareAndSet(MoqSessionState.CONNECTING, MoqSessionState.CONNECTED)
+                throw t
+            }
             Unit
         }.onFailure { e ->
             Log.e(TAG, "requestReconnect() failed: ${e.message}", e)
         }
+
+    override fun transportSendStats(): TransportSendStats? {
+        val current = session ?: return null
+        val stats = runCatching { current.sendStats() }.getOrNull() ?: return null
+        return TransportSendStats(
+            estimatedSendRateBps = stats.estimatedSendRateBps?.toLong(),
+            rttMs = stats.rttMs?.toLong(),
+            bytesSent = stats.bytesSent?.toLong(),
+            packetsLost = stats.packetsLost?.toLong()
+        )
+    }
 
     override suspend fun finish() {
         val callerSnap = Throwable("finish() caller").stackTrace.take(6).joinToString(" | ")

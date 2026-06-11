@@ -49,10 +49,20 @@ interface MoqPublisher {
     /**
      * Force the current session to drop so the internal connect loop re-establishes a fresh QUIC
      * session. Unlike [rebind] (seamless, same connection), this is a brief reconnect — used as a
-     * fallback when rebind() fails to migrate. The new session opens over whatever network the
-     * process is currently bound to (see NetworkManager.selectPath), so bind the target first.
+     * fallback when rebind() fails to migrate, and to shed the QUIC send backlog when the path is
+     * congested (rebind keeps the connection, so queued data follows it to the new path; a
+     * reconnect restarts the relay subscription from the latest group instead). The new session
+     * opens over whatever network the process is currently bound to (see
+     * NetworkManager.selectPath), so bind the target first.
      */
     suspend fun requestReconnect(): Result<Unit>
+
+    /**
+     * Snapshot of QUIC transport send statistics for the active session, or null when no session.
+     * Unlike [txByteCounter] (bytes handed to writeFrame), this reflects what the network actually
+     * absorbs — the only reliable congestion/stall signal. Requires the send_stats() patched AAR.
+     */
+    fun transportSendStats(): TransportSendStats?
 
     /** Finish the broadcast and close the MoQ session cleanly. */
     suspend fun finish()
