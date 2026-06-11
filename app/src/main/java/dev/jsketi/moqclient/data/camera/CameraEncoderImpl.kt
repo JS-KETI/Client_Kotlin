@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -224,6 +225,29 @@ class CameraEncoderImpl(
         synchronized(lifecycleLock) {
             stopping = true
             cleanupInternalLocked()
+        }
+    }
+
+    override fun setTargetBitrate(bps: Int) {
+        synchronized(lifecycleLock) {
+            val codec = encoder
+            if (codec == null) {
+                Log.w(TAG, "setTargetBitrate(${bps}bps) ignored: encoder not started")
+                return
+            }
+            // 비트레이트만 변경 — 해상도/fps/profile 불변이라 SPS/PPS 가 다시 생성되지 않고,
+            // consumer 의 avcC(init segment)도 그대로 유효하다.
+            runCatching {
+                codec.setParameters(
+                    Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, bps) }
+                )
+            }.onSuccess {
+                Log.i(TAG, "encoder target bitrate changed -> ${bps}bps")
+            }.onFailure { t ->
+                // vendor codec 은 setParameters 에서 IllegalStateException 을 던질 수 있다 —
+                // 비트레이트 변경 실패가 송출을 죽여서는 안 된다.
+                Log.w(TAG, "setTargetBitrate(${bps}bps) failed: ${t.message}", t)
+            }
         }
     }
 

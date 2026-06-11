@@ -36,4 +36,13 @@ interface CameraEncoder {
     fun start(lifecycleOwner: LifecycleOwner, previewView: PreviewView?)
 
     fun stop()
+
+    /**
+     * 활성 인코더의 목표 비트레이트만 동적 변경한다 (ABR 용).
+     *
+     * 비트레이트 외(해상도/fps/profile)는 건드리지 않는다 — SPS/PPS 가 다시 생성되지 않아
+     * consumer 가 들고 있는 avcC(init segment)가 그대로 유효해야 하기 때문.
+     * 인코더가 아직 시작 전이면 no-op.
+     */
+    fun setTargetBitrate(bps: Int)
 }
