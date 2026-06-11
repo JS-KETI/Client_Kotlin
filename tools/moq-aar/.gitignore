@@ -1,0 +1,7 @@
+# 빌드 산출물과 스테이징된 생성물은 커밋하지 않는다.
+# moq.kt(uniffi 생성)와 libmoq_ffi.so 는 external/moq 빌드에서 복사돼 오는 입력물이고
+# (절차: patches/README.md), 최종 결과물은 app/libs 의 AAR 로만 커밋된다.
+build/
+.gradle/
+src/main/java/uniffi/
+src/main/jniLibs/

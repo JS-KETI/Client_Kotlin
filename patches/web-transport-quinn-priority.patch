@@ -1,0 +1,24 @@
+Upstream bug: web-transport-quinn 0.11.8 passes the web-transport-trait stream
+priority (u8, LOWER value = send first; moq-lite gives the newest group 0) to
+quinn's SendStream::set_priority (i32, HIGHER value = send first) without
+negating it. Under congestion this inverts MoQ's intended newest-first
+scheduling into oldest-first FIFO, so latency accumulates without bound.
+
+Apply inside a vendored copy of the crate (see patches/README.md):
+  cp -r ~/.cargo/registry/src/index.crates.io-*/web-transport-quinn-0.11.8 \
+        external/moq/vendor/web-transport-quinn
+  cd external/moq/vendor/web-transport-quinn && git apply <this file>
+The vendored copy is wired in via [patch.crates-io] in the moq workspace
+Cargo.toml (added by moq-send-stats.patch).
+
+--- a/src/send.rs
++++ b/src/send.rs
+@@ -148,7 +148,7 @@
+     type Error = WriteError;
+
+     fn set_priority(&mut self, order: u8) {
+-        Self::set_priority(self, order.into()).ok();
++        Self::set_priority(self, -i32::from(order)).ok(); // PATCH: trait contract is lower-first, quinn is higher-first
+     }
+
+     fn reset(&mut self, code: u32) {

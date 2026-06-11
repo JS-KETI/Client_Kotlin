@@ -1,0 +1,116 @@
+diff --git a/rs/moq-lite/src/session.rs b/rs/moq-lite/src/session.rs
+--- a/rs/moq-lite/src/session.rs
++++ b/rs/moq-lite/src/session.rs
+@@ -14,6 +14,22 @@ pub struct Session {
+ 	closed: bool,
+ }
+
++/// Snapshot of transport-level send statistics.
++///
++/// Fields are `None` when the underlying transport backend does not provide them
++/// (see `web_transport_trait::Stats` defaults).
++#[derive(Clone, Copy, Debug, Default)]
++pub struct SessionStats {
++	/// Congestion-controller estimated send bandwidth, in bits per second.
++	pub estimated_send_rate: Option<u64>,
++	/// Smoothed round-trip time estimate.
++	pub rtt: Option<std::time::Duration>,
++	/// Total bytes sent on the connection (including retransmissions).
++	pub bytes_sent: Option<u64>,
++	/// Total number of datagrams detected as lost.
++	pub packets_lost: Option<u64>,
++}
++
+ impl Session {
+ 	pub(super) fn new<S: web_transport_trait::Session>(session: S, version: Version) -> Self {
+ 		Self {
+@@ -28,6 +44,11 @@ impl Session {
+ 		self.version
+ 	}
+
++	/// Snapshot of transport send statistics, if the backend provides them.
++	pub fn stats(&self) -> SessionStats {
++		self.session.stats()
++	}
++
+ 	/// Close the underlying transport session.
+ 	pub fn close(&mut self, err: Error) {
+ 		if self.closed {
+@@ -57,6 +78,7 @@ impl Drop for Session {
+ trait SessionInner: Send + Sync {
+ 	fn close(&self, code: u32, reason: &str);
+ 	fn closed(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
++	fn stats(&self) -> SessionStats;
+ }
+
+ impl<S: web_transport_trait::Session> SessionInner for S {
+@@ -69,4 +91,15 @@ impl<S: web_transport_trait::Session> SessionInner for S {
+ 			let _ = S::closed(self).await;
+ 		})
+ 	}
++
++	fn stats(&self) -> SessionStats {
++		use web_transport_trait::Stats;
++		let stats = S::stats(self);
++		SessionStats {
++			estimated_send_rate: stats.estimated_send_rate(),
++			rtt: stats.rtt(),
++			bytes_sent: stats.bytes_sent(),
++			packets_lost: stats.packets_lost(),
++		}
++	}
+ }
+diff --git a/rs/moq-ffi/src/session.rs b/rs/moq-ffi/src/session.rs
+--- a/rs/moq-ffi/src/session.rs
++++ b/rs/moq-ffi/src/session.rs
+@@ -125,6 +125,21 @@
+ 	}
+ }
+
++/// Transport-level send statistics snapshot for the active QUIC connection.
++///
++/// Per-field `None` means the transport backend does not provide that metric.
++#[derive(uniffi::Record)]
++pub struct MoqSendStats {
++	/// Congestion-controller estimated send bandwidth, in bits per second.
++	pub estimated_send_rate_bps: Option<u64>,
++	/// Smoothed round-trip time estimate, in milliseconds.
++	pub rtt_ms: Option<u64>,
++	/// Total bytes sent on the connection (including retransmissions).
++	pub bytes_sent: Option<u64>,
++	/// Total number of datagrams detected as lost.
++	pub packets_lost: Option<u64>,
++}
++
+ #[derive(uniffi::Object)]
+ pub struct MoqSession {
+ 	inner: Option<moq_lite::Session>,
+@@ -157,4 +172,18 @@
+ 		// NOTE: we don't abort the closed Task because it will be aborted via above ^
+ 		// We'll get a slightly better error message instead of Cancelled.
+ 	}
++
++	/// Snapshot of transport send statistics for this session.
++	///
++	/// Returns `None` if the session handle is already dropped.
++	pub fn send_stats(&self) -> Option<MoqSendStats> {
++		let inner = self.inner.as_ref()?;
++		let stats = inner.stats();
++		Some(MoqSendStats {
++			estimated_send_rate_bps: stats.estimated_send_rate,
++			rtt_ms: stats.rtt.map(|d| d.as_millis() as u64),
++			bytes_sent: stats.bytes_sent,
++			packets_lost: stats.packets_lost,
++		})
++	}
+ }
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -53,3 +53,6 @@ debug = "line-tables-only"
+ [profile.release-with-debug]
+ inherits = "release"
+ debug = true
++
++[patch.crates-io]
++web-transport-quinn = { path = "vendor/web-transport-quinn" }

@@ -129,8 +129,10 @@ dependencies {
     // Location -- FusedLocationProviderClient for GPS telemetry
     implementation(libs.play.services.location)
 
-    // MoQ UniFFI bindings + native lib built from moq-ffi-v0.2.0 with rebind() patch.
-    implementation(files("libs/moq-rebind-0.2.0+rebind.aar"))
+    // MoQ UniFFI bindings + native lib built from moq-ffi-v0.2.0 with the rebind() +
+    // send_stats() patches and the web-transport-quinn priority-inversion fix.
+    // Rebuild pipeline: patches/README.md.
+    implementation(files("libs/moq-rebind-stats-0.2.0.aar"))
     implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
 
     debugImplementation(libs.androidx.compose.ui.tooling)
