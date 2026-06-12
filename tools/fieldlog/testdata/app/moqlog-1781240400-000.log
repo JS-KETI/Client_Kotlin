@@ -1,0 +1,11 @@
+# moqlog v1 app=0.1.0(1) model=samsung SM-S911N os=34 startedEpochMs=1781240400123 tz=Asia/Seoul
+--------- beginning of main
+1781240400.123  0     0 M Service: === SERVICE START ===
+      1781240400.456  4242  4242 I PublisherRuntime: publishingPath changed: null -> WIFI
+1781240401.000  4242  4250 I MoqPublisherImpl: [connLoop] attempt=1 url=https://moq.myyak.xyz:4443/anon
+1781240403.000  4242  4250 I MoqPublisherImpl: session ESTABLISHED (network=WIFI)
+1781240404.200  4242  4242 I PublisherRuntime: device registered: ANDROID-3F2A1B (path=ANDROID-3F2A1B/main)
+!!torn line without timestamp — 강제종료로 잘린 줄 예시!!
+1781240406.500  4242  4242 D PublisherRuntime: tx sample writeBps=1800000 sendRateBps=2400000 egressBps=1750000 rttMs=42 packetsLost=0 lowStreak=0 abrLevel=0
+1781240407.000  4242  4250 I AutoNetMigration: requestReconnect(): cancelling inflight connect
+1781240410.000  0     0 M Service: === SERVICE STOP ===

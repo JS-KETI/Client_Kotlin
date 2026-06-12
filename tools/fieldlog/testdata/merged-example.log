@@ -1,0 +1,23 @@
+────────────────────────────────
+══ === SERVICE START === ══
+2026-06-12 05:00:00.123Z [APP][M][Service] === SERVICE START ===
+2026-06-12 05:00:00.456Z [APP][I][PublisherRuntime] publishingPath changed: null -> WIFI
+2026-06-12 05:00:00.512Z [SRV][?] -- Boot abc123 --
+2026-06-12 05:00:00.512Z [SRV][moq-relay[2154]] INFO session accepted id=77 addr=121.165.10.20:51234
+2026-06-12 05:00:00.612Z [SRV][moq-relay[2154]] INFO announce broadcast=ANDROID-3F2A1B/main
+────────────────────────────────
+2026-06-12 05:00:01.000Z [APP][I][MoqPublisherImpl] [connLoop] attempt=1 url=https://moq.myyak.xyz:4443/anon
+2026-06-12 05:00:01.901Z [SRV][moq-api[811]] Device registered: ANDROID-3F2A1B
+2026-06-12 05:00:01.901Z [SRV][?] -- Reboot --
+────────────────────────────────
+2026-06-12 05:00:03.000Z [APP][I][MoqPublisherImpl] session ESTABLISHED (network=WIFI)
+2026-06-12 05:00:04.200Z [APP][I][PublisherRuntime] device registered: ANDROID-3F2A1B (path=ANDROID-3F2A1B/main)
+2026-06-12 05:00:04.200Z [APP][?] !!torn line without timestamp — 강제종료로 잘린 줄 예시!!
+2026-06-12 05:00:06.500Z [APP][D][PublisherRuntime] tx sample writeBps=1800000 sendRateBps=2400000 egressBps=1750000 rttMs=42 packetsLost=0 lowStreak=0 abrLevel=0
+────────────────────────────────
+2026-06-12 05:00:07.000Z [APP][I][AutoNetMigration] requestReconnect(): cancelling inflight connect
+────────────────────────────────
+══ === SERVICE STOP === ══
+2026-06-12 05:00:10.000Z [APP][M][Service] === SERVICE STOP ===
+2026-06-12 05:03:12.345Z [SRV][moq-relay[2154]] INFO publish track=video accepted (ANDROID-3F2A1B/main)
+2026-06-12 05:04:59.000Z [SRV][moq-relay[2154]] INFO session closed id=77 reason=idle-timeout

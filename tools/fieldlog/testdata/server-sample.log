@@ -1,0 +1,7 @@
+-- Boot abc123 --
+2026-06-12T05:00:00.512345+00:00 ip-172-31-7-77 moq-relay[2154]: INFO session accepted id=77 addr=121.165.10.20:51234
+2026-06-12T05:00:00.612345+00:00 ip-172-31-7-77 moq-relay[2154]: INFO announce broadcast=ANDROID-3F2A1B/main
+2026-06-12T05:00:01.901234+00:00 ip-172-31-7-77 moq-api[811]: Device registered: ANDROID-3F2A1B
+-- Reboot --
+2026-06-12T05:03:12.345678+00:00 ip-172-31-7-77 moq-relay[2154]: INFO publish track=video accepted (ANDROID-3F2A1B/main)
+2026-06-12T05:04:59.000000+00:00 ip-172-31-7-77 moq-relay[2154]: INFO session closed id=77 reason=idle-timeout

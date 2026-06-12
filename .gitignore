@@ -89,3 +89,6 @@ desktop.ini
 *.tmp
 *.bak
 *.orig
+
+# fieldlog 포맷 픽스처는 *.log 무시 규칙에서 제외 (README/merge 도구의 포맷 레퍼런스)
+!tools/fieldlog/testdata/**/*.log

@@ -1,0 +1,19 @@
+{
+    "appVersionName": "0.1.0",
+    "appVersionCode": 1,
+    "manufacturer": "samsung",
+    "model": "SM-S911N",
+    "androidSdk": 34,
+    "deviceId": "ANDROID-3F2A1B",
+    "broadcastPath": "ANDROID-3F2A1B/main",
+    "clockOffsetMs": null,
+    "selfTestResult": "OK",
+    "exportedAtEpochMs": 1781240700000,
+    "captureRangeEpochMs": [
+        1781240400123,
+        1781240410000
+    ],
+    "fileNames": [
+        "moqlog-1781240400-000.log"
+    ]
+}
