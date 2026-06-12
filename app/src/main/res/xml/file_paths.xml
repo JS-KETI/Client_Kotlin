@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LogExporter 가 만드는 zip(cacheDir/log_export/)만 외부에 노출한다 -->
+<paths>
+    <cache-path name="log_export" path="log_export/" />
+</paths>

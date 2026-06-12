@@ -12,6 +12,8 @@ import dev.jsketi.moqclient.data.rest.TelemetryReporter
 import dev.jsketi.moqclient.domain.usecase.ConnectUseCase
 import dev.jsketi.moqclient.domain.usecase.StreamToggleUseCase
 import dev.jsketi.moqclient.domain.usecase.SwitchNetworkUseCase
+import dev.jsketi.moqclient.util.log.FieldLogCapture
+import dev.jsketi.moqclient.util.log.LogExporter
 import dev.jsketi.moqclient.vm.PublisherViewModel
 
 object ServiceLocator {
@@ -19,9 +21,19 @@ object ServiceLocator {
     @Volatile
     private var runtimeInstance: PublisherRuntime? = null
 
+    @Volatile
+    private var fieldLogCaptureInstance: FieldLogCapture? = null
+
     fun runtime(context: Context): PublisherRuntime {
         return runtimeInstance ?: synchronized(this) {
             runtimeInstance ?: createRuntime(context.applicationContext).also { runtimeInstance = it }
+        }
+    }
+
+    fun fieldLogCapture(context: Context): FieldLogCapture {
+        return fieldLogCaptureInstance ?: synchronized(this) {
+            fieldLogCaptureInstance ?: FieldLogCapture(context.applicationContext)
+                .also { fieldLogCaptureInstance = it }
         }
     }
 
@@ -39,7 +51,8 @@ object ServiceLocator {
                 moqPublisher = runtime.moqPublisher
             ),
             runtime = runtime,
-            networkManager = runtime.networkManager
+            networkManager = runtime.networkManager,
+            logExporter = LogExporter(appContext, fieldLogCapture(appContext))
         )
     }
 

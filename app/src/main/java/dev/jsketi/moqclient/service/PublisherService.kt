@@ -16,6 +16,7 @@ import androidx.lifecycle.lifecycleScope
 import dev.jsketi.moqclient.R
 import dev.jsketi.moqclient.domain.model.PublishState
 import dev.jsketi.moqclient.domain.model.PublisherStatus
+import dev.jsketi.moqclient.util.log.FieldLogCapture
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 
@@ -24,9 +25,13 @@ class PublisherService : LifecycleService() {
     private lateinit var runtime: PublisherRuntime
     private lateinit var notificationManager: NotificationManager
     private lateinit var wakeLock: StreamingWakeLock
+    private lateinit var fieldLogCapture: FieldLogCapture
 
     override fun onCreate() {
         super.onCreate()
+        // 서비스 수명 경계를 필드 로그에 박아 둔다 — 사후 분석 시 세션 구간을 가르는 기준선.
+        fieldLogCapture = ServiceLocator.fieldLogCapture(applicationContext)
+        fieldLogCapture.writeMarker("Service", "=== SERVICE START ===")
         runtime = ServiceLocator.runtime(applicationContext)
         runtime.attachServiceLifecycleOwner(this)
         notificationManager = getSystemService(NotificationManager::class.java)
@@ -55,6 +60,10 @@ class PublisherService : LifecycleService() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
+        // 비개발자 필드 테스트에서 "앱을 스와이프로 닫았는지"를 사후 로그로 식별하기 위한 마커.
+        if (::fieldLogCapture.isInitialized) {
+            fieldLogCapture.writeMarker("Service", "=== TASK REMOVED (app swiped) ===")
+        }
         stopSelf()
         super.onTaskRemoved(rootIntent)
     }
@@ -69,6 +78,11 @@ class PublisherService : LifecycleService() {
             }
         }
         stopForegroundCompat()
+        // 기존 teardown 이 끝난 지점에서 종료 마커 + flush — 정상 종료 직후 손실 없이 파일에 남긴다.
+        if (::fieldLogCapture.isInitialized) {
+            fieldLogCapture.writeMarker("Service", "=== SERVICE STOP ===")
+            fieldLogCapture.flushNow()
+        }
         super.onDestroy()
     }
 
