@@ -100,7 +100,9 @@ class PublisherRuntime(
     }
 
     fun incrementMigrationCount() {
-        updateStatus { it.copy(migrationCount = it.migrationCount + 1) }
+        val next = _status.value.migrationCount + 1
+        updateStatus { it.copy(migrationCount = next) }
+        Log.i(TAG, "migrationCount incremented: $next")
     }
 
     /**
@@ -125,7 +127,13 @@ class PublisherRuntime(
                 it.copy(publishingPath = path, txStalled = false)
             }
         }
-        Log.i(TAG, "publishingPath changed: $previous -> $path")
+        val status = _status.value
+        Log.i(
+            TAG,
+            "publishingPath changed: $previous -> $path " +
+                "session=${moqPublisher.sessionState.value} osDefault=${networkManager.activePath.value} " +
+                "txStalled=${status.txStalled} txBps=${status.txBps}"
+        )
     }
 
     fun startServiceLifecycle() {
@@ -402,6 +410,13 @@ class PublisherRuntime(
                 val migrationCount = _status.value.migrationCount
                 val transitionSample = migrationCount != previousMigrationCount ||
                     sessionStateChangedSinceSample
+                if (transitionSample) {
+                    Log.i(
+                        TAG,
+                        "tx sample marked transition: migrationCount $previousMigrationCount->$migrationCount " +
+                            "sessionState=${moqPublisher.sessionState.value}"
+                    )
+                }
                 previousMigrationCount = migrationCount
                 sessionStateChangedSinceSample = false
 

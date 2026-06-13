@@ -185,12 +185,30 @@ class MoqPublisherImpl : MoqPublisher {
 
     override suspend fun rebind(socketAddress: String): Result<Unit> =
         runCatching {
+            val t0 = System.nanoTime()
             val moqClient = checkNotNull(client) { "MoQ client is not connected" }
+            Log.i(TAG, "[rebindLegacy] ENTER socket=$socketAddress state=${_sessionState.value}")
             moqClient.rebind(socketAddress)
-            Log.d(TAG, "rebind(): socket=$socketAddress")
+            val dtMs = (System.nanoTime() - t0) / 1_000_000
+            Log.i(TAG, "[rebindLegacy] OK socket=$socketAddress dt=${dtMs}ms")
             Unit
         }.onFailure { e ->
-            Log.e(TAG, "rebind() failed: ${e.message}", e)
+            Log.e(TAG, "[rebindLegacy] FAIL ${e.javaClass.simpleName}: ${e.message}", e)
+            dumpCauseChain("[rebindLegacy]", e)
+        }
+
+    override suspend fun rebindFd(socketFd: Int): Result<Unit> =
+        runCatching {
+            val t0 = System.nanoTime()
+            val moqClient = checkNotNull(client) { "MoQ client is not connected" }
+            Log.i(TAG, "[rebindFd] ENTER fd=$socketFd state=${_sessionState.value}")
+            moqClient.rebindFd(socketFd)
+            val dtMs = (System.nanoTime() - t0) / 1_000_000
+            Log.i(TAG, "[rebindFd] OK fd=$socketFd dt=${dtMs}ms")
+            Unit
+        }.onFailure { e ->
+            Log.e(TAG, "[rebindFd] FAIL fd=$socketFd ${e.javaClass.simpleName}: ${e.message}", e)
+            dumpCauseChain("[rebindFd]", e)
         }
 
     override suspend fun requestReconnect(): Result<Unit> =

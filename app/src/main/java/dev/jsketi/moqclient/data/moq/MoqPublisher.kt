@@ -47,6 +47,15 @@ interface MoqPublisher {
     suspend fun rebind(socketAddress: String): Result<Unit>
 
     /**
+     * Migrate the active QUIC session to an already-bound UDP socket fd.
+     *
+     * The fd must be a detached duplicate owned by native code after this call. This is the Android
+     * migration path: Kotlin creates a DatagramSocket, binds it to a concrete Android Network via
+     * Network.bindSocket(), detaches a dup fd, then moq-ffi turns that fd into a UdpSocket for quinn.
+     */
+    suspend fun rebindFd(socketFd: Int): Result<Unit>
+
+    /**
      * Force the current session to drop so the internal connect loop re-establishes a fresh QUIC
      * session. Unlike [rebind] (seamless, same connection), this is a brief reconnect — used as a
      * fallback when rebind() fails to migrate, and to shed the QUIC send backlog when the path is

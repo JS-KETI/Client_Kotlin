@@ -15,7 +15,7 @@ index e7210d20..798bb414 100644
  		let client = self
  			.config
  			.clone()
-@@ -24,18 +25,37 @@ impl Client {
+@@ -24,18 +25,61 @@ impl Client {
  		let publish = self.publish.as_ref().map(|o| o.inner().consume());
  		let consume = self.consume.as_ref().map(|o| o.inner().clone());
  
@@ -44,6 +44,30 @@ index e7210d20..798bb414 100644
 +			.map_err(|err| MoqError::Connect(format!("rebind: invalid address: {err}")))?;
 +		let socket = std::net::UdpSocket::bind(parsed)
 +			.map_err(|err| MoqError::Connect(format!("rebind: socket bind failed: {err}")))?;
++		self.rebind_socket(socket)
++	}
++
++	#[cfg(target_family = "unix")]
++	fn rebind_fd(&self, fd: i32) -> Result<(), MoqError> {
++		use std::os::fd::FromRawFd;
++
++		if fd < 0 {
++			return Err(MoqError::Connect(format!("rebindFd: invalid fd: {fd}")));
++		}
++
++		// Takes ownership of a dup fd supplied by Android/Kotlin. The caller must not close it.
++		let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
++		self.rebind_socket(socket)
++	}
++
++	#[cfg(not(target_family = "unix"))]
++	fn rebind_fd(&self, fd: i32) -> Result<(), MoqError> {
++		Err(MoqError::Connect(format!(
++			"rebindFd: fd-based rebind is unsupported on this target (fd={fd})"
++		)))
++	}
++
++	fn rebind_socket(&self, socket: std::net::UdpSocket) -> Result<(), MoqError> {
 +		let native = self
 +			.native
 +			.as_ref()
@@ -55,7 +79,7 @@ index e7210d20..798bb414 100644
  }
  
  #[derive(uniffi::Object)]
-@@ -54,6 +74,7 @@ impl MoqClient {
+@@ -54,6 +98,7 @@ impl MoqClient {
  				config: moq_native::ClientConfig::default(),
  				publish: None,
  				consume: None,
@@ -63,7 +87,7 @@ index e7210d20..798bb414 100644
  			}),
  		})
  	}
-@@ -85,7 +106,17 @@ impl MoqClient {
+@@ -85,7 +130,27 @@ impl MoqClient {
  	pub async fn connect(&self, url: String) -> Result<Arc<MoqSession>, MoqError> {
  		let url = Url::parse(&url)?;
  
@@ -79,6 +103,16 @@ index e7210d20..798bb414 100644
 +			.lock()
 +			.ok_or_else(|| MoqError::Cancelled)?;
 +		state.rebind(addr)
++	}
++
++	/// Rebind the active QUIC endpoint to an already-bound UDP socket fd.
++	pub fn rebind_fd(&self, fd: i32) -> Result<(), MoqError> {
++		let _guard = crate::ffi::RUNTIME.enter();
++		let state = self
++			.task
++			.lock()
++			.ok_or_else(|| MoqError::Cancelled)?;
++		state.rebind_fd(fd)
  	}
  
  	/// Cancel all current and future `connect()` calls.

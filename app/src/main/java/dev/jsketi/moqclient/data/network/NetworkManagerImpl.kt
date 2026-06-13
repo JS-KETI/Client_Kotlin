@@ -11,6 +11,7 @@ import android.os.Build
 import android.util.Log
 import dev.jsketi.moqclient.domain.model.NetworkHealth
 import dev.jsketi.moqclient.domain.model.NetworkPath
+import java.net.DatagramSocket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -163,10 +164,7 @@ class NetworkManagerImpl(
     }
 
     override fun selectPath(path: NetworkPath) {
-        val target = when (path) {
-            NetworkPath.WIFI -> _wifiNetwork.value
-            NetworkPath.CELLULAR -> _cellularNetwork.value
-        }
+        val target = networkFor(path)
         check(target != null) {
             "cannot select $path — corresponding Network handle is not available"
         }
@@ -179,6 +177,33 @@ class NetworkManagerImpl(
             boundNetwork = target
         }
         Log.i(TAG, "process bound to $path network=$target")
+    }
+
+    override fun networkFor(path: NetworkPath): Network? = when (path) {
+        NetworkPath.WIFI -> _wifiNetwork.value
+        NetworkPath.CELLULAR -> _cellularNetwork.value
+    }
+
+    override fun bindDatagramSocket(path: NetworkPath, socket: DatagramSocket): Network {
+        val target = networkFor(path)
+        check(target != null) {
+            "cannot bind DatagramSocket to $path; Network handle is not available"
+        }
+        val before = socket.localSocketAddress
+        return try {
+            Log.i(TAG, "socket bind start path=$path network=$target localBefore=$before")
+            target.bindSocket(socket)
+            Log.i(TAG, "socket bind success path=$path network=$target localAfter=${socket.localSocketAddress}")
+            target
+        } catch (t: Throwable) {
+            Log.e(
+                TAG,
+                "socket bind failed path=$path network=$target localBefore=$before " +
+                    "localAfter=${socket.localSocketAddress}: ${t.message}",
+                t
+            )
+            throw t
+        }
     }
 
     override fun clearProcessBinding() {
@@ -287,6 +312,7 @@ class NetworkManagerImpl(
                 val dbm = readWifiManagerRssi()
                 if (dbm != null) {
                     _wifiSignalDbm.value = dbm
+                    Log.d(TAG, "wifi rssi sample: signal=$dbm health=${_wifiHealth.value}")
                     updateWifiHealth(dbm, force = null)
                 }
             }
@@ -357,8 +383,8 @@ class NetworkManagerImpl(
         // Wi-Fi 신호 임계(dBm). 두 값 사이는 hysteresis 구간(이전 상태 유지).
         // PoC: 영상이 버벅이기 전에 선제 전환하도록 공격적으로 잡음.
         // (표준 권장은 weak -78 / usable -67 이지만, throughput 붕괴(~-80) 한참 전에 점프시킨다.)
-        private const val WIFI_WEAK_DBM = -68    // 이 값 이하로 떨어지면 즉시 Cellular fallback
+        private const val WIFI_WEAK_DBM = -65    // 이 값 이하로 떨어지면 즉시 Cellular fallback
         private const val WIFI_USABLE_DBM = -60  // Wi-Fi 복귀는 확실히 강할 때만 (8dB hysteresis)
-        private const val WIFI_RSSI_POLL_MS = 1_500L
+        private const val WIFI_RSSI_POLL_MS = 500L
     }
 }
