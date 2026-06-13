@@ -118,7 +118,13 @@ class PublisherRuntime(
     private fun setPublishingPath(path: NetworkPath?) {
         val previous = _status.value.publishingPath
         if (previous == path) return
-        updateStatus { it.copy(publishingPath = path) }
+        updateStatus {
+            if (path == null) {
+                it.copy(publishingPath = null)
+            } else {
+                it.copy(publishingPath = path, txStalled = false)
+            }
+        }
         Log.i(TAG, "publishingPath changed: $previous -> $path")
     }
 
@@ -446,7 +452,8 @@ class PublisherRuntime(
                             cameraEncoder.setTargetBitrate(next.toInt())
                             Log.i(TAG, "abr down: $currentTargetBps -> $next (available=$available)")
                         } else if (abrLadderIndex > 0 && sendRateBps != null &&
-                            sendRateBps >= ABR_BITRATE_LADDER_BPS[abrLadderIndex - 1] * 3 / 2
+                            abrUpCapacityBps(sendRateBps, egressBps) >=
+                            ABR_BITRATE_LADDER_BPS[abrLadderIndex - 1] * 3 / 2
                         ) {
                             // 업시프트는 보수적으로: 한 단계 위의 1.5 배 여유(estimate 기준)가
                             // 3 샘플(~9s) 연속일 때만 한 단계씩 (level skip 금지).
@@ -456,7 +463,7 @@ class PublisherRuntime(
                                 abrLadderIndex -= 1
                                 abrUpHoldSamples = 0
                                 cameraEncoder.setTargetBitrate(next.toInt())
-                                Log.i(TAG, "abr up: $currentTargetBps -> $next (estimate=$sendRateBps)")
+                                Log.i(TAG, "abr up: $currentTargetBps -> $next (estimate=$sendRateBps egress=$egressBps)")
                             }
                         } else {
                             abrUpHoldSamples = 0
@@ -470,8 +477,12 @@ class PublisherRuntime(
                         val estimateLow = sendRateBps != null && sendRateBps < TX_STALL_SEND_RATE_BPS
                         val egressLow = egressBps != null && egressBps < TX_STALL_SEND_RATE_BPS
                         val egressHigh = egressBps != null && egressBps >= TX_STALL_SEND_RATE_BPS
+                        val egressBacklogWriteThreshold = maxOf(
+                            TX_STALL_LOW_BPS_THRESHOLD,
+                            minOf(TX_STALL_SEND_RATE_BPS, currentTargetBps / 2)
+                        )
                         val sendRateCollapsed = (estimateLow && !egressHigh) ||
-                            (egressLow && bps >= TX_STALL_SEND_RATE_BPS)
+                            (egressLow && bps >= egressBacklogWriteThreshold)
                         val writeDead = bps <= TX_STALL_LOW_BPS_THRESHOLD || failuresDelta > 0
                         // 절단은 최후수단 — 같은 샘플에서 ABR 강하와 절단이 동시에 발동하지 않게,
                         // 강하한 샘플은 not-low 취급해 낮춘 비트레이트가 한 샘플(3s) 효과를 낼
@@ -511,6 +522,9 @@ class PublisherRuntime(
             }
         }
     }
+
+    private fun abrUpCapacityBps(sendRateBps: Long, egressBps: Long?): Long =
+        if (egressBps != null) minOf(sendRateBps, egressBps) else sendRateBps
 
     private suspend fun reportTelemetry(status: PublisherStatus) {
         if (status.deviceId.isBlank()) return

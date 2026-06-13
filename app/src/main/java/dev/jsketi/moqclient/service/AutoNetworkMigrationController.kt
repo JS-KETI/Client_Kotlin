@@ -135,17 +135,18 @@ class AutoNetworkMigrationController(
             boundTarget = null
             return
         }
+        val shedBacklog = shouldShedBacklog(s, target, decision)
         if (decision.currentPathUnusable) {
             // target == 현재 경로인데 unusable 이고 fallback 도 없음. 정체라면 같은 망에서라도
             // 백로그를 절단하고(아래), 아니면(RSSI 약함 등) 태그만 내린 채 대기.
-            if (s.txStalled) {
+            if (shedBacklog) {
                 scope?.launch(Dispatchers.IO) { migrate(target, "${decision.reason} (backlog cut)", shedBacklog = true) }
             }
             return
         }
         // 이미 그 경로로 송출 중: 정체면 같은 망 reconnect 로 백로그 절단, 아니면 할 일 없음.
         if (s.publishingPath == target) {
-            if (s.txStalled) {
+            if (shedBacklog) {
                 scope?.launch(Dispatchers.IO) { migrate(target, "stalled on $target (backlog cut)", shedBacklog = true) }
             }
             return
@@ -160,7 +161,7 @@ class AutoNetworkMigrationController(
         }
 
         val debounceMs = when {
-            s.txStalled -> STALL_FLEE_DEBOUNCE_MS // 백로그가 이미 3s+ 쌓였음 — 즉시 탈출
+            shedBacklog -> STALL_FLEE_DEBOUNCE_MS
             target == NetworkPath.CELLULAR -> CELLULAR_FALLBACK_DEBOUNCE_MS
             else -> WIFI_RETURN_DEBOUNCE_MS
         }
@@ -168,7 +169,7 @@ class AutoNetworkMigrationController(
 
         // 실제 전환은 service scope 에서 돌려 다음 신호의 collectLatest 취소로부터 보호한다.
         // 정체 중 전환이면 rebind 가 백로그를 들고 가지 않게 reconnect 로 절단한다.
-        scope?.launch(Dispatchers.IO) { migrate(target, decision.reason, shedBacklog = s.txStalled) }
+        scope?.launch(Dispatchers.IO) { migrate(target, decision.reason, shedBacklog = shedBacklog) }
     }
 
     private suspend fun migrate(target: NetworkPath, reason: String, shedBacklog: Boolean = false) {
@@ -290,10 +291,20 @@ class AutoNetworkMigrationController(
         return Decision(NetworkPath.WIFI, "wifi usable preferred")
     }
 
+    private fun shouldShedBacklog(s: Signals, target: NetworkPath, decision: Decision): Boolean {
+        if (!s.txStalled) return false
+        if (s.publishingPath == target) return true
+        if (decision.currentPathUnusable) return true
+
+        val recentWifiFlee = SystemClock.elapsedRealtime() - lastWifiStallFleeAtMs < STALL_FLEE_LATCH_MS
+        return target == NetworkPath.CELLULAR &&
+            (s.publishingPath == NetworkPath.WIFI || recentWifiFlee)
+    }
+
     private fun isPublishingPathUnusable(s: Signals): Boolean = when (s.publishingPath) {
         NetworkPath.WIFI -> s.wifi == null || s.wifiHealth == NetworkHealth.WEAK || s.txStalled
-        // 정체는 송출 경로에서 측정된 값이므로 Cellular 송출 중에도 동일하게 적용한다.
-        NetworkPath.CELLULAR -> s.cellular == null || s.txStalled
+        // Cellular stalls are handled as backlog cuts without dropping the publishing tag.
+        NetworkPath.CELLULAR -> s.cellular == null
         null -> false
     }
 
@@ -334,6 +345,7 @@ class AutoNetworkMigrationController(
         private const val CELLULAR_FALLBACK_DEBOUNCE_MS = 200L
         // 정체 탈출은 즉시에 가깝게 — txStalled 자체가 이미 3s 지속 판정이다.
         private const val STALL_FLEE_DEBOUNCE_MS = 200L
+        private const val STALL_FLEE_LATCH_MS = 2_000L
         // 백로그 절단(reconnect) 최소 간격. 링크가 인코더 비트레이트보다 계속 느리면 절단이
         // 반복되는데, 이 간격이 "지연 누적 vs 공백 빈도" 트레이드오프를 정한다.
         private const val STALL_CUT_COOLDOWN_MS = 10_000L
