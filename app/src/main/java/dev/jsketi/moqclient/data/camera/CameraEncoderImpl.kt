@@ -7,6 +7,7 @@ import android.media.MediaFormat
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.util.Size
 import android.view.Surface
@@ -252,6 +253,25 @@ class CameraEncoderImpl(
     }
 
     /** 반드시 lifecycleLock 안에서 호출. */
+    override fun requestKeyframe() {
+        synchronized(lifecycleLock) {
+            val codec = encoder
+            if (codec == null) {
+                Log.d(TAG, "requestKeyframe ignored: encoder not started")
+                return
+            }
+            runCatching {
+                codec.setParameters(
+                    Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) }
+                )
+            }.onSuccess {
+                Log.i(TAG, "encoder keyframe requested")
+            }.onFailure { t ->
+                Log.w(TAG, "requestKeyframe failed: ${t.message}", t)
+            }
+        }
+    }
+
     private fun cleanupInternalLocked() {
         encoderScope?.cancel()
         encoderScope = null
@@ -452,7 +472,8 @@ class CameraEncoderImpl(
             EncodedFrame(
                 payload = payload,
                 presentationTimeUs = info.presentationTimeUs,
-                isKeyframe = isKeyframe
+                isKeyframe = isKeyframe,
+                encodedAtElapsedMs = SystemClock.elapsedRealtime()
             )
         )
         if (!emitted) {

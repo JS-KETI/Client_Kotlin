@@ -45,4 +45,12 @@ interface CameraEncoder {
      * 인코더가 아직 시작 전이면 no-op.
      */
     fun setTargetBitrate(bps: Int)
+
+    /**
+     * Best-effort request for the encoder to emit a fresh keyframe soon.
+     *
+     * Used after path migration or live-frame drops so the receiver can resume from a clean H.264
+     * reference point without reconnecting the MoQ session. No-op if the encoder is not running.
+     */
+    fun requestKeyframe()
 }

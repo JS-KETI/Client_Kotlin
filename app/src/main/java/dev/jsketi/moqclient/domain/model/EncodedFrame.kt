@@ -12,5 +12,6 @@ package dev.jsketi.moqclient.domain.model
 class EncodedFrame(
     val payload: ByteArray,
     val presentationTimeUs: Long,
-    val isKeyframe: Boolean
+    val isKeyframe: Boolean,
+    val encodedAtElapsedMs: Long
 )

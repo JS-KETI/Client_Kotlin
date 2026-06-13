@@ -102,7 +102,8 @@ class PublisherRuntime(
     fun incrementMigrationCount() {
         val next = _status.value.migrationCount + 1
         updateStatus { it.copy(migrationCount = next) }
-        Log.i(TAG, "migrationCount incremented: $next")
+        Log.i(TAG, "migrationCount incremented: $next; requesting fresh keyframe")
+        cameraEncoder.requestKeyframe()
     }
 
     /**
@@ -126,6 +127,9 @@ class PublisherRuntime(
             } else {
                 it.copy(publishingPath = path, txStalled = false)
             }
+        }
+        if (path == null) {
+            cameraEncoder.requestKeyframe()
         }
         val status = _status.value
         Log.i(
@@ -220,7 +224,68 @@ class PublisherRuntime(
                 frameWriteFailures.set(0)
                 Log.i(TAG, "frameJob start")
                 var hasSentKeyframe = false
+                var observedMigrationCount = _status.value.migrationCount
+                var awaitFreshKeyframe = true
+                var freshKeyframeReason: String? = "stream start"
+                var latestOnlyDropCount = 0L
+
+                fun enterFreshKeyframeGate(reason: String) {
+                    if (!awaitFreshKeyframe || freshKeyframeReason != reason) {
+                        Log.i(TAG, "latest-only gate enter reason=$reason")
+                        cameraEncoder.requestKeyframe()
+                    }
+                    awaitFreshKeyframe = true
+                    freshKeyframeReason = reason
+                    hasSentKeyframe = false
+                }
+
+                fun dropLatestOnlyFrame(reason: String, frameAgeMs: Long, isKeyframe: Boolean) {
+                    latestOnlyDropCount += 1
+                    if (latestOnlyDropCount == 1L || latestOnlyDropCount % 30L == 0L) {
+                        Log.i(
+                            TAG,
+                            "latest-only drop count=$latestOnlyDropCount reason=$reason " +
+                                "age=${frameAgeMs}ms key=$isKeyframe"
+                        )
+                    }
+                }
+
                 cameraEncoder.encodedFrames.collect { frame ->
+                    val status = _status.value
+                    val migrationCount = status.migrationCount
+                    if (migrationCount != observedMigrationCount) {
+                        enterFreshKeyframeGate("migration $observedMigrationCount->$migrationCount")
+                        observedMigrationCount = migrationCount
+                    }
+
+                    val frameAgeMs = SystemClock.elapsedRealtime() - frame.encodedAtElapsedMs
+                    if (status.publishState == PublishState.STREAMING && status.publishingPath == null) {
+                        enterFreshKeyframeGate("publishing path unavailable")
+                        dropLatestOnlyFrame("path-null", frameAgeMs, frame.isKeyframe)
+                        return@collect
+                    }
+
+                    if (frameAgeMs > LIVE_FRAME_MAX_AGE_MS) {
+                        enterFreshKeyframeGate("stale encoder backlog")
+                        dropLatestOnlyFrame("stale", frameAgeMs, frame.isKeyframe)
+                        return@collect
+                    }
+
+                    if (awaitFreshKeyframe && !frame.isKeyframe) {
+                        dropLatestOnlyFrame("await-keyframe", frameAgeMs, isKeyframe = false)
+                        return@collect
+                    }
+
+                    if (awaitFreshKeyframe) {
+                        Log.i(
+                            TAG,
+                            "latest-only fresh keyframe acquired reason=$freshKeyframeReason " +
+                                "age=${frameAgeMs}ms pts=${frame.presentationTimeUs}"
+                        )
+                        awaitFreshKeyframe = false
+                        freshKeyframeReason = null
+                    }
+
                     if (!hasSentKeyframe && !frame.isKeyframe) {
                         return@collect
                     }
@@ -555,6 +620,7 @@ class PublisherRuntime(
         private const val MOQ_SESSION_CONNECTED_TIMEOUT_MS = 10_000L
         private const val TELEMETRY_INTERVAL_SECONDS = 3
         private const val HTTP_CONFLICT = 409
+        private const val LIVE_FRAME_MAX_AGE_MS = 500L
 
         // tx-stall 판정. 샘플은 TELEMETRY_INTERVAL_SECONDS(3s) 주기.
         // RSSI 와 무관한 처리량 붕괴(간섭/혼잡/felt-throttling)를 실측으로 잡는다.
