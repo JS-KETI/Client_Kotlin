@@ -13,6 +13,9 @@ import kotlinx.serialization.Serializable
  * GPS 미수신/권한거부 시 둘 다 null (default 없이 nullable 필수 필드 → null 도 항상 직렬화).
  * 좌표 변환 금지 — Location.latitude/longitude 를 그대로 전송.
  * location(String) 은 서버 미사용 (레거시 필드).
+ *
+ * streamRevision = 진짜 하드 재연결(MoQ 세션 완전 teardown+재수립) 누적 횟수. 0 부터 시작하고
+ * rebind/soft cut 에서는 증가하지 않는다. 서버는 nullable/default 로 취급 — 구 서버 호환.
  */
 @Serializable
 data class DeviceTelemetryRequest(
@@ -22,5 +25,6 @@ data class DeviceTelemetryRequest(
     val longitude: Double?,
     val missionId: String,
     val missionStatus: String,
-    val publisherTxBps: Long
+    val publisherTxBps: Long,
+    val streamRevision: Int = 0
 )

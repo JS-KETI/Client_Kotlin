@@ -65,6 +65,12 @@ class PublisherRuntime(
     private var frameJob: Job? = null
     private var migrationController: AutoNetworkMigrationController? = null
     private val frameWriteFailures = AtomicLong(0)
+    // Soft cut(latest-only refresh) 신호. frameJob 이 매 frame 이 값(elapsedRealtime)보다 오래된
+    // 백로그를 버리도록 한다. requestLatestOnlyRefresh()가 now 로 갱신 → 그 시점 이전 인코더 backlog
+    // 전부 폐기 + 다음 keyframe 까지 대기. 세션은 그대로 유지(reconnect 아님).
+    private val latestOnlyCutAtElapsedMs = AtomicLong(0L)
+    // 마지막 하드 재연결 시각(elapsedRealtime). 30s 쿨다운 enforcement. 0 = 아직 없음.
+    @Volatile private var lastHardReconnectAtMs: Long = 0L
     private var startedAtElapsedMs: Long = 0L
     private var streamStarted: Boolean = false
     private var serverRegistered: Boolean = false
@@ -118,6 +124,70 @@ class PublisherRuntime(
         updateStatus { it.copy(migrationCount = next) }
         Log.i(TAG, "migrationCount incremented: $next; requesting fresh keyframe")
         cameraEncoder.requestKeyframe()
+    }
+
+    /**
+     * Soft cut for a slow/congested path: discards the stale encoder frame backlog and requests a
+     * fresh keyframe so the receiver resumes from a clean reference point — WITHOUT tearing down the
+     * QUIC/MoQ session (publishingPath stays, no requestReconnect()).
+     *
+     * Reuses the existing latest-only gate in frameJob via [latestOnlyCutAtElapsedMs]: frames encoded
+     * before this instant are dropped and the collector re-arms its await-keyframe gate. This is the
+     * ONLY response to a pure throughput stall (txStalled) — keeping the session alive avoids the
+     * reconnect churn that a STALL-CUT HARD would cause.
+     */
+    fun requestLatestOnlyRefresh(reason: String) {
+        latestOnlyCutAtElapsedMs.set(SystemClock.elapsedRealtime())
+        cameraEncoder.requestKeyframe()
+        Log.i(TAG, "STALL-CUT SOFT latest-only refresh reason=$reason")
+    }
+
+    /**
+     * Hard reconnect for a genuinely dead path: tears down and re-establishes the MoQ session.
+     *
+     * Enforces a [HARD_RECONNECT_COOLDOWN_MS] floor between hard reconnects (returns false if still
+     * cooling down) and increments [PublisherStatus.streamRevision] only when a reconnect actually
+     * fires. Clears publishingPath first so the controller re-claims the path after the new session
+     * connects. Used only for confirmed hard failures (see runMetricsLoop hardFailed) — never for a
+     * pure throughput stall.
+     */
+    private fun requestHardReconnect(reason: String, counters: String): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        val sinceLast = now - lastHardReconnectAtMs
+        if (lastHardReconnectAtMs != 0L && sinceLast < HARD_RECONNECT_COOLDOWN_MS) {
+            Log.i(
+                TAG,
+                "STALL-CUT HARD suppressed (cooldown) reason=$reason " +
+                    "remainingMs=${HARD_RECONNECT_COOLDOWN_MS - sinceLast} $counters"
+            )
+            return false
+        }
+        markHardReconnect(reason, counters)
+        Log.i(TAG, "STALL-CUT HARD reconnect reason=$reason $counters")
+        // 새 세션이 어느 망에서 열릴지는 현재 프로세스 바인딩이 정한다 — 같은 경로 하드 재연결이므로
+        // 별도 bind 없이 바로 reconnect. publishingPath 를 내려 컨트롤러가 재연결 후 다시 claim 하게 한다.
+        markPublishingPath(null)
+        serviceScope?.launch(Dispatchers.IO) {
+            moqPublisher.requestReconnect().onFailure { e ->
+                Log.w(TAG, "STALL-CUT HARD requestReconnect failed: ${e.message}", e)
+            }
+        }
+        return true
+    }
+
+    /**
+     * Records that a genuine hard reconnect (full MoQ session teardown + re-establish) is happening:
+     * bumps [PublisherStatus.streamRevision] and stamps the cooldown. The actual requestReconnect()
+     * is the caller's responsibility. Used both by the runtime's own hard-failure path and by the
+     * controller when a rebind() fails and it falls back to reconnect (the only other genuine hard
+     * reconnect). NOT called for rebind/soft cut.
+     */
+    fun markHardReconnect(reason: String, counters: String = "") {
+        lastHardReconnectAtMs = SystemClock.elapsedRealtime()
+        val old = _status.value.streamRevision
+        val next = old + 1
+        updateStatus { it.copy(streamRevision = next) }
+        Log.i(TAG, "streamRevision incremented: $old -> $next (reason=$reason $counters)")
     }
 
     /**
@@ -248,6 +318,9 @@ class PublisherRuntime(
                 var awaitFreshKeyframe = true
                 var freshKeyframeReason: String? = "stream start"
                 var latestOnlyDropCount = 0L
+                // 직전까지 처리한 soft-cut 시각. latestOnlyCutAtElapsedMs 가 이보다 새로워지면
+                // (requestLatestOnlyRefresh 호출) 그 시점 이전 backlog 를 전부 버리고 keyframe 재대기.
+                var observedSoftCutAtMs = latestOnlyCutAtElapsedMs.get()
 
                 fun enterFreshKeyframeGate(reason: String) {
                     if (!awaitFreshKeyframe || freshKeyframeReason != reason) {
@@ -279,6 +352,19 @@ class PublisherRuntime(
                     }
 
                     val frameAgeMs = SystemClock.elapsedRealtime() - frame.encodedAtElapsedMs
+
+                    // Soft cut: requestLatestOnlyRefresh()가 가리키는 시각 이전에 인코딩된 backlog 는
+                    // 전부 폐기하고 fresh keyframe 을 기다린다(세션은 유지).
+                    val softCutAtMs = latestOnlyCutAtElapsedMs.get()
+                    if (softCutAtMs != observedSoftCutAtMs) {
+                        enterFreshKeyframeGate("soft cut latest-only")
+                        observedSoftCutAtMs = softCutAtMs
+                    }
+                    if (softCutAtMs != 0L && frame.encodedAtElapsedMs <= softCutAtMs && !awaitFreshKeyframe) {
+                        // 안전망: 게이트가 이미 풀린 뒤에도 cut 시각 이전 frame 이 새면 다시 버린다.
+                        enterFreshKeyframeGate("soft cut latest-only")
+                    }
+
                     if (status.streamActive && status.publishingPath == null) {
                         enterFreshKeyframeGate("publishing path unavailable")
                         dropLatestOnlyFrame("path-null", frameAgeMs, frame.isKeyframe)
@@ -456,8 +542,13 @@ class PublisherRuntime(
         var streamingBpsSamples = 0
         var consecutiveLowSamples = 0
         var previousStalled = false
+        // 하드 실패 연속 샘플 수. ack/egress/bytesSent 가 한 발짝도 안 늘고 write 도 ~0 인 샘플의 streak.
+        var hardStreak = 0
         // 실측 egress 추적용. bytesSent 는 per-connection 누적이라 reconnect 시 0 으로 리셋된다.
         var previousBytesSent: Long? = null
+        // bytesSent 가 마지막으로 "증가"한 시각(elapsedRealtime). 하드 실패(egress 완전 정지) 판정용.
+        // 세션 전환/리셋 때 갱신해 false positive 를 막는다. 0 = 아직 기준 없음.
+        var lastBytesSentProgressAtMs = 0L
         // migrationCount 가 바뀐(= rebind/reconnect claim 직후) 샘플은 전환 잡음 — 판정을 쉰다.
         var previousMigrationCount = _status.value.migrationCount
         // 컨트롤러와 무관한 자발적 reconnect(relay 측 drop 등)는 migrationCount 를 안 바꾼다 —
@@ -510,14 +601,29 @@ class PublisherRuntime(
 
                 // 실측 UDP egress(재전송 포함). estimate(cwnd*8/RTT 추정치)와 달리 망이 실제로
                 // 흡수한 양이다. delta < 0 은 reconnect 로 카운터가 리셋된 것 → unknown 처리.
+                // egressValid=false 인 샘플(전환 직후 / 카운터 리셋)은 egressBps 를 신뢰하지 않으며
+                // stall 판정에서 제외한다(아래 sendRateCollapsed/egress* 가 egressBps==null 로 우회).
                 val bytesSent = sendStats?.bytesSent
                 var egressBps: Long? = null
+                var egressValid = false
+                // bytesSentDelta = 이번 3s 윈도우의 실측 송신 증가분(unknown 이면 null).
+                var bytesSentDelta: Long? = null
                 if (transitionSample) {
-                    previousBytesSent = null
+                    // 세션 전환/통계 리셋 직후 — egress 기준선을 새로 잡는다(이 샘플은 무판정).
+                    previousBytesSent = bytesSent
+                    lastBytesSentProgressAtMs = SystemClock.elapsedRealtime()
                 } else {
                     val prevSent = previousBytesSent
                     if (prevSent != null && bytesSent != null && bytesSent >= prevSent) {
-                        egressBps = (bytesSent - prevSent) * 8 / TELEMETRY_INTERVAL_SECONDS
+                        bytesSentDelta = bytesSent - prevSent
+                        egressBps = bytesSentDelta * 8 / TELEMETRY_INTERVAL_SECONDS
+                        egressValid = true
+                        if (bytesSentDelta > 0) {
+                            lastBytesSentProgressAtMs = SystemClock.elapsedRealtime()
+                        }
+                    } else if (prevSent != null && bytesSent != null && bytesSent < prevSent) {
+                        // 카운터가 줄었다 = reconnect 리셋 → 기준선 재설정, 무판정.
+                        lastBytesSentProgressAtMs = SystemClock.elapsedRealtime()
                     }
                     previousBytesSent = bytesSent
                 }
@@ -525,8 +631,9 @@ class PublisherRuntime(
                 if (streaming) {
                     streamingBpsSamples += 1
                     if (transitionSample) {
-                        // 전환 샘플은 stall/ABR 판정 모두 skip (post-migration/reconnect false positive 방지).
+                        // 전환 샘플은 stall/ABR/hard 판정 모두 skip (post-migration/reconnect false positive 방지).
                         consecutiveLowSamples = 0
+                        hardStreak = 0
                         abrUpHoldSamples = 0
                     } else {
                         // 인코더 ABR — txStalled 보다 먼저 평가되는 1차 방어선. 링크가 현재 목표
@@ -572,11 +679,12 @@ class PublisherRuntime(
                             abrUpHoldSamples = 0
                         }
 
-                        // tx stall: grace 이후에 (a) estimate 붕괴 — 단 실측 egress 가 임계 이상으로
-                        // 멀쩡하면 cwnd 일시 수축으로 보고 거부(veto) — 거나 (b) 앱은 거의 풀
+                        // tx stall(soft): grace 이후에 (a) estimate 붕괴 — 단 실측 egress 가 임계
+                        // 이상으로 멀쩡하면 cwnd 일시 수축으로 보고 거부(veto) — 거나 (b) 앱은 거의 풀
                         // 비트레이트로 쓰는데 실측 egress 가 붕괴(estimate 가 stale-high 로 남는
-                        // 케이스)했거나 (c) writeFrame 자체가 죽었으면 정체. (c)의 bps 는 writeFrame
-                        // "투입량"이라 망이 막혀도 풀 비트레이트로 보인다.
+                        // 케이스)했거나 (c) writeFrame 투입량이 near-zero(망이 막혀 인코더가 막힘)면
+                        // 정체. 이건 "느림/혼잡/degraded" 신호일 뿐 — 대응은 soft cut(latest-only)이고
+                        // 세션은 유지한다. 진짜 죽음(hardFailed)은 아래에서 따로 판정.
                         val estimateLow = sendRateBps != null && sendRateBps < TX_STALL_SEND_RATE_BPS
                         val egressLow = egressBps != null && egressBps < TX_STALL_SEND_RATE_BPS
                         val egressHigh = egressBps != null && egressBps >= TX_STALL_SEND_RATE_BPS
@@ -586,40 +694,117 @@ class PublisherRuntime(
                         )
                         val sendRateCollapsed = (estimateLow && !egressHigh) ||
                             (egressLow && bps >= egressBacklogWriteThreshold)
-                        val writeDead = bps <= TX_STALL_LOW_BPS_THRESHOLD || failuresDelta > 0
-                        // 절단은 최후수단 — 같은 샘플에서 ABR 강하와 절단이 동시에 발동하지 않게,
+                        val writeNearZero = bps <= TX_STALL_LOW_BPS_THRESHOLD
+                        // 절단은 최후수단 — 같은 샘플에서 ABR 강하와 soft cut 이 동시에 발동하지 않게,
                         // 강하한 샘플은 not-low 취급해 낮춘 비트레이트가 한 샘플(3s) 효과를 낼
                         // 시간을 준다.
-                        val low = !abrDownshifted && (sendRateCollapsed || writeDead)
+                        val low = !abrDownshifted && (sendRateCollapsed || writeNearZero)
                         consecutiveLowSamples = if (low) consecutiveLowSamples + 1 else 0
+
+                        // 하드 실패 후보(보수적): 실측 egress 가 HARD_EGRESS_STALL_MS 이상 한 발짝도
+                        // 안 늘었고(=망이 1바이트도 못 흡수) write 도 ~0 으로 죽어 있는 샘플. egress 가
+                        // valid 일 때만(전환/리셋 직후 제외) 카운트한다. writeFrame 연속 실패도 포함.
+                        val egressFrozenMs = if (lastBytesSentProgressAtMs == 0L) {
+                            0L
+                        } else {
+                            SystemClock.elapsedRealtime() - lastBytesSentProgressAtMs
+                        }
+                        val egressFrozen = egressValid && egressFrozenMs >= HARD_EGRESS_STALL_MS
+                        val writeFailing = failuresDelta > 0
+                        val hardSample = (egressFrozen && writeNearZero) || writeFailing
+                        hardStreak = if (hardSample) hardStreak + 1 else 0
                     }
-                    Log.d(
-                        TAG,
-                        "tx sample writeBps=$bps sendRateBps=$sendRateBps egressBps=$egressBps " +
-                            "rttMs=${sendStats?.rttMs} packetsLost=${sendStats?.packetsLost} " +
-                            "lowStreak=$consecutiveLowSamples abrLevel=$abrLadderIndex"
-                    )
                 } else {
                     streamingBpsSamples = 0
                     consecutiveLowSamples = 0
+                    hardStreak = 0
                     abrLadderIndex = 0
                     abrUpHoldSamples = 0
                 }
-                val stalled = streaming &&
+                val softStalled = streaming &&
                     streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
                     consecutiveLowSamples >= TX_STALL_SAMPLES
-                if (stalled != previousStalled) {
+                // 하드 실패: (1) MoQ 세션이 실제 FAILED 거나 (2) egress 동결+write 죽음 또는 writeFrame
+                // 연속 실패가 HARD_STREAK_SAMPLES 이상 지속. 전환 샘플 직후가 아닐 때만(grace) 본다.
+                val sessionFailed = moqPublisher.sessionState.value == MoqSessionState.FAILED
+                val hardFailed = streaming &&
+                    streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
+                    (sessionFailed || hardStreak >= HARD_STREAK_SAMPLES)
+
+                val softStallRisingEdge = softStalled && !previousStalled
+                if (softStalled != previousStalled) {
                     Log.i(
                         TAG,
-                        "tx stalled changed: $stalled (writeBps=$bps sendRateBps=$sendRateBps " +
+                        "tx stalled changed: $softStalled (writeBps=$bps sendRateBps=$sendRateBps " +
                             "egressBps=$egressBps rttMs=${sendStats?.rttMs} " +
                             "packetsLost=${sendStats?.packetsLost} failuresDelta=$failuresDelta)"
                     )
-                    previousStalled = stalled
+                    previousStalled = softStalled
                 }
 
-                updateStatus { it.copy(uptimeSeconds = uptimeSeconds, txBps = bps, txStalled = stalled) }
+                // 풍부한 per-3s tx 샘플 로그(현장 분석용). writeBps 는 앱이 MoQ producer 에 투입한
+                // 바이트/s(실제 업로드 속도 아님), quicEgressBps 는 QUIC bytesSent delta(egressValid 가
+                // false 면 무효 — 전환/리셋 직후). boundTarget 은 컨트롤러가 마지막으로 bind/rebind 한 경로.
+                val statusNow = _status.value
+                Log.i(
+                    TAG,
+                    "tx sample publishingPath=${statusNow.publishingPath} " +
+                        "boundTarget=${migrationController?.boundTarget()} " +
+                        "osDefault=${networkManager.activePath.value} " +
+                        "wifiHandle=${networkManager.wifiNetwork.value} " +
+                        "cellHandle=${networkManager.cellularNetwork.value} " +
+                        "sessionState=${moqPublisher.sessionState.value} " +
+                        "migrationCount=${statusNow.migrationCount} " +
+                        "abrTargetBps=${ABR_BITRATE_LADDER_BPS[abrLadderIndex]} " +
+                        "writeBps=$bps quicSendRateBps=$sendRateBps quicEgressBps=$egressBps " +
+                        "egressValid=$egressValid bytesSentDelta=$bytesSentDelta " +
+                        "rttMs=${sendStats?.rttMs} packetsLost=${sendStats?.packetsLost} " +
+                        "softStalled=$softStalled hardFailed=$hardFailed " +
+                        "lowStreak=$consecutiveLowSamples hardStreak=$hardStreak"
+                )
+
+                updateStatus { it.copy(uptimeSeconds = uptimeSeconds, txBps = bps, txStalled = softStalled) }
+
+                // 같은 경로 위 대응. 하드 실패가 우선 — 진짜 죽음이면 reconnect(streamRevision++),
+                // 아니면 단순 정체이므로 soft cut(latest-only refresh)로 세션을 살린 채 backlog 만 버린다.
+                // 단 cross-path(Wi-Fi→Cellular) 전환은 컨트롤러가 txStalled 를 보고 rebind 로 처리하므로
+                // 여기서 soft cut 은 publishingPath 가 CELLULAR(또는 미지정)일 때만 — Wi-Fi 정체는
+                // 컨트롤러의 cellular rebind 가 1차 대응이고 soft cut 은 그 사이 backlog 정리로 충분.
+                val counters = "writeBps=$bps sendRateBps=$sendRateBps egressBps=$egressBps " +
+                    "egressValid=$egressValid bytesSentDelta=$bytesSentDelta " +
+                    "rttMs=${sendStats?.rttMs} packetsLost=${sendStats?.packetsLost} " +
+                    "failuresDelta=$failuresDelta lowStreak=$consecutiveLowSamples hardStreak=$hardStreak " +
+                    "sessionState=${moqPublisher.sessionState.value}"
+                if (hardFailed) {
+                    val reason = if (sessionFailed) "session FAILED" else "egress frozen + write dead"
+                    val fired = requestHardReconnect(reason, counters)
+                    if (fired) {
+                        // reconnect 가 새 세션을 세우면 카운터가 리셋되므로 streak 도 초기화.
+                        hardStreak = 0
+                        consecutiveLowSamples = 0
+                    }
+                } else if (softStallRisingEdge) {
+                    // soft cut 은 정체 진입 edge 에서만 — 매 샘플 keyframe 재요청으로 혼잡 링크의
+                    // 대역을 더 갉아먹지 않도록. 정체가 풀렸다 다시 빠지면 그때 또 한 번.
+                    requestLatestOnlyRefresh(
+                        "soft stall path=${_status.value.publishingPath} $counters"
+                    )
+                }
+
                 reportTelemetry(_status.value)
+
+                // Cellular 송출 중에는 실측 셀룰러 처리량을 별도 라인으로 남겨 현장 분석을 쉽게 한다.
+                // writeBps 는 "앱이 MoQ producer 에 투입한 바이트/s"(실제 셀룰러 업로드 속도가 아님),
+                // egressBps 는 QUIC bytesSent delta(전환 직후 egressValid=false 면 무효).
+                if (streaming && _status.value.publishingPath == NetworkPath.CELLULAR) {
+                    Log.i(
+                        TAG,
+                        "CELLULAR_THROUGHPUT passive cellularMoqWriteBps=$bps " +
+                            "cellularQuicSendRateBps=$sendRateBps cellularQuicEgressBps=$egressBps " +
+                            "egressValid=$egressValid rttMs=${sendStats?.rttMs} " +
+                            "packetsLost=${sendStats?.packetsLost}"
+                    )
+                }
             } else {
                 updateStatus { it.copy(uptimeSeconds = uptimeSeconds) }
             }
@@ -653,6 +838,16 @@ class PublisherRuntime(
         // QUIC estimated send rate 가 이 값 미만이면 정체. 인코더 2 Mbps 의 30% — 그 아래면
         // 백로그가 누적되기 시작한 지 한참이고 시청 품질은 이미 무너져 있다.
         private const val TX_STALL_SEND_RATE_BPS = 600_000L
+
+        // ── 하드 재연결(genuine failure) 판정 — soft stall 과 엄격히 분리 ──
+        // 실측 egress(bytesSent) 가 이 시간 이상 한 발짝도 안 늘어야(=망이 1바이트도 못 흡수)
+        // 하드 후보. 보수적으로 12s — 짧은 셀룰러 핸드오버/일시 정체로는 트립하지 않게.
+        private const val HARD_EGRESS_STALL_MS = 12_000L
+        // 하드 후보 샘플이 이만큼 연속(=~9s)일 때만 하드 reconnect. egress 동결(12s)+write 죽음과
+        // 합쳐 실질 ~12s 이상 완전 정지가 확인되어야 한다.
+        private const val HARD_STREAK_SAMPLES = 3
+        // 하드 재연결 사이 최소 간격(쿨다운). 30s 안에는 두 번째 하드 reconnect 를 막아 churn 차단.
+        private const val HARD_RECONNECT_COOLDOWN_MS = 30_000L
 
         // 인코더 ABR 사다리(비트레이트만 조절 — 해상도/fps/profile 불변). index 0 = 기본값으로,
         // CameraEncoderImpl 의 시작 비트레이트(2 Mbps)와 일치해야 한다. 바닥(500k)은 의도적으로

@@ -45,9 +45,11 @@ class AutoNetworkMigrationController(
 
     @Volatile private var inProgressTarget: NetworkPath? = null
     @Volatile private var boundTarget: NetworkPath? = null
-    @Volatile private var lastSamePathCutAtMs: Long = 0L
-    @Volatile private var lastFleeCutAtMs: Long = 0L
     @Volatile private var lastWifiStallFleeAtMs: Long = 0L
+    // Cellular→Wi-Fi 복귀 디바운스: 복귀 조건(osDefault=WIFI, wifiHealth=USABLE, RSSI 회복,
+    // stall-flee holdoff 경과, txStalled=false)이 "전부" 충족되기 시작한 시각. 하나라도 깨지면 0 으로
+    // 리셋. WIFI_RETURN_SUSTAIN_MS 동안 연속 충족돼야 실제 복귀한다(짧은 회복으로 왕복 금지).
+    @Volatile private var wifiReturnClearSinceMs: Long = 0L
 
     private var scope: CoroutineScope? = null
     private var observeJob: Job? = null
@@ -65,6 +67,9 @@ class AutoNetworkMigrationController(
         scope = null
         Log.i(TAG, "controller stop")
     }
+
+    /** 컨트롤러가 마지막으로 bind/rebind 한 송출 경로(없으면 null). 진단 로그용. */
+    fun boundTarget(): NetworkPath? = boundTarget
 
     private suspend fun observe() {
         val publishSignals = runtime.status
@@ -136,22 +141,25 @@ class AutoNetworkMigrationController(
         }
 
         val shedBacklog = shouldShedBacklog(s, target, decision)
+        // currentPathUnusable = 현재 경로가 막혔는데 대체 망이 없다(예: Wi-Fi 약화/정체인데 셀룰러 없음).
+        // 예전엔 여기서 bind+reconnect(STALL-CUT HARD) 로 churn 을 냈다. 이제는 절대 reconnect 하지
+        // 않는다 — 갈 곳이 없으니 세션을 유지하고, 정체면 runtime 이 soft cut(latest-only)으로 backlog
+        // 만 정리한다. (hardFailed 일 때만 runtime 이 보수적으로 reconnect.)
         if (decision.currentPathUnusable) {
             if (shedBacklog) {
-                Log.i(TAG, "schedule same-target backlog cut target=$target reason=${decision.reason}")
-                scope?.launch(Dispatchers.IO) {
-                    migrate(target, "${decision.reason} (backlog cut)", shedBacklog = true)
-                }
+                Log.i(TAG, "same-target stall, no alternative path → defer to runtime soft cut target=$target")
+                runtime.requestLatestOnlyRefresh("controller same-target stall target=$target (no alt)")
             }
             return
         }
 
+        // 같은 경로 정체(예: CELLULAR 송출 중 CELLULAR 정체). cross-path 전환 대상이 없으므로
+        // reconnect 하지 않고 soft cut 만 — 세션 유지. (runtime 도 rising-edge 에서 soft cut 을
+        // 걸지만, 컨트롤러 신호로도 한 번 더 명시적으로 backlog 를 턴다.)
         if (s.publishingPath == target) {
             if (shedBacklog) {
-                Log.i(TAG, "schedule current-path backlog cut target=$target")
-                scope?.launch(Dispatchers.IO) {
-                    migrate(target, "stalled on $target (backlog cut)", shedBacklog = true)
-                }
+                Log.i(TAG, "same-path stall → soft cut only (keep session) target=$target")
+                runtime.requestLatestOnlyRefresh("controller same-path stall target=$target")
             }
             return
         }
@@ -219,33 +227,12 @@ class AutoNetworkMigrationController(
                         runtime.incrementMigrationCount()
                     }
 
-                    shedBacklog && session == MoqSessionState.CONNECTED -> {
-                        val now = SystemClock.elapsedRealtime()
-                        val lastCutAtMs = if (samePath) lastSamePathCutAtMs else lastFleeCutAtMs
-                        if (now - lastCutAtMs < STALL_CUT_COOLDOWN_MS) {
-                            Log.i(
-                                TAG,
-                                "[migrate#$attemptId] SKIP stall-cut cooldown target=$target " +
-                                    "remainingMs=${STALL_CUT_COOLDOWN_MS - (now - lastCutAtMs)}"
-                            )
-                            return@withLock
-                        }
-                        Log.i(TAG, "[migrate#$attemptId] STALL-CUT bind+reconnect target=$target samePath=$samePath")
-                        val bind = runCatching { networkManager.selectPath(target) }
-                        if (bind.isFailure) {
-                            val e = bind.exceptionOrNull()
-                            Log.w(TAG, "[migrate#$attemptId] STALL-CUT bind failed target=$target: ${e?.message}", e)
-                            return@withLock
-                        }
-                        boundTarget = target
-                        if (samePath) lastSamePathCutAtMs = now else lastFleeCutAtMs = now
-                        runtime.markPublishingPath(null)
-                        moqPublisher.requestReconnect()
-                        Log.i(TAG, "[migrate#$attemptId] STALL-CUT reconnect requested target=$target")
-                    }
-
+                    // Cross-path 전환(예: Wi-Fi 정체 → Cellular)은 REBIND 로 처리한다 — 세션을 유지한
+                    // 채 QUIC 소켓만 새 망으로 옮긴다. 예전의 STALL-CUT(markPublishingPath(null) +
+                    // requestReconnect) 분기는 churn 의 근원이라 제거했다. rebind 성공 시 세션 유지,
+                    // rebind 실패 시에만 그 안에서 reconnect fallback 이 돈다(아래 onFailure).
                     session == MoqSessionState.CONNECTED -> {
-                        Log.i(TAG, "[migrate#$attemptId] REBIND start target=$target reason=$reason")
+                        Log.i(TAG, "[migrate#$attemptId] REBIND start target=$target reason=$reason shedBacklog=$shedBacklog")
                         switchNetworkUseCase(target)
                             .onSuccess {
                                 Log.i(TAG, "[migrate#$attemptId] REBIND success target=$target")
@@ -272,6 +259,8 @@ class AutoNetworkMigrationController(
                                         )
                                     }
                                 runtime.markPublishingPath(null)
+                                // rebind 실패 후 reconnect 는 진짜 하드 재연결 — streamRevision 을 올린다.
+                                runtime.markHardReconnect("rebind failed target=$target", "migrate#$attemptId")
                                 moqPublisher.requestReconnect()
                                 Log.i(TAG, "[migrate#$attemptId] reconnect requested target=$target")
                             }
@@ -327,15 +316,44 @@ class AutoNetworkMigrationController(
             return Decision(NetworkPath.CELLULAR, "wifi in stall-flee holdoff")
         }
 
-        if (s.publishingPath != NetworkPath.WIFI && s.osDefaultPath != NetworkPath.WIFI) {
+        // 이미 Wi-Fi 송출 중이면 그대로 유지(복귀 게이트는 cellular→wifi 복귀에만 적용).
+        if (s.publishingPath == NetworkPath.WIFI) {
+            wifiReturnClearSinceMs = 0L
+            return Decision(NetworkPath.WIFI, "wifi usable preferred")
+        }
+
+        // 여기부터는 cellular(또는 미지정)에서 Wi-Fi 로 복귀를 검토하는 경로.
+        // 복귀는 모든 조건이 WIFI_RETURN_SUSTAIN_MS 동안 연속 충족돼야 한다.
+        val rssi = networkManager.wifiSignalDbm.value
+        val rssiRecovered = rssi == null || rssi >= WIFI_RETURN_DBM
+        val holdoffElapsed =
+            SystemClock.elapsedRealtime() - lastWifiStallFleeAtMs >= WIFI_STALL_FLEE_HOLDOFF_MS
+        val allClear = s.osDefaultPath == NetworkPath.WIFI &&
+            s.wifiHealth == NetworkHealth.USABLE &&
+            rssiRecovered &&
+            holdoffElapsed &&
+            !s.txStalled
+        if (!allClear) {
+            wifiReturnClearSinceMs = 0L
             return if (cellular != null) {
-                Decision(NetworkPath.CELLULAR, "wifi usable, waiting for os default wifi")
+                Decision(NetworkPath.CELLULAR, "wifi return not all-clear (waiting)")
             } else {
-                Decision(null, "wifi usable, waiting for os default wifi; no cellular")
+                Decision(null, "wifi return not all-clear; no cellular")
             }
         }
 
-        return Decision(NetworkPath.WIFI, "wifi usable preferred")
+        // 모든 조건 충족 — 연속 지속 시간을 latch 해 sustain 을 넘겼을 때만 복귀.
+        val now = SystemClock.elapsedRealtime()
+        if (wifiReturnClearSinceMs == 0L) wifiReturnClearSinceMs = now
+        val sustainedMs = now - wifiReturnClearSinceMs
+        if (sustainedMs < WIFI_RETURN_SUSTAIN_MS) {
+            return if (cellular != null) {
+                Decision(NetworkPath.CELLULAR, "wifi return clear, sustaining ${sustainedMs}ms")
+            } else {
+                Decision(null, "wifi return clear but no cellular; sustaining")
+            }
+        }
+        return Decision(NetworkPath.WIFI, "wifi return all-clear sustained ${sustainedMs}ms")
     }
 
     private fun shouldShedBacklog(s: Signals, target: NetworkPath, decision: Decision): Boolean {
@@ -405,7 +423,11 @@ class AutoNetworkMigrationController(
         private const val CELLULAR_FALLBACK_DEBOUNCE_MS = 200L
         private const val STALL_FLEE_DEBOUNCE_MS = 200L
         private const val STALL_FLEE_LATCH_MS = 2_000L
-        private const val STALL_CUT_COOLDOWN_MS = 10_000L
         private const val WIFI_STALL_FLEE_HOLDOFF_MS = 30_000L
+        // Cellular→Wi-Fi 복귀: 모든 조건이 이만큼 연속 충족돼야 복귀(왕복 방지). 7s.
+        private const val WIFI_RETURN_SUSTAIN_MS = 7_000L
+        // 복귀에 요구하는 최소 RSSI(dBm). NetworkManager 의 USABLE 임계(-60)와 정합. RSSI 미지원
+        // 단말(null)은 wifiHealth==USABLE 로만 판정한다.
+        private const val WIFI_RETURN_DBM = -60
     }
 }

@@ -17,5 +17,8 @@ data class PublisherStatus(
     // writeFrame 죽음(near-zero 투입/연속 실패)을 백업 신호로 쓴다.
     val txStalled: Boolean = false,
     val migrationCount: Int = 0,
+    // 진짜 하드 재연결(MoQ 세션 완전 teardown+재수립) 횟수. rebind/soft cut 에서는 절대 증가하지
+    // 않는다. 텔레메트리로 서버에 보고되어 현장 churn(세션 재수립 빈도)을 추적하는 지표.
+    val streamRevision: Int = 0,
     val uptimeSeconds: Long = 0L
 )
