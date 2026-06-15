@@ -45,7 +45,8 @@ class PublisherService : LifecycleService() {
             runtime.status.collect { status ->
                 notificationManager.notify(NOTIFICATION_ID, buildNotification(status))
                 // Hold CPU/Wi-Fi locks only while actively streaming; release on any other state.
-                wakeLock.setStreaming(status.publishState == PublishState.STREAMING)
+                // publishState 가 아닌 streamActive 기준 — ERROR 로 표시돼도 송출 중이면 락을 유지한다.
+                wakeLock.setStreaming(status.streamActive)
             }
         }
     }
@@ -125,7 +126,7 @@ class PublisherService : LifecycleService() {
             .setContentTitle("MoQ Publisher")
             .setContentText("${formatDeviceId(status.deviceId)} · ${formatBps(status.txBps)}")
             .setSubText(status.publishState.toNotificationText())
-            .setOngoing(status.publishState == PublishState.STREAMING)
+            .setOngoing(status.streamActive)
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .addAction(0, "Stop", stopIntent)

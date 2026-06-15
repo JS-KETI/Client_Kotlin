@@ -17,15 +17,23 @@ import dev.jsketi.moqclient.ui.theme.MoqClientTheme
 @Composable
 fun ActionButtons(
     publishState: PublishState,
+    streamActive: Boolean,
+    operationInFlight: Boolean,
     onConnect: () -> Unit,
     onToggleStream: () -> Unit,
     onDisconnect: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val isConnected = publishState == PublishState.CONNECTED || publishState == PublishState.STREAMING
-    val isStreaming = publishState == PublishState.STREAMING
+    val isStreaming = streamActive
     val isConnecting = publishState == PublishState.CONNECTING
-    val canDisconnect = isConnected || publishState == PublishState.ERROR
+    // 버튼 활성은 실제 runtime 상태 기준. ERROR 라도 송출이 살아 있으면 Connect 를 막아야 한다
+    // (살아있는 session 을 중복 connect 하면 handle 이 파괴됨). 명령 진행 중엔 전부 잠근다.
+    val canConnect = !streamActive && !operationInFlight &&
+        (publishState == PublishState.IDLE || publishState == PublishState.ERROR)
+    val canToggleStream = !operationInFlight &&
+        (publishState == PublishState.CONNECTED || streamActive)
+    val canDisconnect = !operationInFlight &&
+        (streamActive || publishState == PublishState.CONNECTED || publishState == PublishState.ERROR)
 
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -37,7 +45,7 @@ fun ActionButtons(
         ) {
             Button(
                 onClick = onConnect,
-                enabled = publishState == PublishState.IDLE || publishState == PublishState.ERROR,
+                enabled = canConnect,
                 modifier = Modifier.weight(1f)
             ) {
                 Text(if (isConnecting) "Connecting..." else "Connect")
@@ -54,7 +62,7 @@ fun ActionButtons(
 
         Button(
             onClick = onToggleStream,
-            enabled = isConnected,
+            enabled = canToggleStream,
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(if (isStreaming) "Stop streaming" else "Start streaming")
@@ -68,6 +76,8 @@ private fun ActionButtonsIdlePreview() {
     MoqClientTheme {
         ActionButtons(
             publishState = PublishState.IDLE,
+            streamActive = false,
+            operationInFlight = false,
             onConnect = {},
             onToggleStream = {},
             onDisconnect = {}
@@ -81,6 +91,8 @@ private fun ActionButtonsStreamingPreview() {
     MoqClientTheme {
         ActionButtons(
             publishState = PublishState.STREAMING,
+            streamActive = true,
+            operationInFlight = false,
             onConnect = {},
             onToggleStream = {},
             onDisconnect = {}

@@ -26,7 +26,8 @@ class TelemetryReporter(
                 latitude = location?.latitude,
                 longitude = location?.longitude,
                 missionId = DEFAULT_MISSION_ID,
-                missionStatus = status.publishState.toMissionStatus(),
+                // 실제 송출 중이면(streamActive) publishState 가 ERROR 여도 in_progress 로 보고한다.
+                missionStatus = if (status.streamActive) "in_progress" else status.publishState.toMissionStatus(),
                 publisherTxBps = status.txBps
             )
         ).getOrThrow()

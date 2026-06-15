@@ -52,11 +52,17 @@ class MoqPublisherImpl : MoqPublisher {
     private val frameSkippedNoSession = AtomicLong(0)
     private val frameSkippedNoKeyframe = AtomicLong(0)
 
-    override suspend fun connect(relayUrl: String, broadcastPath: String): Result<Unit> =
-        runCatching {
+    override suspend fun connect(relayUrl: String, broadcastPath: String): Result<Unit> {
+        // "이미 연결됨"은 실패가 아니라 멱등 성공으로 처리한다. 예전엔 check(client==null) 실패가
+        // onFailure 로 떨어져 closeHandles()/clearHandles() 가 살아있는 session/producer 를 파괴했고,
+        // frameJob 이 destroyed MoqMediaProducer 에 write 하다 죽었다. 활성 시엔 handle 을 절대 안 닫는다.
+        if (client != null || session != null) {
+            Log.w(TAG, "[connect] ignored: already active client=${client != null} session=${session != null} — handles preserved")
+            return Result.success(Unit)
+        }
+        return runCatching {
             Log.i(TAG, "[connect] ENTER relayUrl='$relayUrl' broadcastPath='$broadcastPath' " +
                 "client=${if (client == null) "null" else "EXISTS"}")
-            check(client == null) { "MoQ session is already connected" }
             _sessionState.value = MoqSessionState.CONNECTING
             pendingRelayUrl = relayUrl
             pendingBroadcastPath = broadcastPath
@@ -70,6 +76,7 @@ class MoqPublisherImpl : MoqPublisher {
             clearHandles()
             _sessionState.value = MoqSessionState.FAILED
         }
+    }
 
     override suspend fun publishMedia(codecString: String, sps: ByteArray, pps: ByteArray) {
         val t0 = System.nanoTime()

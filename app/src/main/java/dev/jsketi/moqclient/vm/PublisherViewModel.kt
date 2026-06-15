@@ -1,6 +1,7 @@
 package dev.jsketi.moqclient.vm
 
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -20,6 +21,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
+private const val TAG = "PublisherViewModel"
+
 class PublisherViewModel(
     private val connectUseCase: ConnectUseCase,
     private val streamToggleUseCase: StreamToggleUseCase,
@@ -37,47 +40,95 @@ class PublisherViewModel(
     private val _exportZipUri = MutableStateFlow<Uri?>(null)
     val exportZipUri: StateFlow<Uri?> = _exportZipUri.asStateFlow()
 
+    // 중복 탭 방지용 in-flight 플래그. 이게 없어서 연결 지연 중 재탭하면 두 번째 명령이 실패→ERROR→
+    // 활성 세션 파괴로 이어졌다.
+    private var streamCommandInFlight = false
+    private var connectCommandInFlight = false
+
     init {
         observeRuntimeStatus()
         observeNetworkState()
     }
 
+    private fun updateOperationInFlight() {
+        _uiState.update { it.copy(operationInFlight = streamCommandInFlight || connectCommandInFlight) }
+    }
+
     fun onConnect() {
+        val status = runtime.status.value
+        if (connectCommandInFlight) {
+            Log.i(TAG, "onConnect IGNORE: command in flight")
+            return
+        }
+        // 이미 송출 중이거나 연결/송출 상태면 재연결 금지 — 살아있는 session 을 중복 connect 하면 안 된다.
+        if (status.streamActive ||
+            status.publishState == PublishState.CONNECTED ||
+            status.publishState == PublishState.STREAMING
+        ) {
+            Log.i(TAG, "onConnect IGNORE: already active streamActive=${status.streamActive} state=${status.publishState}")
+            return
+        }
+        Log.i(TAG, "onConnect ENTER state=${status.publishState} deviceId='${status.deviceId}' publishingPath=${status.publishingPath}")
         viewModelScope.launch {
+            connectCommandInFlight = true
+            updateOperationInFlight()
             runtime.updateStatus { it.copy(publishState = PublishState.CONNECTING) }
             _uiState.update { it.copy(errorMessage = null) }
-            connectUseCase()
-                .onSuccess { summary ->
-                    runtime.markConnected(summary)
-                }
-                .onFailure { error ->
-                    runtime.updateStatus { it.copy(publishState = PublishState.ERROR) }
-                    _uiState.update {
-                        it.copy(errorMessage = error.message)
+            try {
+                connectUseCase()
+                    .onSuccess { summary -> runtime.markConnected(summary) }
+                    .onFailure { error ->
+                        val latest = runtime.status.value
+                        Log.w(TAG, "onConnect FAIL state=${latest.publishState} streamActive=${latest.streamActive}: ${error.message}", error)
+                        // 송출이 살아 있으면(streamActive) ERROR 로 덮지 않는다 — migration 이 계속 돌아야 한다.
+                        if (!latest.streamActive) {
+                            runtime.updateStatus { it.copy(publishState = PublishState.ERROR) }
+                        }
+                        _uiState.update { it.copy(errorMessage = error.message) }
                     }
-                }
+            } finally {
+                connectCommandInFlight = false
+                updateOperationInFlight()
+            }
         }
     }
 
     fun onToggleStream() {
-        val currentState = _uiState.value.publishState
-        val starting = currentState == PublishState.CONNECTED
+        if (streamCommandInFlight) {
+            Log.i(TAG, "onToggleStream IGNORE: command in flight")
+            return
+        }
+        val status = runtime.status.value
+        val starting = status.publishState == PublishState.CONNECTED && !status.streamActive
+        Log.i(TAG, "onToggleStream ENTER start=$starting state=${status.publishState} streamActive=${status.streamActive}")
         viewModelScope.launch {
-            streamToggleUseCase(start = starting)
-                .onFailure { error ->
-                    runtime.updateStatus { it.copy(publishState = PublishState.ERROR) }
-                    _uiState.update {
-                        it.copy(errorMessage = error.message)
+            streamCommandInFlight = true
+            updateOperationInFlight()
+            try {
+                streamToggleUseCase(start = starting)
+                    .onFailure { error ->
+                        val latest = runtime.status.value
+                        Log.w(TAG, "onToggleStream FAIL start=$starting state=${latest.publishState} streamActive=${latest.streamActive}: ${error.message}", error)
+                        // 송출이 살아 있으면 ERROR 로 덮지 않고 UI 메시지에만 남긴다.
+                        if (!latest.streamActive) {
+                            runtime.updateStatus { it.copy(publishState = PublishState.ERROR) }
+                        }
+                        _uiState.update { it.copy(errorMessage = error.message) }
                     }
-                }
+            } finally {
+                streamCommandInFlight = false
+                updateOperationInFlight()
+            }
         }
     }
 
     fun onDisconnect() {
+        Log.i(TAG, "onDisconnect ENTER state=${runtime.status.value.publishState} streamActive=${runtime.status.value.streamActive}")
         viewModelScope.launch {
             _uiState.update { it.copy(errorMessage = null) }
             runtime.disconnect()
                 .onFailure { error ->
+                    Log.w(TAG, "onDisconnect FAIL: ${error.message}", error)
                     runtime.updateStatus { it.copy(publishState = PublishState.ERROR) }
                     _uiState.update {
                         it.copy(errorMessage = error.message)
@@ -136,6 +187,7 @@ class PublisherViewModel(
                         deviceId = status.deviceId,
                         broadcastPath = status.broadcastPath,
                         publishState = status.publishState,
+                        streamActive = status.streamActive,
                         txBps = status.txBps,
                         migrationCount = status.migrationCount,
                         uptimeSeconds = status.uptimeSeconds,

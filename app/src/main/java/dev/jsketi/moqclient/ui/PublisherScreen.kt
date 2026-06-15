@@ -178,6 +178,8 @@ private fun PublisherScreenContent(
 
                     ActionButtons(
                         publishState = uiState.publishState,
+                        streamActive = uiState.streamActive,
+                        operationInFlight = uiState.operationInFlight,
                         onConnect = onConnect,
                         onToggleStream = onToggleStream,
                         onDisconnect = onDisconnect

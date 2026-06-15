@@ -32,6 +32,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -85,7 +86,18 @@ class PublisherRuntime(
     }
 
     fun updateStatus(transform: (PublisherStatus) -> PublisherStatus) {
-        _status.update(transform)
+        val before = _status.value
+        val after = _status.updateAndGet(transform)
+        // publishState/streamActive 전이만 로깅(매초 바뀌는 txBps/uptime 으로 도배되지 않게).
+        if (before.publishState != after.publishState || before.streamActive != after.streamActive) {
+            val caller = Throwable().stackTrace.drop(1).take(3)
+                .joinToString(" <- ") { "${it.methodName}:${it.lineNumber}" }
+            Log.i(
+                TAG,
+                "status changed: publishState ${before.publishState}->${after.publishState} " +
+                    "streamActive ${before.streamActive}->${after.streamActive} caller=$caller"
+            )
+        }
     }
 
     fun markConnected(summary: DeviceSummary) {
@@ -94,7 +106,9 @@ class PublisherRuntime(
             it.copy(
                 deviceId = summary.deviceId,
                 broadcastPath = summary.broadcastPath,
-                publishState = PublishState.CONNECTED
+                publishState = PublishState.CONNECTED,
+                // CONNECTED 는 송출 전 단계 — streamActive 는 startStream 성공 시에만 true.
+                streamActive = false
             )
         }
     }
@@ -194,7 +208,7 @@ class PublisherRuntime(
             serviceScope = null
             lifecycleOwner = null
             serverRegistered = false
-            updateStatus { it.copy(publishState = PublishState.IDLE, txBps = 0L, publishingPath = null, txStalled = false) }
+            updateStatus { it.copy(publishState = PublishState.IDLE, streamActive = false, txBps = 0L, publishingPath = null, txStalled = false) }
         }
     }
 
@@ -203,7 +217,13 @@ class PublisherRuntime(
     }
 
     private suspend fun startStreamLocked(): Result<Unit> = runCatching {
-        check(!streamStarted) { "stream already started" }
+        // 중복 start 는 실패가 아니라 멱등 성공으로 처리한다. 예전엔 check()가 예외를 던지고
+        // VM 이 그것을 publishState=ERROR 로 바꿔, 송출이 살아있는데도 migration 이 멈췄다.
+        if (streamStarted || frameJob != null) {
+            Log.w(TAG, "startStream ignored: already active streamStarted=$streamStarted frameJob=${frameJob != null}")
+            updateStatus { it.copy(publishState = PublishState.STREAMING, streamActive = true) }
+            return@runCatching
+        }
         val owner = checkNotNull(lifecycleOwner) { "PublisherService lifecycle owner is not attached" }
         val scope = checkNotNull(serviceScope) { "PublisherService is not running" }
         // PreviewView is optional: publishing rides on ImageAnalysis, which binds without a preview.
@@ -259,7 +279,7 @@ class PublisherRuntime(
                     }
 
                     val frameAgeMs = SystemClock.elapsedRealtime() - frame.encodedAtElapsedMs
-                    if (status.publishState == PublishState.STREAMING && status.publishingPath == null) {
+                    if (status.streamActive && status.publishingPath == null) {
                         enterFreshKeyframeGate("publishing path unavailable")
                         dropLatestOnlyFrame("path-null", frameAgeMs, frame.isKeyframe)
                         return@collect
@@ -331,6 +351,7 @@ class PublisherRuntime(
                     deviceId = summary.deviceId,
                     broadcastPath = summary.broadcastPath,
                     publishState = PublishState.STREAMING,
+                    streamActive = true,
                     publishingPath = currentPublishingPath
                 )
             }
@@ -362,6 +383,7 @@ class PublisherRuntime(
                 deviceId = "",
                 broadcastPath = "",
                 publishState = PublishState.IDLE,
+                streamActive = false,
                 txBps = 0L,
                 publishingPath = null,
                 txStalled = false
@@ -384,6 +406,7 @@ class PublisherRuntime(
             updateStatus {
                 it.copy(
                     publishState = if (it.deviceId.isBlank()) PublishState.IDLE else PublishState.CONNECTED,
+                    streamActive = false,
                     publishingPath = null,
                     txStalled = false
                 )
@@ -465,7 +488,7 @@ class PublisherRuntime(
                 previousFailures = currentFailures
                 secondsSinceBpsSample = 0
 
-                val streaming = _status.value.publishState == PublishState.STREAMING
+                val streaming = _status.value.streamActive
                 val sendStats = if (streaming) moqPublisher.transportSendStats() else null
                 val sendRateBps = sendStats?.estimatedSendRateBps
 

@@ -4,6 +4,10 @@ data class PublisherStatus(
     val deviceId: String = "",
     val broadcastPath: String = "",
     val publishState: PublishState = PublishState.IDLE,
+    // 실제 송출(camera/frameJob/MoQ publishing) 활성 여부. UI 표시용 publishState 와 분리한 권위
+    // 상태로, migration·wakelock·telemetry 는 이 값을 본다. publishState 가 일시적으로 ERROR 가
+    // 되어도 송출이 살아 있으면 streamActive 는 true 여서 전환 판단이 끊기지 않는다.
+    val streamActive: Boolean = false,
     // Network the active MoQ session is publishing over. Distinct from NetworkManager.activePath
     // (the OS default network), which is not necessarily the publishing path. Null when not publishing.
     val publishingPath: NetworkPath? = null,

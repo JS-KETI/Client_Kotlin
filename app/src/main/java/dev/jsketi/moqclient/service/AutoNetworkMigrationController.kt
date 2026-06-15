@@ -68,16 +68,17 @@ class AutoNetworkMigrationController(
 
     private suspend fun observe() {
         val publishSignals = runtime.status
-            .map { Triple(it.publishState, it.publishingPath, it.txStalled) }
+            .map { PublishSnapshot(it.publishState, it.publishingPath, it.txStalled, it.streamActive) }
             .distinctUntilChanged()
         val runtimeSignals = combine(
             publishSignals,
             networkManager.activePath
         ) { publish, osDefaultPath ->
             RuntimeSignals(
-                publishState = publish.first,
-                publishingPath = publish.second,
-                txStalled = publish.third,
+                publishState = publish.publishState,
+                publishingPath = publish.publishingPath,
+                txStalled = publish.txStalled,
+                streamActive = publish.streamActive,
                 osDefaultPath = osDefaultPath
             )
         }.distinctUntilChanged()
@@ -97,13 +98,19 @@ class AutoNetworkMigrationController(
                 publishState = runtime.publishState,
                 publishingPath = runtime.publishingPath,
                 txStalled = runtime.txStalled,
+                streamActive = runtime.streamActive,
                 osDefaultPath = runtime.osDefaultPath
             )
         }.collectLatest { evaluate(it) }
     }
 
     private suspend fun evaluate(s: Signals) {
-        if (s.publishState != PublishState.STREAMING) return
+        // 권위 상태는 streamActive — publishState 가 ERROR 로 남아도 실제 송출이 살아 있으면
+        // Wi-Fi 약화 판단·Cellular 전환을 계속 돌려야 한다(예전 STREAMING 가드가 이걸 막았다).
+        if (!s.streamActive) {
+            Log.i(TAG, "evaluate skip: !streamActive (publishState=${s.publishState})")
+            return
+        }
 
         clearStaleBoundTargetIfNeeded()
 
@@ -186,8 +193,8 @@ class AutoNetworkMigrationController(
                     "osDefault=${networkManager.activePath.value}"
             )
 
-            if (status.publishState != PublishState.STREAMING) {
-                Log.i(TAG, "[migrate#$attemptId] SKIP not streaming")
+            if (!status.streamActive) {
+                Log.i(TAG, "[migrate#$attemptId] SKIP not streamActive (publishState=${status.publishState})")
                 return@withLock
             }
             if (!isHandlePresent(target)) {
@@ -371,6 +378,7 @@ class AutoNetworkMigrationController(
         val publishState: PublishState,
         val publishingPath: NetworkPath?,
         val txStalled: Boolean,
+        val streamActive: Boolean,
         val osDefaultPath: NetworkPath
     )
 
@@ -378,7 +386,17 @@ class AutoNetworkMigrationController(
         val publishState: PublishState,
         val publishingPath: NetworkPath?,
         val txStalled: Boolean,
+        val streamActive: Boolean,
         val osDefaultPath: NetworkPath
+    )
+
+    // runtime.status 에서 추려낸 송출 신호 스냅샷. Kotlin Triple 이 3개뿐이라 streamActive 까지
+    // 담으려고 별도 타입을 둔다(distinctUntilChanged 로 불필요한 evaluate 재실행 방지).
+    private data class PublishSnapshot(
+        val publishState: PublishState,
+        val publishingPath: NetworkPath?,
+        val txStalled: Boolean,
+        val streamActive: Boolean
     )
 
     private companion object {
