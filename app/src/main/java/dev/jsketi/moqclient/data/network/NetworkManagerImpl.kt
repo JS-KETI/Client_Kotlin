@@ -1,6 +1,9 @@
 package dev.jsketi.moqclient.data.network
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -13,6 +16,7 @@ import android.telephony.CellSignalStrengthLte
 import android.telephony.CellSignalStrengthNr
 import android.telephony.TelephonyManager
 import android.util.Log
+import androidx.core.content.ContextCompat
 import dev.jsketi.moqclient.domain.model.NetworkHealth
 import dev.jsketi.moqclient.domain.model.NetworkPath
 import java.net.DatagramSocket
@@ -47,6 +51,9 @@ import kotlinx.coroutines.launch
 class NetworkManagerImpl(
     context: Context
 ) : NetworkManager {
+
+    // READ_PHONE_STATE 권한 확인용(dataNetworkType). 앱 컨텍스트만 보관(액티비티 누수 방지).
+    private val appContext: Context = context.applicationContext
 
     private val connectivityManager: ConnectivityManager =
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -469,13 +476,11 @@ class NetworkManagerImpl(
         val tm = telephonyManager ?: return "dataNetworkType=n/a lteRsrp=n/a lteRsrq=n/a lteRssnr=n/a " +
             "lteCqi=n/a nrSsRsrp=n/a nrSsRsrq=n/a nrSsSinr=n/a"
 
-        val dataNetworkType = runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                dataNetworkTypeName(tm.dataNetworkType)
-            } else {
-                "n/a"
-            }
-        }.getOrElse { "n/a" }
+        // dataNetworkType 은 READ_PHONE_STATE 가 필요하다(lint MissingPermission). PoC 는 이 권한을
+        // 요청/선언하지 않으므로, 부여돼 있지 않으면 호출하지 않고 n/a 로 둔다(빌드 실패 방지 +
+        // SecurityException 회피). 부여돼 있으면(다른 경로로 받은 경우) 읽는다. 권한 체크가 API 호출과
+        // 같은 메서드 본문 직선상에 있어야 lint data-flow 가 인식한다(runCatching 람다 밖으로 꺼냄).
+        val dataNetworkType = readDataNetworkTypeOrNa(tm)
 
         var lteRsrp = "n/a"; var lteRsrq = "n/a"; var lteRssnr = "n/a"; var lteCqi = "n/a"
         var nrSsRsrp = "n/a"; var nrSsRsrq = "n/a"; var nrSsSinr = "n/a"
@@ -507,6 +512,32 @@ class NetworkManagerImpl(
         }
         return "dataNetworkType=$dataNetworkType lteRsrp=$lteRsrp lteRsrq=$lteRsrq lteRssnr=$lteRssnr " +
             "lteCqi=$lteCqi nrSsRsrp=$nrSsRsrp nrSsRsrq=$nrSsRsrq nrSsSinr=$nrSsSinr"
+    }
+
+    /**
+     * dataNetworkType 을 권한이 있을 때만 읽어 이름으로 반환, 아니면 "n/a".
+     *
+     * READ_PHONE_STATE 를 런타임에 명시적으로 확인하고(부여 안 됐으면 호출 자체를 건너뜀),
+     * SecurityException 도 삼킨다 — 동작상 안전하다. 다만 lint 의 MissingPermission data-flow 가
+     * ContextCompat.checkSelfPermission 가드(특히 negated early-return)를 따라오지 못해 오탐을 내므로,
+     * 가드가 실재함을 근거로 이 함수에 한해 좁게 suppress 한다. PoC 는 READ_PHONE_STATE 를
+     * manifest 에 선언/요청하지 않으므로 평상시엔 항상 n/a 다. 어떤 예외도 밖으로 던지지 않는다.
+     */
+    @SuppressLint("MissingPermission")
+    private fun readDataNetworkTypeOrNa(tm: TelephonyManager): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return "n/a"
+        if (ContextCompat.checkSelfPermission(
+                appContext,
+                Manifest.permission.READ_PHONE_STATE
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return "n/a"
+        }
+        return try {
+            dataNetworkTypeName(tm.dataNetworkType)
+        } catch (t: Throwable) {
+            "n/a"
+        }
     }
 
     private fun dataNetworkTypeName(type: Int): String = when (type) {

@@ -119,8 +119,11 @@ class AutoNetworkMigrationController(
 
         clearStaleBoundTargetIfNeeded()
 
-        if (s.publishingPath != null && isPublishingPathUnusable(s)) {
-            Log.i(TAG, "current publishing path unusable; clearing tag path=${s.publishingPath}")
+        // 태그를 즉시 내리는 것은 핸들이 "진짜 사라졌을 때"만 — WEAK/txStalled 로는 내리지 않는다.
+        // 그래야 seamless Wi-Fi→Cellular rebind 중에 path-null 게이트가 frame 을 버리는 창이 안 생기고,
+        // rebind 성공 시 migrate() 가 markPublishingPath(target)로 재태그할 때까지 송출이 끊기지 않는다.
+        if (s.publishingPath != null && isPublishingPathHandleLost(s)) {
+            Log.i(TAG, "current publishing path handle lost; clearing tag path=${s.publishingPath}")
             runtime.markPublishingPath(null)
         }
 
@@ -246,6 +249,7 @@ class AutoNetworkMigrationController(
                                     "[migrate#$attemptId] REBIND failed target=$target; forcing reconnect: ${e.message}",
                                     e
                                 )
+                                // reconnect 가 target 망에서 열리도록 먼저 프로세스를 bind 한다.
                                 runCatching { networkManager.selectPath(target) }
                                     .onSuccess {
                                         boundTarget = target
@@ -258,11 +262,22 @@ class AutoNetworkMigrationController(
                                             be
                                         )
                                     }
-                                runtime.markPublishingPath(null)
-                                // rebind 실패 후 reconnect 는 진짜 하드 재연결 — streamRevision 을 올린다.
-                                runtime.markHardReconnect("rebind failed target=$target", "migrate#$attemptId")
-                                moqPublisher.requestReconnect()
-                                Log.i(TAG, "[migrate#$attemptId] reconnect requested target=$target")
+                                // rebind 실패 후 reconnect 는 진짜 하드 재연결 — runtime 의 30s 쿨다운
+                                // 가드를 통과해야만 진행한다(streamRevision 증가·requestReconnect 모두
+                                // 그 안에서). 쿨다운에 막히면(false) reconnect 하지 않고 현 상태 유지.
+                                val fired = runtime.hardReconnect(
+                                    "rebind failed target=$target",
+                                    "migrate#$attemptId"
+                                )
+                                if (fired) {
+                                    Log.i(TAG, "[migrate#$attemptId] reconnect requested target=$target")
+                                } else {
+                                    Log.i(
+                                        TAG,
+                                        "[migrate#$attemptId] reconnect suppressed by cooldown target=$target; " +
+                                            "keeping current session/state"
+                                    )
+                                }
                             }
                     }
 
@@ -366,8 +381,18 @@ class AutoNetworkMigrationController(
             (s.publishingPath == NetworkPath.WIFI || recentWifiFlee)
     }
 
-    private fun isPublishingPathUnusable(s: Signals): Boolean = when (s.publishingPath) {
-        NetworkPath.WIFI -> s.wifi == null || s.wifiHealth == NetworkHealth.WEAK || s.txStalled
+    /**
+     * 현재 송출 경로의 Android Network 핸들이 "실제로 사라졌는가"(onLost). WEAK/txStalled 는 핸들이
+     * 살아있으므로 false — seamless rebind 중에는 기존 태그로 frame 이 계속 흐르고, migrate() 가
+     * rebind 성공 시 markPublishingPath(target)로 재태그한다. 태그를 즉시 내리는 것은 핸들이 진짜
+     * 없을 때(또는 runtime 의 hard reconnect)뿐이어야 frame drop 창이 생기지 않는다.
+     *
+     * 전환(migrate) 판단의 "경로가 쓸 만한가"(WEAK/txStalled 포함)는 [decideTarget] 가 인라인으로
+     * 직접 본다 — 별도 헬퍼(과거 isPublishingPathUnusable)는 태그 즉시 내리기와 의미가 섞여
+     * 위험했으므로 제거하고, 즉시 내리기는 이 핸들-손실 판정으로 한정한다.
+     */
+    private fun isPublishingPathHandleLost(s: Signals): Boolean = when (s.publishingPath) {
+        NetworkPath.WIFI -> s.wifi == null
         NetworkPath.CELLULAR -> s.cellular == null
         null -> false
     }

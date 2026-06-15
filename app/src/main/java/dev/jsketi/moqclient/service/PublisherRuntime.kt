@@ -143,15 +143,20 @@ class PublisherRuntime(
     }
 
     /**
-     * Hard reconnect for a genuinely dead path: tears down and re-establishes the MoQ session.
+     * Single cooldown-guarded entry point for a genuine hard reconnect (full MoQ session teardown +
+     * re-establish).
      *
-     * Enforces a [HARD_RECONNECT_COOLDOWN_MS] floor between hard reconnects (returns false if still
-     * cooling down) and increments [PublisherStatus.streamRevision] only when a reconnect actually
-     * fires. Clears publishingPath first so the controller re-claims the path after the new session
-     * connects. Used only for confirmed hard failures (see runMetricsLoop hardFailed) — never for a
-     * pure throughput stall.
+     * Enforces a [HARD_RECONNECT_COOLDOWN_MS] floor between hard reconnects — returns false WITHOUT
+     * touching state (no streamRevision bump, no reconnect) when suppressed by cooldown. When it
+     * proceeds it bumps [PublisherStatus.streamRevision] exactly once, clears publishingPath (so the
+     * controller re-claims the path after the new session connects), and fires requestReconnect().
+     *
+     * BOTH genuine hard-reconnect sites must route through this so neither bypasses the cooldown:
+     *  - the runtime's own hard-failure path (runMetricsLoop hardFailed), and
+     *  - the controller's rebind()-failure fallback.
+     * Never called for rebind/soft cut.
      */
-    private fun requestHardReconnect(reason: String, counters: String): Boolean {
+    fun hardReconnect(reason: String, counters: String = ""): Boolean {
         val now = SystemClock.elapsedRealtime()
         val sinceLast = now - lastHardReconnectAtMs
         if (lastHardReconnectAtMs != 0L && sinceLast < HARD_RECONNECT_COOLDOWN_MS) {
@@ -162,7 +167,11 @@ class PublisherRuntime(
             )
             return false
         }
-        markHardReconnect(reason, counters)
+        lastHardReconnectAtMs = now
+        val old = _status.value.streamRevision
+        val next = old + 1
+        updateStatus { it.copy(streamRevision = next) }
+        Log.i(TAG, "streamRevision incremented: $old -> $next (reason=$reason $counters)")
         Log.i(TAG, "STALL-CUT HARD reconnect reason=$reason $counters")
         // 새 세션이 어느 망에서 열릴지는 현재 프로세스 바인딩이 정한다 — 같은 경로 하드 재연결이므로
         // 별도 bind 없이 바로 reconnect. publishingPath 를 내려 컨트롤러가 재연결 후 다시 claim 하게 한다.
@@ -173,21 +182,6 @@ class PublisherRuntime(
             }
         }
         return true
-    }
-
-    /**
-     * Records that a genuine hard reconnect (full MoQ session teardown + re-establish) is happening:
-     * bumps [PublisherStatus.streamRevision] and stamps the cooldown. The actual requestReconnect()
-     * is the caller's responsibility. Used both by the runtime's own hard-failure path and by the
-     * controller when a rebind() fails and it falls back to reconnect (the only other genuine hard
-     * reconnect). NOT called for rebind/soft cut.
-     */
-    fun markHardReconnect(reason: String, counters: String = "") {
-        lastHardReconnectAtMs = SystemClock.elapsedRealtime()
-        val old = _status.value.streamRevision
-        val next = old + 1
-        updateStatus { it.copy(streamRevision = next) }
-        Log.i(TAG, "streamRevision incremented: $old -> $next (reason=$reason $counters)")
     }
 
     /**
@@ -777,7 +771,7 @@ class PublisherRuntime(
                     "sessionState=${moqPublisher.sessionState.value}"
                 if (hardFailed) {
                     val reason = if (sessionFailed) "session FAILED" else "egress frozen + write dead"
-                    val fired = requestHardReconnect(reason, counters)
+                    val fired = hardReconnect(reason, counters)
                     if (fired) {
                         // reconnect 가 새 세션을 세우면 카운터가 리셋되므로 streak 도 초기화.
                         hardStreak = 0
