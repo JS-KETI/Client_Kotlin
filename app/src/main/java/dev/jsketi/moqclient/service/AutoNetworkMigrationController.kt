@@ -46,10 +46,10 @@ class AutoNetworkMigrationController(
     @Volatile private var inProgressTarget: NetworkPath? = null
     @Volatile private var boundTarget: NetworkPath? = null
     @Volatile private var lastWifiStallFleeAtMs: Long = 0L
-    // Cellular→Wi-Fi 복귀 디바운스: 복귀 조건(osDefault=WIFI, wifiHealth=USABLE, RSSI 회복,
-    // stall-flee holdoff 경과, txStalled=false)이 "전부" 충족되기 시작한 시각. 하나라도 깨지면 0 으로
-    // 리셋. WIFI_RETURN_SUSTAIN_MS 동안 연속 충족돼야 실제 복귀한다(짧은 회복으로 왕복 금지).
-    @Volatile private var wifiReturnClearSinceMs: Long = 0L
+    // Cellular→Wi-Fi 복귀 sustain 타이머. 복귀 조건(osDefault=WIFI, USABLE, RSSI 회복, holdoff 경과,
+    // !txStalled)이 처음 충족되면 예약 → WIFI_RETURN_SUSTAIN_MS 후 조건 재확인하고 여전히 충족이면
+    // Wi-Fi 로 rebind. 조건이 깨지면 취소. Flow 이벤트가 없어도 시간 경과만으로 복귀가 진행되게 한다.
+    @Volatile private var wifiReturnJob: Job? = null
 
     private var scope: CoroutineScope? = null
     private var observeJob: Job? = null
@@ -62,6 +62,7 @@ class AutoNetworkMigrationController(
     }
 
     fun stop() {
+        cancelWifiReturnTimer("controller stop")
         observeJob?.cancel()
         observeJob = null
         scope = null
@@ -114,6 +115,8 @@ class AutoNetworkMigrationController(
         // Wi-Fi 약화 판단·Cellular 전환을 계속 돌려야 한다(예전 STREAMING 가드가 이걸 막았다).
         if (!s.streamActive) {
             Log.i(TAG, "evaluate skip: !streamActive (publishState=${s.publishState})")
+            // 송출이 끝났으면 다음 스트림에 잔존 boundTarget/타이머가 남지 않게 정리.
+            resetBindingState("streamActive=false")
             return
         }
 
@@ -137,9 +140,28 @@ class AutoNetworkMigrationController(
                 "txStalled=${s.txStalled} osDefault=${s.osDefaultPath} boundTarget=$boundTarget"
         )
 
+        // Wi-Fi 복귀 sustain 타이머는 Flow 이벤트와 무관하게 시간 경과로 복귀를 진행시킨다.
+        // 복귀 조건 충족 중이면 예약(중복 무시), 아니면 취소.
+        if (decision.wifiReturnWaiting) {
+            scheduleWifiReturnTimer()
+        } else {
+            cancelWifiReturnTimer("decision=${decision.reason}")
+        }
+
         if (target == null) {
             runtime.markPublishingPath(null)
             boundTarget = null
+            return
+        }
+
+        // 초기 claim: 스트림 시작 직후 태그도 binding 도 없고 target 이 이미 OS default 망이면, 실제
+        // rebind 없이 그 망을 그대로 태그한다(viewer remount 불필요 → migrationRevision 증가 안 함).
+        if (s.publishingPath == null && boundTarget == null &&
+            s.session == MoqSessionState.CONNECTED &&
+            isHandlePresent(target) && s.osDefaultPath == target
+        ) {
+            Log.i(TAG, "initial claim publishingPath=$target (no rebind, no revision bump) osDefault=${s.osDefaultPath}")
+            runtime.markPublishingPath(target)
             return
         }
 
@@ -159,12 +181,25 @@ class AutoNetworkMigrationController(
         // 같은 경로 정체(예: CELLULAR 송출 중 CELLULAR 정체). cross-path 전환 대상이 없으므로
         // reconnect 하지 않고 soft cut 만 — 세션 유지. (runtime 도 rising-edge 에서 soft cut 을
         // 걸지만, 컨트롤러 신호로도 한 번 더 명시적으로 backlog 를 턴다.)
-        if (s.publishingPath == target) {
+        // same-path 판정은 태그(publishingPath)뿐 아니라 실제 바인딩(boundTarget)도 일치해야 한다.
+        // publishingPath==target 이어도 boundTarget 이 다른 망이면(예: 태그 WIFI / bind CELLULAR)
+        // 실제 경로가 어긋난 것이므로 rebind 로 보정해야 한다.
+        val boundConsistent = boundTarget == null || boundTarget == target
+        if (s.publishingPath == target && boundConsistent) {
+            Log.i(TAG, "same-path confirmed publishingPath=${s.publishingPath} boundTarget=$boundTarget target=$target")
             if (shedBacklog) {
                 Log.i(TAG, "same-path stall → soft cut only (keep session) target=$target")
                 runtime.requestLatestOnlyRefresh("controller same-path stall target=$target")
             }
             return
+        }
+        if (s.publishingPath == target && !boundConsistent) {
+            Log.w(
+                TAG,
+                "path tag/bind mismatch: publishingPath=${s.publishingPath} boundTarget=$boundTarget " +
+                    "target=$target; forcing rebind"
+            )
+            // 아래 migrate() 로 진행 — 실제 binding 을 target 으로 정렬한다.
         }
 
         if (s.txStalled && s.publishingPath == NetworkPath.WIFI && target == NetworkPath.CELLULAR) {
@@ -212,8 +247,10 @@ class AutoNetworkMigrationController(
                 Log.w(TAG, "[migrate#$attemptId] SKIP no target handle target=$target")
                 return@withLock
             }
-            if (samePath && !shedBacklog) {
-                Log.i(TAG, "[migrate#$attemptId] SKIP already publishing on target=$target")
+            // 태그가 같아도 실제 bind 가 다르면(boundTarget != target) skip 하지 않고 rebind 로 보정.
+            val boundConsistent = boundTarget == null || boundTarget == target
+            if (samePath && !shedBacklog && boundConsistent) {
+                Log.i(TAG, "[migrate#$attemptId] SKIP already publishing on target=$target (bound consistent)")
                 return@withLock
             }
             if (inProgressTarget == target) {
@@ -228,6 +265,7 @@ class AutoNetworkMigrationController(
                         Log.i(TAG, "[migrate#$attemptId] CLAIM connected on boundTarget=$boundTarget target=$target")
                         runtime.markPublishingPath(target)
                         runtime.incrementMigrationCount()
+                        runtime.incrementMigrationRevision("claim target=$target")
                     }
 
                     // Cross-path 전환(예: Wi-Fi 정체 → Cellular)은 REBIND 로 처리한다 — 세션을 유지한
@@ -242,6 +280,7 @@ class AutoNetworkMigrationController(
                                 boundTarget = target
                                 runtime.markPublishingPath(target)
                                 runtime.incrementMigrationCount()
+                                runtime.incrementMigrationRevision("actual-rebind target=$target")
                             }
                             .onFailure { e ->
                                 Log.w(
@@ -325,50 +364,99 @@ class AutoNetworkMigrationController(
             }
         }
 
-        if (cellular != null && s.publishingPath != NetworkPath.WIFI &&
+        // stall-flee holdoff: 정체로 떠난 직후엔(현재 Cellular 송출 중) 잠시 Wi-Fi 복귀 보류.
+        if (cellular != null && s.publishingPath == NetworkPath.CELLULAR &&
             SystemClock.elapsedRealtime() - lastWifiStallFleeAtMs < WIFI_STALL_FLEE_HOLDOFF_MS
         ) {
             return Decision(NetworkPath.CELLULAR, "wifi in stall-flee holdoff")
         }
 
-        // 이미 Wi-Fi 송출 중이면 그대로 유지(복귀 게이트는 cellular→wifi 복귀에만 적용).
-        if (s.publishingPath == NetworkPath.WIFI) {
-            wifiReturnClearSinceMs = 0L
-            return Decision(NetworkPath.WIFI, "wifi usable preferred")
-        }
-
-        // 여기부터는 cellular(또는 미지정)에서 Wi-Fi 로 복귀를 검토하는 경로.
-        // 복귀는 모든 조건이 WIFI_RETURN_SUSTAIN_MS 동안 연속 충족돼야 한다.
-        val rssi = networkManager.wifiSignalDbm.value
-        val rssiRecovered = rssi == null || rssi >= WIFI_RETURN_DBM
-        val holdoffElapsed =
-            SystemClock.elapsedRealtime() - lastWifiStallFleeAtMs >= WIFI_STALL_FLEE_HOLDOFF_MS
-        val allClear = s.osDefaultPath == NetworkPath.WIFI &&
-            s.wifiHealth == NetworkHealth.USABLE &&
-            rssiRecovered &&
-            holdoffElapsed &&
-            !s.txStalled
-        if (!allClear) {
-            wifiReturnClearSinceMs = 0L
-            return if (cellular != null) {
+        // 복귀 게이트는 "현재 Cellular 송출/바인딩 중"일 때만 적용한다. 그 외(Wi-Fi 송출 중이거나
+        // 스트림 시작 직후 미지정)는 Wi-Fi 선호 — 초기 claim 이나 Wi-Fi 유지가 복귀 sustain 타이머에
+        // 잘못 걸리지 않게 한다. 실제 복귀(rebind)는 sustain 타이머가 7s 후 수행하므로 여기서는
+        // wifiReturnWaiting 만 신호한다(evaluate 가 타이머를 예약/취소).
+        if (s.publishingPath == NetworkPath.CELLULAR || boundTarget == NetworkPath.CELLULAR) {
+            return if (wifiReturnAllClearNow()) {
+                Decision(NetworkPath.CELLULAR, "wifi return all-clear; sustain timer running", wifiReturnWaiting = true)
+            } else if (cellular != null) {
                 Decision(NetworkPath.CELLULAR, "wifi return not all-clear (waiting)")
             } else {
                 Decision(null, "wifi return not all-clear; no cellular")
             }
         }
 
-        // 모든 조건 충족 — 연속 지속 시간을 latch 해 sustain 을 넘겼을 때만 복귀.
-        val now = SystemClock.elapsedRealtime()
-        if (wifiReturnClearSinceMs == 0L) wifiReturnClearSinceMs = now
-        val sustainedMs = now - wifiReturnClearSinceMs
-        if (sustainedMs < WIFI_RETURN_SUSTAIN_MS) {
-            return if (cellular != null) {
-                Decision(NetworkPath.CELLULAR, "wifi return clear, sustaining ${sustainedMs}ms")
-            } else {
-                Decision(null, "wifi return clear but no cellular; sustaining")
+        return Decision(NetworkPath.WIFI, "wifi usable preferred")
+    }
+
+    /** Cellular→Wi-Fi 복귀 조건이 "지금" 전부 충족되는가(현재 .value 기준 — 타이머/decideTarget 공용). */
+    private fun wifiReturnAllClearNow(): Boolean {
+        val rssi = networkManager.wifiSignalDbm.value
+        val rssiRecovered = rssi == null || rssi >= WIFI_RETURN_DBM
+        val holdoffElapsed =
+            SystemClock.elapsedRealtime() - lastWifiStallFleeAtMs >= WIFI_STALL_FLEE_HOLDOFF_MS
+        return networkManager.activePath.value == NetworkPath.WIFI &&
+            networkManager.wifiHealth.value == NetworkHealth.USABLE &&
+            networkManager.wifiNetwork.value != null &&
+            rssiRecovered &&
+            holdoffElapsed &&
+            !runtime.status.value.txStalled
+    }
+
+    /**
+     * Wi-Fi 복귀 sustain 타이머 예약(중복 예약 방지). WIFI_RETURN_SUSTAIN_MS 후 all-clear 가
+     * 여전히 충족되면(그리고 streamActive·CONNECTED·아직 Wi-Fi 아님) Wi-Fi 로 rebind 한다. Flow
+     * 이벤트가 없어도 시간 경과만으로 복귀가 진행된다.
+     */
+    private fun scheduleWifiReturnTimer() {
+        if (wifiReturnJob?.isActive == true) return
+        val s = scope ?: return
+        val job = s.launch {
+            Log.i(TAG, "wifi return all-clear timer started (sustain=${WIFI_RETURN_SUSTAIN_MS}ms)")
+            delay(WIFI_RETURN_SUSTAIN_MS)
+            Log.i(TAG, "wifi return timer fired; rechecking all-clear")
+            val status = runtime.status.value
+            when {
+                !status.streamActive -> Log.i(TAG, "wifi return timer: not streamActive; skip")
+                moqPublisher.sessionState.value != MoqSessionState.CONNECTED ->
+                    Log.i(TAG, "wifi return timer: session not connected; skip")
+                status.publishingPath == NetworkPath.WIFI ->
+                    Log.i(TAG, "wifi return timer: already on WIFI; done")
+                !wifiReturnAllClearNow() ->
+                    Log.i(TAG, "wifi return timer: no longer all-clear; staying on cellular")
+                else -> {
+                    Log.i(TAG, "wifi return sustained; migrating WIFI")
+                    // 기존 evaluate 와 동일하게 bind/rebind 는 IO 에서 — Main 블로킹 방지.
+                    scope?.launch(Dispatchers.IO) {
+                        migrate(NetworkPath.WIFI, "wifi return all-clear sustained (timer)")
+                    }
+                }
             }
         }
-        return Decision(NetworkPath.WIFI, "wifi return all-clear sustained ${sustainedMs}ms")
+        wifiReturnJob = job
+        job.invokeOnCompletion { if (wifiReturnJob === job) wifiReturnJob = null }
+    }
+
+    private fun cancelWifiReturnTimer(reason: String) {
+        val job = wifiReturnJob ?: return
+        wifiReturnJob = null
+        if (job.isActive) {
+            Log.i(TAG, "wifi return timer cancelled reason=$reason")
+            job.cancel()
+        }
+    }
+
+    /**
+     * 스트림 종료/전환 시 컨트롤러 바인딩 상태를 정리한다. 이전 Cellular boundTarget 등이 다음 스트림
+     * 시작에 남아 태그/바인딩 불일치를 만드는 것을 막는다. PublisherRuntime stop/disconnect 경로와
+     * evaluate 의 !streamActive 진입에서 호출.
+     */
+    fun resetBindingState(reason: String) {
+        cancelWifiReturnTimer("reset: $reason")
+        if (boundTarget == null && inProgressTarget == null) return
+        val old = boundTarget
+        boundTarget = null
+        inProgressTarget = null
+        Log.i(TAG, "controller binding state reset reason=$reason oldBoundTarget=$old")
     }
 
     private fun shouldShedBacklog(s: Signals, target: NetworkPath, decision: Decision): Boolean {
@@ -410,7 +498,10 @@ class AutoNetworkMigrationController(
     private data class Decision(
         val target: NetworkPath?,
         val reason: String,
-        val currentPathUnusable: Boolean = false
+        val currentPathUnusable: Boolean = false,
+        // Cellular 송출 중 Wi-Fi 복귀 조건이 충족돼 sustain 타이머를 돌려야 하는 상태.
+        // evaluate 가 이 값을 보고 타이머를 예약/취소한다(실제 복귀 rebind 는 타이머가 수행).
+        val wifiReturnWaiting: Boolean = false
     )
 
     private data class Signals(

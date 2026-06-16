@@ -127,6 +127,18 @@ class PublisherRuntime(
     }
 
     /**
+     * 실제 송출 경로 rebind/claim 성공 시에만 호출 — 관제가 즉시 player 를 remount 하게 하는 신호.
+     * startStream 초기 claim·soft cut·단순 감지·OS default 변경에는 호출하지 않는다(그 경우는 viewer
+     * remount 가 불필요). hard reconnect 는 별도 [PublisherStatus.streamRevision] 을 쓴다.
+     */
+    fun incrementMigrationRevision(reason: String) {
+        val old = _status.value.migrationRevision
+        val next = old + 1
+        updateStatus { it.copy(migrationRevision = next) }
+        Log.i(TAG, "migrationRevision incremented $old -> $next target/reason=$reason")
+    }
+
+    /**
      * Soft cut for a slow/congested path: discards the stale encoder frame backlog and requests a
      * fresh keyframe so the receiver resumes from a clean reference point — WITHOUT tearing down the
      * QUIC/MoQ session (publishingPath stays, no requestReconnect()).
@@ -203,14 +215,9 @@ class PublisherRuntime(
             updateStatus { it.copy(publishingPath = null) }
             cameraEncoder.requestKeyframe()
         } else {
-            // publishingPath 가 새 망으로 확정되는 유일한 지점 = rebind/claim 성공. 이때만
-            // migrationRevision 을 올려 관제가 즉시 remount 하게 한다. soft cut(경로 불변)·태그 정리
-            // (→null)·단순 감지에서는 호출되지 않으므로 여기 한 곳이면 충분하다.
-            val oldRev = _status.value.migrationRevision
-            updateStatus {
-                it.copy(publishingPath = path, txStalled = false, migrationRevision = it.migrationRevision + 1)
-            }
-            Log.i(TAG, "migrationRevision incremented: $oldRev -> ${_status.value.migrationRevision} target=$path")
+            // 태그만 세팅한다. migrationRevision 증가는 여기서 자동으로 하지 않는다 — 실제 rebind/claim
+            // 성공 시 migrate() 가 incrementMigrationRevision() 으로 명시 증가시킨다(초기 claim 은 제외).
+            updateStatus { it.copy(publishingPath = path, txStalled = false) }
         }
         val status = _status.value
         Log.i(
@@ -425,19 +432,23 @@ class PublisherRuntime(
             moqCatalogPublished = true
             val summary = ensureServerRegistered()
             streamStarted = true
-            // Best-effort initial publishing path: activePath is the OS default network, used here as
-            // the presumed send path right after the session connects. A future rebind trigger should
-            // call markPublishingPath() with the real target instead of relying on this estimate.
-            val currentPublishingPath = networkManager.activePath.value
+            // publishingPath 는 OS default 로 추정하지 않는다 — 이전 Cellular bind 가 남아 있으면
+            // 실제 송출 바인딩과 태그가 어긋난다. null 로 두고, AutoNetworkMigrationController 가
+            // streamActive 관측 후 실제 경로를 claim/rebind 하면서 markPublishingPath() 로 태그한다.
             updateStatus {
                 it.copy(
                     deviceId = summary.deviceId,
                     broadcastPath = summary.broadcastPath,
                     publishState = PublishState.STREAMING,
                     streamActive = true,
-                    publishingPath = currentPublishingPath
+                    publishingPath = null
                 )
             }
+            Log.i(
+                TAG,
+                "initial publishingPath left null; osDefault=${networkManager.activePath.value} " +
+                    "boundTarget=${migrationController?.boundTarget()}"
+            )
             reportTelemetry(_status.value)
         } catch (t: Throwable) {
             frameJob?.cancelAndJoin()
@@ -494,6 +505,8 @@ class PublisherRuntime(
                     txStalled = false
                 )
             }
+            // 다음 스트림 시작에 이전 Cellular boundTarget 등이 남지 않게 컨트롤러 상태를 정리한다.
+            migrationController?.resetBindingState("stopStream")
         }
     }
 
