@@ -16,6 +16,9 @@ import kotlinx.serialization.Serializable
  *
  * streamRevision = 진짜 하드 재연결(MoQ 세션 완전 teardown+재수립) 누적 횟수. 0 부터 시작하고
  * rebind/soft cut 에서는 증가하지 않는다. 서버는 nullable/default 로 취급 — 구 서버 호환.
+ *
+ * migrationRevision = 세션 유지 QUIC path rebind 성공(publishingPath 확정) 누적 횟수. hard
+ * reconnect 와 분리. 관제가 rebind 직후 즉시 remount 하게 하는 신호. 서버는 nullable/default 취급.
  */
 @Serializable
 data class DeviceTelemetryRequest(
@@ -26,5 +29,6 @@ data class DeviceTelemetryRequest(
     val missionId: String,
     val missionStatus: String,
     val publisherTxBps: Long,
-    val streamRevision: Int = 0
+    val streamRevision: Int = 0,
+    val migrationRevision: Int = 0
 )

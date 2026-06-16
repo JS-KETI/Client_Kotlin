@@ -199,20 +199,23 @@ class PublisherRuntime(
     private fun setPublishingPath(path: NetworkPath?) {
         val previous = _status.value.publishingPath
         if (previous == path) return
-        updateStatus {
-            if (path == null) {
-                it.copy(publishingPath = null)
-            } else {
-                it.copy(publishingPath = path, txStalled = false)
-            }
-        }
         if (path == null) {
+            updateStatus { it.copy(publishingPath = null) }
             cameraEncoder.requestKeyframe()
+        } else {
+            // publishingPath 가 새 망으로 확정되는 유일한 지점 = rebind/claim 성공. 이때만
+            // migrationRevision 을 올려 관제가 즉시 remount 하게 한다. soft cut(경로 불변)·태그 정리
+            // (→null)·단순 감지에서는 호출되지 않으므로 여기 한 곳이면 충분하다.
+            val oldRev = _status.value.migrationRevision
+            updateStatus {
+                it.copy(publishingPath = path, txStalled = false, migrationRevision = it.migrationRevision + 1)
+            }
+            Log.i(TAG, "migrationRevision incremented: $oldRev -> ${_status.value.migrationRevision} target=$path")
         }
         val status = _status.value
         Log.i(
             TAG,
-            "publishingPath changed: $previous -> $path " +
+            "publishingPath changed: $previous -> $path migrationRevision=${status.migrationRevision} " +
                 "session=${moqPublisher.sessionState.value} osDefault=${networkManager.activePath.value} " +
                 "txStalled=${status.txStalled} txBps=${status.txBps}"
         )
@@ -749,6 +752,7 @@ class PublisherRuntime(
                         "cellHandle=${networkManager.cellularNetwork.value} " +
                         "sessionState=${moqPublisher.sessionState.value} " +
                         "migrationCount=${statusNow.migrationCount} " +
+                        "streamRevision=${statusNow.streamRevision} migrationRevision=${statusNow.migrationRevision} " +
                         "abrTargetBps=${ABR_BITRATE_LADDER_BPS[abrLadderIndex]} " +
                         "writeBps=$bps quicSendRateBps=$sendRateBps quicEgressBps=$egressBps " +
                         "egressValid=$egressValid bytesSentDelta=$bytesSentDelta " +

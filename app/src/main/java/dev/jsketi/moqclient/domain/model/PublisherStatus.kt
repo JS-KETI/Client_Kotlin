@@ -20,5 +20,9 @@ data class PublisherStatus(
     // 진짜 하드 재연결(MoQ 세션 완전 teardown+재수립) 횟수. rebind/soft cut 에서는 절대 증가하지
     // 않는다. 텔레메트리로 서버에 보고되어 현장 churn(세션 재수립 빈도)을 추적하는 지표.
     val streamRevision: Int = 0,
+    // 세션을 유지한 QUIC path rebind 성공(= publishingPath 가 새 망으로 확정) 누적 횟수. hard
+    // reconnect(streamRevision)과 분리. soft cut/단순 감지/OS default 변경에는 증가하지 않는다.
+    // 관제 페이지는 streamRevision 또는 migrationRevision 이 바뀌면 즉시 player 를 remount 한다.
+    val migrationRevision: Int = 0,
     val uptimeSeconds: Long = 0L
 )
