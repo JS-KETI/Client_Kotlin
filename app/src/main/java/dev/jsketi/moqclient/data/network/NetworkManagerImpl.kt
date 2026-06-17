@@ -371,30 +371,57 @@ class NetworkManagerImpl(
     }
 
     /**
-     * Wi-Fi 핸들이 살아있는 동안 WifiManager 로 RSSI 를 주기적으로 읽어 [wifiHealth] 를 갱신한다.
-     * NetworkCapabilities.signalStrength 와 달리 프로세스가 셀룰러에 바인딩돼 있어도 실제 신호를 준다
-     * → 셀룰러 송출 중 Wi-Fi 가 강해졌는지 감지해 복귀 트리거.
+     * 주기 폴 루프(500ms). Wi-Fi 핸들이 살아있는 동안 WifiManager 로 RSSI + 링크속도(Mbps) + 주파수를
+     * 읽어 로깅하고 [wifiHealth] 를 갱신한다. NetworkCapabilities.signalStrength 와 달리 프로세스가
+     * 셀룰러에 바인딩돼 있어도 실제 신호를 준다 → 셀룰러 송출 중 Wi-Fi 회복 감지. 같은 루프에서
+     * 셀룰러 품질(연결상태/선언 대역폭/신호)도 약 3s 간격으로 남겨 비활성 경로 추세를 확보한다.
      */
+    @Suppress("DEPRECATION")
     private suspend fun wifiRssiPollLoop() {
+        var tick = 0
         while (currentCoroutineContext().isActive) {
             if (_wifiNetwork.value != null) {
-                val dbm = readWifiManagerRssi()
-                if (dbm != null) {
+                val info = runCatching { wifiManager.connectionInfo }.getOrNull()
+                val rssi = info?.rssi
+                // -127 = 미연결 sentinel; rssi >= 0 도 무효.
+                val dbm = if (rssi != null && rssi < 0 && rssi > -127) rssi else null
+                if (info != null && dbm != null) {
                     _wifiSignalDbm.value = dbm
-                    Log.d(TAG, "wifi rssi sample: signal=$dbm health=${_wifiHealth.value}")
+                    Log.d(
+                        TAG,
+                        "wifi rssi sample: signal=$dbm health=${_wifiHealth.value} ${wifiLinkSummary(info)}"
+                    )
                     updateWifiHealth(dbm, force = null)
                 }
             }
+            // 셀룰러: 연결상태 + 선언 대역폭 + 신호를 약 3s 간격으로. 비활성(현재 Wi-Fi 송출) 경로도 추세 확보.
+            if (tick % CELLULAR_POLL_EVERY_N_TICKS == 0) {
+                _cellularNetwork.value?.let { cell ->
+                    val caps = runCatching { connectivityManager.getNetworkCapabilities(cell) }.getOrNull()
+                    logCellularQuality(cell, caps, "poll")
+                }
+            }
+            tick++
             delay(WIFI_RSSI_POLL_MS)
         }
     }
 
-    /** WifiManager 의 현재 연결 RSSI(dBm). 미연결/무효값이면 null. (-127 = 미연결 sentinel) */
+    /** WifiInfo 의 현재 링크 속도(Mbps)/주파수(MHz) 요약. 미지원/무효값은 "n/a". */
     @Suppress("DEPRECATION")
-    private fun readWifiManagerRssi(): Int? {
-        val info: WifiInfo = wifiManager.connectionInfo ?: return null
-        val rssi = info.rssi
-        return if (rssi >= 0 || rssi <= -127) null else rssi
+    private fun wifiLinkSummary(info: WifiInfo): String {
+        fun mbps(v: Int): String = v.takeIf { it >= 0 }?.toString() ?: "n/a"
+        val linkMbps = mbps(info.linkSpeed)
+        val txMbps: String
+        val rxMbps: String
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            txMbps = mbps(info.txLinkSpeedMbps)
+            rxMbps = mbps(info.rxLinkSpeedMbps)
+        } else {
+            txMbps = "n/a"
+            rxMbps = "n/a"
+        }
+        val freqMhz = info.frequency.takeIf { it > 0 }?.toString() ?: "n/a"
+        return "linkMbps=$linkMbps txMbps=$txMbps rxMbps=$rxMbps freqMhz=$freqMhz"
     }
 
     /**
@@ -588,5 +615,8 @@ class NetworkManagerImpl(
         private const val WIFI_WEAK_CONSEC_SAMPLES = 2
         private const val WIFI_WEAK_SUSTAIN_MS = 1_000L
         private const val WIFI_RSSI_POLL_MS = 500L
+
+        // 셀룰러 품질 폴 주기 = WIFI_RSSI_POLL_MS * N (약 3s). 콜백 이벤트가 드물어도 추세 확보.
+        private const val CELLULAR_POLL_EVERY_N_TICKS = 6
     }
 }
