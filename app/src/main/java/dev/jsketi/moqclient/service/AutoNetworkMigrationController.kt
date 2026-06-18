@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -74,7 +75,7 @@ class AutoNetworkMigrationController(
 
     private suspend fun observe() {
         val publishSignals = runtime.status
-            .map { PublishSnapshot(it.publishState, it.publishingPath, it.txStalled, it.streamActive) }
+            .map { PublishSnapshot(it.publishState, it.publishingPath, it.txStalled, it.txDegraded, it.streamActive) }
             .distinctUntilChanged()
         val runtimeSignals = combine(
             publishSignals,
@@ -84,6 +85,7 @@ class AutoNetworkMigrationController(
                 publishState = publish.publishState,
                 publishingPath = publish.publishingPath,
                 txStalled = publish.txStalled,
+                txDegraded = publish.txDegraded,
                 streamActive = publish.streamActive,
                 osDefaultPath = osDefaultPath
             )
@@ -104,6 +106,7 @@ class AutoNetworkMigrationController(
                 publishState = runtime.publishState,
                 publishingPath = runtime.publishingPath,
                 txStalled = runtime.txStalled,
+                txDegraded = runtime.txDegraded,
                 streamActive = runtime.streamActive,
                 osDefaultPath = runtime.osDefaultPath
             )
@@ -353,11 +356,18 @@ class AutoNetworkMigrationController(
             else Decision(null, "no network")
         }
 
+        // Wi-Fi 이탈 트리거: (1) RSSI 약함(선행/예측 — 신호가 떨어지는 중) (2) txStalled(near-death
+        // ~600k) (3) txDegraded(egress 가 영상 목표를 못 받침 — RSSI 가 멀쩡해도 간섭/혼잡/백홀로
+        // throughput 이 붕괴한 경우). (2)(3)은 Wi-Fi 송출 중일 때만(egress 는 현재 경로 기준).
         val wifiUnusable = s.wifiHealth == NetworkHealth.WEAK ||
-            (s.txStalled && s.publishingPath == NetworkPath.WIFI)
+            ((s.txStalled || s.txDegraded) && s.publishingPath == NetworkPath.WIFI)
         if (wifiUnusable) {
             return if (cellular != null) {
-                val why = if (s.wifiHealth == NetworkHealth.WEAK) "wifi weak" else "tx stalled on wifi"
+                val why = when {
+                    s.wifiHealth == NetworkHealth.WEAK -> "wifi weak"
+                    s.txStalled -> "tx stalled on wifi"
+                    else -> "tx degraded on wifi"
+                }
                 Decision(NetworkPath.CELLULAR, why)
             } else {
                 Decision(NetworkPath.WIFI, "wifi unusable, no cellular", currentPathUnusable = true)
@@ -390,14 +400,15 @@ class AutoNetworkMigrationController(
 
     /** Cellular→Wi-Fi 복귀 조건이 "지금" 전부 충족되는가(현재 .value 기준 — 타이머/decideTarget 공용). */
     private fun wifiReturnAllClearNow(): Boolean {
-        val rssi = networkManager.wifiSignalDbm.value
-        val rssiRecovered = rssi == null || rssi >= WIFI_RETURN_DBM
+        // wifiHealth==USABLE 자체가 RSSI>=WIFI_USABLE_DBM(-60) 진입 + 히스테리시스(-67까지 유지)를
+        // 인코딩한다. 과거엔 별도 rssi>=-60 게이트를 또 둬서 health 는 USABLE 인데(-61~-67) 복귀는
+        // 막히는 데드존이 생겼고, wifi 가 -60 경계에서 출렁이면 재검사가 그 순간 -61 에 걸려 복귀가
+        // 영영 취소됐다. → health 로 일원화해 데드존 제거.
         val holdoffElapsed =
             SystemClock.elapsedRealtime() - lastWifiStallFleeAtMs >= WIFI_STALL_FLEE_HOLDOFF_MS
         return networkManager.activePath.value == NetworkPath.WIFI &&
             networkManager.wifiHealth.value == NetworkHealth.USABLE &&
             networkManager.wifiNetwork.value != null &&
-            rssiRecovered &&
             holdoffElapsed &&
             !runtime.status.value.txStalled
     }
@@ -411,25 +422,50 @@ class AutoNetworkMigrationController(
         if (wifiReturnJob?.isActive == true) return
         val s = scope ?: return
         val job = s.launch {
-            Log.i(TAG, "wifi return all-clear timer started (sustain=${WIFI_RETURN_SUSTAIN_MS}ms)")
-            delay(WIFI_RETURN_SUSTAIN_MS)
-            Log.i(TAG, "wifi return timer fired; rechecking all-clear")
-            val status = runtime.status.value
-            when {
-                !status.streamActive -> Log.i(TAG, "wifi return timer: not streamActive; skip")
-                moqPublisher.sessionState.value != MoqSessionState.CONNECTED ->
-                    Log.i(TAG, "wifi return timer: session not connected; skip")
-                status.publishingPath == NetworkPath.WIFI ->
-                    Log.i(TAG, "wifi return timer: already on WIFI; done")
-                !wifiReturnAllClearNow() ->
-                    Log.i(TAG, "wifi return timer: no longer all-clear; staying on cellular")
-                else -> {
-                    Log.i(TAG, "wifi return sustained; migrating WIFI")
-                    // 기존 evaluate 와 동일하게 bind/rebind 는 IO 에서 — Main 블로킹 방지.
-                    scope?.launch(Dispatchers.IO) {
-                        migrate(NetworkPath.WIFI, "wifi return all-clear sustained (timer)")
+            // 단발 타이머가 아니라 폴 루프: Cellular 송출 중 all-clear 가 WIFI_RETURN_SUSTAIN_MS 동안
+            // "연속" 충족되면 복귀한다. 한 번의 불운한 샘플(RSSI 순간 -61 등)로 sustain 이 깨져도 계속
+            // 재시도하므로(과거엔 단발 재검사 1회 실패 후 영영 셀룰러 고착), wifi 가 강하면 결국 복귀한다.
+            // 조건이 깨지면(weak/stall 등) evaluate 가 cancelWifiReturnTimer 로 이 잡을 취소한다.
+            Log.i(TAG, "wifi return watch started (sustain=${WIFI_RETURN_SUSTAIN_MS}ms poll=${WIFI_RETURN_POLL_MS}ms)")
+            var allClearSinceMs = 0L
+            while (isActive) {
+                val status = runtime.status.value
+                when {
+                    !status.streamActive -> {
+                        Log.i(TAG, "wifi return watch: !streamActive; stop")
+                        return@launch
+                    }
+                    status.publishingPath == NetworkPath.WIFI -> {
+                        Log.i(TAG, "wifi return watch: already on WIFI; stop")
+                        return@launch
+                    }
+                    moqPublisher.sessionState.value != MoqSessionState.CONNECTED -> {
+                        // 세션 회복 대기 — sustain 리셋하고 계속 폴.
+                        allClearSinceMs = 0L
+                    }
+                    wifiReturnAllClearNow() -> {
+                        val now = SystemClock.elapsedRealtime()
+                        if (allClearSinceMs == 0L) {
+                            allClearSinceMs = now
+                            Log.i(TAG, "wifi return: all-clear, sustaining…")
+                        }
+                        if (now - allClearSinceMs >= WIFI_RETURN_SUSTAIN_MS) {
+                            Log.i(TAG, "wifi return sustained; migrating WIFI")
+                            // bind/rebind 는 IO 에서 — Main 블로킹 방지.
+                            scope?.launch(Dispatchers.IO) {
+                                migrate(NetworkPath.WIFI, "wifi return all-clear sustained")
+                            }
+                            return@launch
+                        }
+                    }
+                    else -> {
+                        if (allClearSinceMs != 0L) {
+                            Log.i(TAG, "wifi return: all-clear broke; resetting sustain")
+                        }
+                        allClearSinceMs = 0L
                     }
                 }
+                delay(WIFI_RETURN_POLL_MS)
             }
         }
         wifiReturnJob = job
@@ -512,6 +548,7 @@ class AutoNetworkMigrationController(
         val publishState: PublishState,
         val publishingPath: NetworkPath?,
         val txStalled: Boolean,
+        val txDegraded: Boolean,
         val streamActive: Boolean,
         val osDefaultPath: NetworkPath
     )
@@ -520,6 +557,7 @@ class AutoNetworkMigrationController(
         val publishState: PublishState,
         val publishingPath: NetworkPath?,
         val txStalled: Boolean,
+        val txDegraded: Boolean,
         val streamActive: Boolean,
         val osDefaultPath: NetworkPath
     )
@@ -530,6 +568,7 @@ class AutoNetworkMigrationController(
         val publishState: PublishState,
         val publishingPath: NetworkPath?,
         val txStalled: Boolean,
+        val txDegraded: Boolean,
         val streamActive: Boolean
     )
 
@@ -540,10 +579,9 @@ class AutoNetworkMigrationController(
         private const val STALL_FLEE_DEBOUNCE_MS = 200L
         private const val STALL_FLEE_LATCH_MS = 2_000L
         private const val WIFI_STALL_FLEE_HOLDOFF_MS = 30_000L
-        // Cellular→Wi-Fi 복귀: 모든 조건이 이만큼 연속 충족돼야 복귀(왕복 방지). 7s.
+        // Cellular→Wi-Fi 복귀: all-clear 가 이만큼 "연속" 충족돼야 복귀(왕복 방지). 7s.
         private const val WIFI_RETURN_SUSTAIN_MS = 7_000L
-        // 복귀에 요구하는 최소 RSSI(dBm). NetworkManager 의 USABLE 임계(-60)와 정합. RSSI 미지원
-        // 단말(null)은 wifiHealth==USABLE 로만 판정한다.
-        private const val WIFI_RETURN_DBM = -60
+        // 복귀 폴 주기. all-clear 를 이 간격으로 재평가해 단발 실패 후에도 재시도한다(고착 방지).
+        private const val WIFI_RETURN_POLL_MS = 1_000L
     }
 }

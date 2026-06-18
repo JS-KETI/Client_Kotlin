@@ -16,6 +16,10 @@ data class PublisherStatus(
     // runMetricsLoop 가 QUIC 실측치(estimated send rate + bytesSent 기반 egress)로 판정하고,
     // writeFrame 죽음(near-zero 투입/연속 실패)을 백업 신호로 쓴다.
     val txStalled: Boolean = false,
+    // 송신 저하(egress 기반 전환 트리거). txStalled(near-death ~600k)보다 높은 문턱에서, 링크
+    // capacity 추정이 영상 목표 비트레이트를 지속적으로 못 받칠 때 true. 컨트롤러가 Wi-Fi 송출 중
+    // 이 값으로 Cellular 로 선제 전환한다(RSSI 가 멀쩡해도 throughput 붕괴를 잡기 위함).
+    val txDegraded: Boolean = false,
     val migrationCount: Int = 0,
     // 진짜 하드 재연결(MoQ 세션 완전 teardown+재수립) 횟수. rebind/soft cut 에서는 절대 증가하지
     // 않는다. 텔레메트리로 서버에 보고되어 현장 churn(세션 재수립 빈도)을 추적하는 지표.
