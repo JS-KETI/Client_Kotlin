@@ -551,6 +551,9 @@ class PublisherRuntime(
         var secondsSinceBpsSample = 0
         var streamingBpsSamples = 0
         var consecutiveLowSamples = 0
+        // egress 기반 전환(txDegraded) 연속 저하 샘플 수. consecutiveLowSamples(600k 바닥)와 별개로
+        // 더 높은 문턱(WIFI_EGRESS_FLEE_BPS)에서 capacity 부족을 센다.
+        var consecutiveDegradedSamples = 0
         var previousStalled = false
         // 하드 실패 연속 샘플 수. ack/egress/bytesSent 가 한 발짝도 안 늘고 write 도 ~0 인 샘플의 streak.
         var hardStreak = 0
@@ -643,6 +646,7 @@ class PublisherRuntime(
                     if (transitionSample) {
                         // 전환 샘플은 stall/ABR/hard 판정 모두 skip (post-migration/reconnect false positive 방지).
                         consecutiveLowSamples = 0
+                        consecutiveDegradedSamples = 0
                         hardStreak = 0
                         abrUpHoldSamples = 0
                     } else {
@@ -711,6 +715,16 @@ class PublisherRuntime(
                         val low = !abrDownshifted && (sendRateCollapsed || writeNearZero)
                         consecutiveLowSamples = if (low) consecutiveLowSamples + 1 else 0
 
+                        // egress 기반 전환 신호(txDegraded): txStalled(600k)보다 높은 WIFI_EGRESS_FLEE_BPS
+                        // 문턱에서 링크 capacity 추정(sendRateBps = cwnd*8/RTT)이 부족한지 본다. sendRateBps 는
+                        // 인코더 출력에 안 묶인 capacity 추정이라 정적 장면(저비트레이트)에는 안 떨어져 오탐이
+                        // 적다. 실측 egress 가 문턱 이상으로 멀쩡하면 cwnd 일시 수축으로 보고 veto. ABR 강하
+                        // 샘플은 한 샘플 유예(낮춘 비트레이트 반영 시간).
+                        val estimateDegraded = sendRateBps != null && sendRateBps < WIFI_EGRESS_FLEE_BPS
+                        val egressDegradedHigh = egressBps != null && egressBps >= WIFI_EGRESS_FLEE_BPS
+                        val degraded = !abrDownshifted && estimateDegraded && !egressDegradedHigh
+                        consecutiveDegradedSamples = if (degraded) consecutiveDegradedSamples + 1 else 0
+
                         // 하드 실패 후보(보수적): 실측 egress 가 HARD_EGRESS_STALL_MS 이상 한 발짝도
                         // 안 늘었고(=망이 1바이트도 못 흡수) write 도 ~0 으로 죽어 있는 샘플. egress 가
                         // valid 일 때만(전환/리셋 직후 제외) 카운트한다. writeFrame 연속 실패도 포함.
@@ -727,6 +741,7 @@ class PublisherRuntime(
                 } else {
                     streamingBpsSamples = 0
                     consecutiveLowSamples = 0
+                    consecutiveDegradedSamples = 0
                     hardStreak = 0
                     abrLadderIndex = 0
                     abrUpHoldSamples = 0
@@ -734,6 +749,10 @@ class PublisherRuntime(
                 val softStalled = streaming &&
                     streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
                     consecutiveLowSamples >= TX_STALL_SAMPLES
+                // egress 기반 전환 신호 — 컨트롤러가 Wi-Fi 송출 중 Cellular 로 선제 전환에 사용.
+                val txDegraded = streaming &&
+                    streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
+                    consecutiveDegradedSamples >= TX_DEGRADED_SAMPLES
                 // 하드 실패: (1) MoQ 세션이 실제 FAILED 거나 (2) egress 동결+write 죽음 또는 writeFrame
                 // 연속 실패가 HARD_STREAK_SAMPLES 이상 지속. 전환 샘플 직후가 아닐 때만(grace) 본다.
                 val sessionFailed = moqPublisher.sessionState.value == MoqSessionState.FAILED
@@ -770,11 +789,11 @@ class PublisherRuntime(
                         "writeBps=$bps quicSendRateBps=$sendRateBps quicEgressBps=$egressBps " +
                         "egressValid=$egressValid bytesSentDelta=$bytesSentDelta " +
                         "rttMs=${sendStats?.rttMs} packetsLost=${sendStats?.packetsLost} " +
-                        "softStalled=$softStalled hardFailed=$hardFailed " +
+                        "softStalled=$softStalled txDegraded=$txDegraded hardFailed=$hardFailed " +
                         "lowStreak=$consecutiveLowSamples hardStreak=$hardStreak"
                 )
 
-                updateStatus { it.copy(uptimeSeconds = uptimeSeconds, txBps = bps, txStalled = softStalled) }
+                updateStatus { it.copy(uptimeSeconds = uptimeSeconds, txBps = bps, txStalled = softStalled, txDegraded = txDegraded) }
 
                 // 같은 경로 위 대응. 하드 실패가 우선 — 진짜 죽음이면 reconnect(streamRevision++),
                 // 아니면 단순 정체이므로 soft cut(latest-only refresh)로 세션을 살린 채 backlog 만 버린다.
@@ -849,6 +868,13 @@ class PublisherRuntime(
         // QUIC estimated send rate 가 이 값 미만이면 정체. 인코더 2 Mbps 의 30% — 그 아래면
         // 백로그가 누적되기 시작한 지 한참이고 시청 품질은 이미 무너져 있다.
         private const val TX_STALL_SEND_RATE_BPS = 600_000L
+
+        // egress 기반 전환(txDegraded) 문턱(bps). txStalled 의 600k 바닥보다 높게 잡아 "거의 죽음"이
+        // 아니라 "영상 목표를 못 받침" 단계에서 Cellular 로 선제 전환한다(영상 풀타깃 ~2M 기준 capacity
+        // 1.2M 미만). RSSI 가 멀쩡해도(간섭/혼잡/백홀) throughput 붕괴를 잡는다.
+        private const val WIFI_EGRESS_FLEE_BPS = 1_200_000L
+        // 위 문턱 연속 저하 샘플 수(샘플≈3s). 2 = ~6s 지속 시 txDegraded(단발 dip 오탐 방지).
+        private const val TX_DEGRADED_SAMPLES = 2
 
         // ── 하드 재연결(genuine failure) 판정 — soft stall 과 엄격히 분리 ──
         // 실측 egress(bytesSent) 가 이 시간 이상 한 발짝도 안 늘어야(=망이 1바이트도 못 흡수)
