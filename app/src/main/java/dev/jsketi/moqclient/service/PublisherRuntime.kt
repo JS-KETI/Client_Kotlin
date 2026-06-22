@@ -559,6 +559,8 @@ class PublisherRuntime(
         var hardStreak = 0
         // 실측 egress 추적용. bytesSent 는 per-connection 누적이라 reconnect 시 0 으로 리셋된다.
         var previousBytesSent: Long? = null
+        // packetsLost 도 per-connection 누적 — 윈도우 손실 증가분(packetsLostDelta) 계산용 직전값.
+        var previousPacketsLost: Long? = null
         // bytesSent 가 마지막으로 "증가"한 시각(elapsedRealtime). 하드 실패(egress 완전 정지) 판정용.
         // 세션 전환/리셋 때 갱신해 false positive 를 막는다. 0 = 아직 기준 없음.
         var lastBytesSentProgressAtMs = 0L
@@ -617,13 +619,17 @@ class PublisherRuntime(
                 // egressValid=false 인 샘플(전환 직후 / 카운터 리셋)은 egressBps 를 신뢰하지 않으며
                 // stall 판정에서 제외한다(아래 sendRateCollapsed/egress* 가 egressBps==null 로 우회).
                 val bytesSent = sendStats?.bytesSent
+                val packetsLostNow = sendStats?.packetsLost
                 var egressBps: Long? = null
                 var egressValid = false
                 // bytesSentDelta = 이번 3s 윈도우의 실측 송신 증가분(unknown 이면 null).
                 var bytesSentDelta: Long? = null
+                // packetsLostDelta = 이번 3s 윈도우의 손실 증가분(누적 카운터 delta, unknown 이면 null).
+                var packetsLostDelta: Long? = null
                 if (transitionSample) {
-                    // 세션 전환/통계 리셋 직후 — egress 기준선을 새로 잡는다(이 샘플은 무판정).
+                    // 세션 전환/통계 리셋 직후 — egress/손실 기준선을 새로 잡는다(이 샘플은 무판정).
                     previousBytesSent = bytesSent
+                    previousPacketsLost = packetsLostNow
                     lastBytesSentProgressAtMs = SystemClock.elapsedRealtime()
                 } else {
                     val prevSent = previousBytesSent
@@ -639,8 +645,19 @@ class PublisherRuntime(
                         lastBytesSentProgressAtMs = SystemClock.elapsedRealtime()
                     }
                     previousBytesSent = bytesSent
+                    // 손실 증가분: bytesSent 가 연속(egressValid)일 때만 계산한다. bytesSent/packetsLost
+                    // 는 reconnect 시 함께 리셋되므로, bytesSent 가 연속이 아니면(리셋/미상) 손실 delta 도
+                    // 신뢰할 수 없다 — 새 커넥션의 작은 packetsLost 가 큰 가짜 delta(거짓 lossSurge)로
+                    // 잡히는 것을 막는다(transitionSample 이 빠른 reconnect 를 놓친 경우 대비).
+                    val prevLost = previousPacketsLost
+                    if (egressValid && prevLost != null && packetsLostNow != null && packetsLostNow >= prevLost) {
+                        packetsLostDelta = packetsLostNow - prevLost
+                    }
+                    previousPacketsLost = packetsLostNow
                 }
 
+                // RTT 심각(1샘플 즉시 flee) 신호 — 판정 샘플에서만 set(전환/비스트리밍은 false 유지).
+                var severeDegradedSample = false
                 if (streaming) {
                     streamingBpsSamples += 1
                     if (transitionSample) {
@@ -715,15 +732,30 @@ class PublisherRuntime(
                         val low = !abrDownshifted && (sendRateCollapsed || writeNearZero)
                         consecutiveLowSamples = if (low) consecutiveLowSamples + 1 else 0
 
-                        // egress 기반 전환 신호(txDegraded): txStalled(600k)보다 높은 WIFI_EGRESS_FLEE_BPS
-                        // 문턱에서 링크 capacity 추정(sendRateBps = cwnd*8/RTT)이 부족한지 본다. sendRateBps 는
-                        // 인코더 출력에 안 묶인 capacity 추정이라 정적 장면(저비트레이트)에는 안 떨어져 오탐이
-                        // 적다. 실측 egress 가 문턱 이상으로 멀쩡하면 cwnd 일시 수축으로 보고 veto. ABR 강하
-                        // 샘플은 한 샘플 유예(낮춘 비트레이트 반영 시간).
+                        // ── Wi-Fi 이탈(flee) 신호 txDegraded 산정 — "실신호" 기반 ──
+                        // 기존엔 capacity 추정(sendRateBps=cwnd*8/RTT)만 봤는데, RTT 가 폭증해도 추정치가
+                        // high-stale 로 높게 남아(0622 Pixel: rtt 705~2263 인데 estimate 4.8M) flee 가 늦었다.
+                        // → RTT 급등/손실 급증을 1차 신호로 쓴다(둘 다 high-stale 맹점도 정적 장면 오탐도 없음).
+                        //  (a) rttSevere: 명백한 bufferbloat 붕괴 수준 RTT — 지속 없이 1샘플 즉시 flee.
+                        //  (b) rttHigh / lossSurge: 그보다 약한 열화 — TX_DEGRADED_SAMPLES 지속 시 flee.
+                        //  (c) estimateDegraded: capacity 추정 자체가 낮음(링크 나쁨). 단 실측 egress 가
+                        //      문턱 이상이면 일시 cwnd 수축으로 보고 veto(RTT/손실 실신호는 veto 대상 아님).
+                        val rtt = sendStats?.rttMs
+                        val rttSevere = rtt != null && rtt >= WIFI_DEGRADED_RTT_SEVERE_MS
+                        val rttHigh = rtt != null && rtt >= WIFI_DEGRADED_RTT_MS
+                        val lossSurge = packetsLostDelta != null && packetsLostDelta >= WIFI_DEGRADED_LOSS_DELTA
                         val estimateDegraded = sendRateBps != null && sendRateBps < WIFI_EGRESS_FLEE_BPS
                         val egressDegradedHigh = egressBps != null && egressBps >= WIFI_EGRESS_FLEE_BPS
-                        val degraded = !abrDownshifted && estimateDegraded && !egressDegradedHigh
+                        val degradedSustainable = rttHigh || lossSurge ||
+                            (estimateDegraded && !egressDegradedHigh)
+                        // ABR 강하 "직후" 샘플만 유예(!abrDownshifted) — 낮춘 비트레이트가 아직 반영
+                        // 안 됐으므로 그 샘플은 안 센다(바닥으로 막 내린 샘플 포함). 정상(steady) 바닥
+                        // 샘플은 강하가 없어(abrDownshifted=false) 그대로 카운트되므로 "바닥에서도 목표를
+                        // 못 받치면 이탈"은 유지된다.
+                        val degraded = degradedSustainable && !abrDownshifted
                         consecutiveDegradedSamples = if (degraded) consecutiveDegradedSamples + 1 else 0
+                        // RTT 심각은 지속 없이 즉시 flee(healthy wifi-relay SRTT 는 이 값에 못 미침).
+                        severeDegradedSample = rttSevere
 
                         // 하드 실패 후보(보수적): 실측 egress 가 HARD_EGRESS_STALL_MS 이상 한 발짝도
                         // 안 늘었고(=망이 1바이트도 못 흡수) write 도 ~0 으로 죽어 있는 샘플. egress 가
@@ -749,10 +781,12 @@ class PublisherRuntime(
                 val softStalled = streaming &&
                     streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
                     consecutiveLowSamples >= TX_STALL_SAMPLES
-                // egress 기반 전환 신호 — 컨트롤러가 Wi-Fi 송출 중 Cellular 로 선제 전환에 사용.
+                // 실신호 기반 전환 신호 — 컨트롤러가 Wi-Fi 송출 중 Cellular 로 선제 전환에 사용.
+                // RTT 심각(severeDegradedSample)은 1샘플 즉시, 그 외(RTT 급등/손실/capacity)는
+                // TX_DEGRADED_SAMPLES 지속 시 발화.
                 val txDegraded = streaming &&
                     streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
-                    consecutiveDegradedSamples >= TX_DEGRADED_SAMPLES
+                    (severeDegradedSample || consecutiveDegradedSamples >= TX_DEGRADED_SAMPLES)
                 // 하드 실패: (1) MoQ 세션이 실제 FAILED 거나 (2) egress 동결+write 죽음 또는 writeFrame
                 // 연속 실패가 HARD_STREAK_SAMPLES 이상 지속. 전환 샘플 직후가 아닐 때만(grace) 본다.
                 val sessionFailed = moqPublisher.sessionState.value == MoqSessionState.FAILED
@@ -789,6 +823,7 @@ class PublisherRuntime(
                         "writeBps=$bps quicSendRateBps=$sendRateBps quicEgressBps=$egressBps " +
                         "egressValid=$egressValid bytesSentDelta=$bytesSentDelta " +
                         "rttMs=${sendStats?.rttMs} packetsLost=${sendStats?.packetsLost} " +
+                        "packetsLostDelta=$packetsLostDelta " +
                         "softStalled=$softStalled txDegraded=$txDegraded hardFailed=$hardFailed " +
                         "lowStreak=$consecutiveLowSamples hardStreak=$hardStreak"
                 )
@@ -803,6 +838,7 @@ class PublisherRuntime(
                 val counters = "writeBps=$bps sendRateBps=$sendRateBps egressBps=$egressBps " +
                     "egressValid=$egressValid bytesSentDelta=$bytesSentDelta " +
                     "rttMs=${sendStats?.rttMs} packetsLost=${sendStats?.packetsLost} " +
+                    "packetsLostDelta=$packetsLostDelta " +
                     "failuresDelta=$failuresDelta lowStreak=$consecutiveLowSamples hardStreak=$hardStreak " +
                     "sessionState=${moqPublisher.sessionState.value}"
                 if (hardFailed) {
@@ -875,6 +911,16 @@ class PublisherRuntime(
         private const val WIFI_EGRESS_FLEE_BPS = 1_200_000L
         // 위 문턱 연속 저하 샘플 수(샘플≈3s). 2 = ~6s 지속 시 txDegraded(단발 dip 오탐 방지).
         private const val TX_DEGRADED_SAMPLES = 2
+
+        // ── Wi-Fi flee 실신호 임계(capacity 추정 high-stale 맹점·정적 장면 오탐 회피) ──
+        // 0622 Pixel 근거: 정상 RTT 수십 ms·손실 0~2/윈도우 ↔ 열화 RTT 705~2263ms·손실 급증.
+        // RTT 급등(>=350ms)은 큐잉(bufferbloat)이 쌓이면 추정치보다 먼저, 정적 장면에도 안 속고 오른다.
+        private const val WIFI_DEGRADED_RTT_MS = 350L
+        // RTT 심각(>=600ms) = 명백한 붕괴 — 지속 없이 1샘플 즉시 flee. healthy wifi-relay SRTT 는
+        // 수십 ms 라 이 값에 못 미치므로 오탐 위험이 낮다.
+        private const val WIFI_DEGRADED_RTT_SEVERE_MS = 600L
+        // 윈도우(3s)당 손실 증가분이 이 값 이상이면 손실 급증(경로 열화/혼잡 확정). 정상 0~2 대비 여유.
+        private const val WIFI_DEGRADED_LOSS_DELTA = 15L
 
         // ── 하드 재연결(genuine failure) 판정 — soft stall 과 엄격히 분리 ──
         // 실측 egress(bytesSent) 가 이 시간 이상 한 발짝도 안 늘어야(=망이 1바이트도 못 흡수)
