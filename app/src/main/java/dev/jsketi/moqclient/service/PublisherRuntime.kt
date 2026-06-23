@@ -574,6 +574,9 @@ class PublisherRuntime(
         // 인코더는 어차피 기본 비트레이트로 새로 만들어지므로 적용 호출은 불필요.
         var abrLadderIndex = 0
         var abrUpHoldSamples = 0
+        // 전환(rebind/claim) 직후 인코더 선강하 hold 만료 시각(elapsedRealtime). 0 = 비활성.
+        // 이 시각 전까지 인코더를 바닥 비트레이트로 유지하고 stall/ABR/degraded 판정을 보류한다.
+        var migrationPredropUntilMs = 0L
 
         while (currentCoroutineContext().isActive) {
             delay(1_000)
@@ -602,7 +605,8 @@ class PublisherRuntime(
                 // 직후 첫 샘플은 전환 잡음이 섞인다 — cwnd 리셋으로 estimate 가 일시 붕괴하고,
                 // bytesSent delta 는 커넥션 경계에 걸친다.
                 val migrationCount = _status.value.migrationCount
-                val transitionSample = migrationCount != previousMigrationCount ||
+                val migrationChanged = migrationCount != previousMigrationCount
+                val transitionSample = migrationChanged ||
                     sessionStateChangedSinceSample
                 if (transitionSample) {
                     Log.i(
@@ -660,8 +664,28 @@ class PublisherRuntime(
                 var severeDegradedSample = false
                 if (streaming) {
                     streamingBpsSamples += 1
+                    val nowMs = SystemClock.elapsedRealtime()
                     if (transitionSample) {
                         // 전환 샘플은 stall/ABR/hard 판정 모두 skip (post-migration/reconnect false positive 방지).
+                        consecutiveLowSamples = 0
+                        consecutiveDegradedSamples = 0
+                        hardStreak = 0
+                        abrUpHoldSamples = 0
+                        if (migrationChanged) {
+                            // 전환(rebind/claim) 직후 cold/validating 경로에 풀 비트레이트를 쏟지 않도록
+                            // 인코더를 바닥으로 선강하한다. path 가 warm/validate 되는 동안 backlog·PTO 폭주를
+                            // 줄이고, 이후 MIGRATION_PREDROP_RAMP_MS 동안 빠르게 회복한다.
+                            val floorIdx = ABR_BITRATE_LADDER_BPS.lastIndex
+                            if (abrLadderIndex != floorIdx) {
+                                abrLadderIndex = floorIdx
+                                cameraEncoder.setTargetBitrate(ABR_BITRATE_LADDER_BPS[floorIdx].toInt())
+                            }
+                            migrationPredropUntilMs = nowMs + MIGRATION_PREDROP_HOLD_MS
+                            Log.i(TAG, "migration predrop: encoder->${ABR_BITRATE_LADDER_BPS[floorIdx]} holdMs=$MIGRATION_PREDROP_HOLD_MS")
+                        }
+                    } else if (nowMs < migrationPredropUntilMs) {
+                        // 선강하 HOLD: 전환 직후 cold-start 구간 — 바닥 비트레이트 유지, stall/ABR/degraded
+                        // 판정 보류(transition 과 동일). cold 경로의 일시적 RTT/egress 저하를 오탐하지 않는다.
                         consecutiveLowSamples = 0
                         consecutiveDegradedSamples = 0
                         hardStreak = 0
@@ -697,9 +721,15 @@ class PublisherRuntime(
                             ABR_BITRATE_LADDER_BPS[abrLadderIndex - 1] * 3 / 2
                         ) {
                             // 업시프트는 보수적으로: 한 단계 위의 1.5 배 여유(estimate 기준)가
-                            // 3 샘플(~9s) 연속일 때만 한 단계씩 (level skip 금지).
+                            // 평시 3 샘플(~9s) 연속일 때만 한 단계씩 (level skip 금지). 단 선강하 회복
+                            // 구간(MIGRATION_PREDROP_RAMP_MS)에선 빠른 hold 로 신속 회복.
                             abrUpHoldSamples += 1
-                            if (abrUpHoldSamples >= ABR_UP_HOLD_SAMPLES) {
+                            val upHoldNeeded = if (nowMs < migrationPredropUntilMs + MIGRATION_PREDROP_RAMP_MS) {
+                                ABR_PREDROP_RAMP_HOLD_SAMPLES
+                            } else {
+                                ABR_UP_HOLD_SAMPLES
+                            }
+                            if (abrUpHoldSamples >= upHoldNeeded) {
                                 val next = ABR_BITRATE_LADDER_BPS[abrLadderIndex - 1]
                                 abrLadderIndex -= 1
                                 abrUpHoldSamples = 0
@@ -723,8 +753,12 @@ class PublisherRuntime(
                             TX_STALL_LOW_BPS_THRESHOLD,
                             minOf(TX_STALL_SEND_RATE_BPS, currentTargetBps / 2)
                         )
+                        // 선강하 회복 구간(MIGRATION_PREDROP_RAMP_MS)엔 egress 가 인코더 출력(바닥)에
+                        // 묶여 낮으므로 egress 기반 stall term 을 보류한다(자기유발 오탐 방지). capacity
+                        // (estimate) 기반 term 은 유지 — 새 경로가 실제로 못 받치면 정상 판정.
+                        val inPredropRamp = nowMs < migrationPredropUntilMs + MIGRATION_PREDROP_RAMP_MS
                         val sendRateCollapsed = (estimateLow && !egressHigh) ||
-                            (egressLow && bps >= egressBacklogWriteThreshold)
+                            (!inPredropRamp && egressLow && bps >= egressBacklogWriteThreshold)
                         val writeNearZero = bps <= TX_STALL_LOW_BPS_THRESHOLD
                         // 절단은 최후수단 — 같은 샘플에서 ABR 강하와 soft cut 이 동시에 발동하지 않게,
                         // 강하한 샘플은 not-low 취급해 낮춘 비트레이트가 한 샘플(3s) 효과를 낼
@@ -777,6 +811,7 @@ class PublisherRuntime(
                     hardStreak = 0
                     abrLadderIndex = 0
                     abrUpHoldSamples = 0
+                    migrationPredropUntilMs = 0L
                 }
                 val softStalled = streaming &&
                     streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
@@ -938,5 +973,12 @@ class PublisherRuntime(
         private val ABR_BITRATE_LADDER_BPS = longArrayOf(2_000_000, 1_000_000, 500_000)
         // 업시프트 보류 샘플 수 — 여유 대역이 이만큼 연속 관측될 때만 한 단계 올린다(~9s).
         private const val ABR_UP_HOLD_SAMPLES = 3
+
+        // ── 전환 직후 인코더 선강하(predrop) — cold/validating 경로 blast 방지 ──
+        // 전환 시 인코더를 사다리 바닥으로 내려 cold 셀룰러/path validation 동안 backlog·PTO 폭주를
+        // 줄인다. HOLD 동안은 판정 보류, 이후 RAMP 동안 빠르게 회복하며 egress 기반 stall 만 보류한다.
+        private const val MIGRATION_PREDROP_HOLD_MS = 3_000L   // 바닥 유지(경로 warm 대기). 이 동안 판정 보류.
+        private const val MIGRATION_PREDROP_RAMP_MS = 15_000L  // hold 이후 빠른 회복 구간(이 동안 egress-stall 보류).
+        private const val ABR_PREDROP_RAMP_HOLD_SAMPLES = 1    // 회복 구간 업시프트 hold(평시 3 대비 신속).
     }
 }
