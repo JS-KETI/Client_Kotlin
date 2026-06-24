@@ -19,6 +19,9 @@ import kotlinx.serialization.Serializable
  *
  * migrationRevision = 세션 유지 QUIC path rebind 성공(publishingPath 확정) 누적 횟수. hard
  * reconnect 와 분리. 관제가 rebind 직후 즉시 remount 하게 하는 신호. 서버는 nullable/default 취급.
+ *
+ * networkType = 현재 네트워크 타입("WIFI" | "5G" | "LTE" | "CELLULAR" | null). 관제 카드/상세 표시용.
+ * 필드명은 서버 record 컴포넌트명과 일치. 서버는 nullable/default 취급 — 구 서버 호환.
  */
 @Serializable
 data class DeviceTelemetryRequest(
@@ -30,5 +33,6 @@ data class DeviceTelemetryRequest(
     val missionStatus: String,
     val publisherTxBps: Long,
     val streamRevision: Int = 0,
-    val migrationRevision: Int = 0
+    val migrationRevision: Int = 0,
+    val networkType: String? = null
 )
