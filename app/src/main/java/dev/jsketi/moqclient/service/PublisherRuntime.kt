@@ -127,18 +127,6 @@ class PublisherRuntime(
     }
 
     /**
-     * 실제 송출 경로 rebind/claim 성공 시에만 호출 — 관제가 즉시 player 를 remount 하게 하는 신호.
-     * startStream 초기 claim·soft cut·단순 감지·OS default 변경에는 호출하지 않는다(그 경우는 viewer
-     * remount 가 불필요). hard reconnect 는 별도 [PublisherStatus.streamRevision] 을 쓴다.
-     */
-    fun incrementMigrationRevision(reason: String) {
-        val old = _status.value.migrationRevision
-        val next = old + 1
-        updateStatus { it.copy(migrationRevision = next) }
-        Log.i(TAG, "migrationRevision incremented $old -> $next target/reason=$reason")
-    }
-
-    /**
      * Soft cut for a slow/congested path: discards the stale encoder frame backlog and requests a
      * fresh keyframe so the receiver resumes from a clean reference point — WITHOUT tearing down the
      * QUIC/MoQ session (publishingPath stays, no requestReconnect()).
@@ -215,8 +203,8 @@ class PublisherRuntime(
             updateStatus { it.copy(publishingPath = null) }
             cameraEncoder.requestKeyframe()
         } else {
-            // 태그만 세팅한다. migrationRevision 증가는 여기서 자동으로 하지 않는다 — 실제 rebind/claim
-            // 성공 시 migrate() 가 incrementMigrationRevision() 으로 명시 증가시킨다(초기 claim 은 제외).
+            // 태그만 세팅한다(관제 remount 신호 없음). migrationRevision 은 더 이상 증가시키지 않는다 —
+            // rebind 는 연결 유지라 관제가 재구독 없이 영상이 이어지기 때문. 진짜 재연결만 streamRevision.
             updateStatus { it.copy(publishingPath = path, txStalled = false) }
         }
         val status = _status.value
