@@ -56,6 +56,8 @@ class MainActivity : ComponentActivity() {
         return buildList {
             addAll(CameraPermission.REQUIRED)
             add(Manifest.permission.ACCESS_FINE_LOCATION)
+            // LTE/5G 구분(dataNetworkType)용 — 거부돼도 서비스 시작은 막지 않는다(CELLULAR 폴백).
+            add(Manifest.permission.READ_PHONE_STATE)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add(Manifest.permission.POST_NOTIFICATIONS)
             }
