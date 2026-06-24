@@ -271,7 +271,9 @@ class AutoNetworkMigrationController(
                         Log.i(TAG, "[migrate#$attemptId] CLAIM connected on boundTarget=$boundTarget target=$target")
                         runtime.markPublishingPath(target)
                         runtime.incrementMigrationCount()
-                        runtime.incrementMigrationRevision("claim target=$target")
+                        // migrationRevision(관제 remount 신호)은 더 이상 올리지 않는다 — rebind/claim 은
+                        // 연결 유지라 관제가 재구독 없이 영상이 이어진다. 진짜 재연결만 streamRevision 으로
+                        // remount(혹시의 공백은 관제 watchdog 이 잡는다).
                     }
 
                     // Cross-path 전환(예: Wi-Fi 정체 → Cellular)은 REBIND 로 처리한다 — 세션을 유지한
@@ -286,7 +288,7 @@ class AutoNetworkMigrationController(
                                 boundTarget = target
                                 runtime.markPublishingPath(target)
                                 runtime.incrementMigrationCount()
-                                runtime.incrementMigrationRevision("actual-rebind target=$target")
+                                // migrationRevision 미증가 — 위 CLAIM 분기 참조(연결 유지=관제 재구독 불필요).
                             }
                             .onFailure { e ->
                                 Log.w(
