@@ -548,7 +548,7 @@ class PublisherRuntime(
     private suspend fun runMetricsLoop() {
         var previousBytes = moqPublisher.txByteCounter.value
         var previousFailures = frameWriteFailures.get()
-        var secondsSinceBpsSample = 0
+        var msSinceTelemetry = 0L
         var streamingBpsSamples = 0
         var consecutiveLowSamples = 0
         // egress 기반 전환(txDegraded) 연속 저하 샘플 수. consecutiveLowSamples(600k 바닥)와 별개로
@@ -577,25 +577,70 @@ class PublisherRuntime(
         // 전환(rebind/claim) 직후 인코더 선강하 hold 만료 시각(elapsedRealtime). 0 = 비활성.
         // 이 시각 전까지 인코더를 바닥 비트레이트로 유지하고 stall/ABR/degraded 판정을 보류한다.
         var migrationPredropUntilMs = 0L
+        // ── 빠른 flee 평가(매 TRIGGER_EVAL_INTERVAL_MS tick) 상태 ──
+        // RTT 기반 flee 를 0.5s 마다 평가해 감지 지연을 줄인다(텔레메트리/egress/ABR 은 그대로 3s).
+        var fastRttLatch = false              // 빠른 RTT flee 신호(heavy block 이 txDegraded 에 OR)
+        var fastDegradedSinceMs = 0L          // rttHigh 지속 시작 시각(time 기준 sustain)
+        var fastSuppressUntilMs = 0L          // 전환 직후 cold-start flee 억제 만료 시각
+        var previousMigCountFast = _status.value.migrationCount
+        var lastHeavyEgressBps: Long? = null  // heavy block 이 갱신하는 직전 실측 egress(veto 용)
 
         while (currentCoroutineContext().isActive) {
-            delay(1_000)
-            secondsSinceBpsSample += 1
-            // 세션 상태는 1s tick 마다 관찰 — 자발적 reconnect 가 3s 샘플 경계 사이에
+            delay(TRIGGER_EVAL_INTERVAL_MS)
+            msSinceTelemetry += TRIGGER_EVAL_INTERVAL_MS
+            // 세션 상태는 매 tick 관찰 — 자발적 reconnect 가 샘플 경계 사이에
             // CONNECTED→CONNECTING→CONNECTED 로 왕복을 끝내도 "changed" 로 latch 되게.
             val sessionStateNow = moqPublisher.sessionState.value
             if (sessionStateNow != previousSessionState) sessionStateChangedSinceSample = true
             previousSessionState = sessionStateNow
-            val uptimeSeconds = (SystemClock.elapsedRealtime() - startedAtElapsedMs) / 1_000
+            val tickNowMs = SystemClock.elapsedRealtime()
+            val uptimeSeconds = (tickNowMs - startedAtElapsedMs) / 1_000
 
-            if (secondsSinceBpsSample >= TELEMETRY_INTERVAL_SECONDS) {
+            // ── 빠른 flee 평가(매 tick) — RTT 기반 txDegraded 를 0.5s 단위로 당겨 감지 지연 축소.
+            // 전환 직후(migrationCount 변화)엔 cold-start RTT 스파이크 오발을 막기 위해 일정시간 억제.
+            run {
+                val migCountNow = _status.value.migrationCount
+                if (migCountNow != previousMigCountFast) {
+                    previousMigCountFast = migCountNow
+                    fastSuppressUntilMs = tickNowMs + MIGRATION_PREDROP_HOLD_MS
+                    fastDegradedSinceMs = 0L
+                }
+                if (_status.value.streamActive && tickNowMs >= fastSuppressUntilMs) {
+                    val fastStats = moqPublisher.transportSendStats()
+                    val fastRtt = fastStats?.rttMs
+                    val fastEst = fastStats?.estimatedSendRateBps
+                    val rttSevere = fastRtt != null && fastRtt >= WIFI_DEGRADED_RTT_SEVERE_MS
+                    val rttHigh = fastRtt != null && fastRtt >= WIFI_DEGRADED_RTT_MS
+                    val estLow = fastEst != null && fastEst < WIFI_EGRESS_FLEE_BPS
+                    val egressHealthy = (lastHeavyEgressBps ?: 0L) >= WIFI_EGRESS_FLEE_BPS
+                    val degradedNow = rttHigh || (estLow && !egressHealthy)
+                    fastRttLatch = if (rttSevere) {
+                        true
+                    } else if (degradedNow) {
+                        if (fastDegradedSinceMs == 0L) fastDegradedSinceMs = tickNowMs
+                        tickNowMs - fastDegradedSinceMs >= TX_DEGRADED_SUSTAIN_MS
+                    } else {
+                        fastDegradedSinceMs = 0L
+                        false
+                    }
+                } else {
+                    fastDegradedSinceMs = 0L
+                    fastRttLatch = false
+                }
+                // 빠른 신호가 켜지면 heavy block 을 기다리지 않고 즉시 반영(끄는 건 heavy block 이 담당).
+                if (fastRttLatch && !_status.value.txDegraded) {
+                    updateStatus { it.copy(txDegraded = true) }
+                }
+            }
+
+            if (msSinceTelemetry >= TELEMETRY_INTERVAL_MS) {
                 val currentBytes = moqPublisher.txByteCounter.value
                 val bps = (currentBytes - previousBytes) * 8 / TELEMETRY_INTERVAL_SECONDS
                 val currentFailures = frameWriteFailures.get()
                 val failuresDelta = currentFailures - previousFailures
                 previousBytes = currentBytes
                 previousFailures = currentFailures
-                secondsSinceBpsSample = 0
+                msSinceTelemetry = 0L
 
                 val streaming = _status.value.streamActive
                 val sendStats = if (streaming) moqPublisher.transportSendStats() else null
@@ -659,6 +704,8 @@ class PublisherRuntime(
                     }
                     previousPacketsLost = packetsLostNow
                 }
+                // 빠른 flee 평가의 egress veto 용 — 직전 실측 egress(전환 샘플이면 null)를 보존.
+                lastHeavyEgressBps = egressBps
 
                 // RTT 심각(1샘플 즉시 flee) 신호 — 판정 샘플에서만 set(전환/비스트리밍은 false 유지).
                 var severeDegradedSample = false
@@ -819,9 +866,10 @@ class PublisherRuntime(
                 // 실신호 기반 전환 신호 — 컨트롤러가 Wi-Fi 송출 중 Cellular 로 선제 전환에 사용.
                 // RTT 심각(severeDegradedSample)은 1샘플 즉시, 그 외(RTT 급등/손실/capacity)는
                 // TX_DEGRADED_SAMPLES 지속 시 발화.
-                val txDegraded = streaming &&
+                val txDegraded = (streaming &&
                     streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
-                    (severeDegradedSample || consecutiveDegradedSamples >= TX_DEGRADED_SAMPLES)
+                    (severeDegradedSample || consecutiveDegradedSamples >= TX_DEGRADED_SAMPLES)) ||
+                    fastRttLatch
                 // 하드 실패: (1) MoQ 세션이 실제 FAILED 거나 (2) egress 동결+write 죽음 또는 writeFrame
                 // 연속 실패가 HARD_STREAK_SAMPLES 이상 지속. 전환 샘플 직후가 아닐 때만(grace) 본다.
                 val sessionFailed = moqPublisher.sessionState.value == MoqSessionState.FAILED
@@ -928,6 +976,12 @@ class PublisherRuntime(
         private const val CODEC_CONFIG_TIMEOUT_MS = 5_000L
         private const val MOQ_SESSION_CONNECTED_TIMEOUT_MS = 10_000L
         private const val TELEMETRY_INTERVAL_SECONDS = 3
+        // 트리거(flee) 평가 주기. 텔레메트리/egress/ABR 은 3s 그대로, RTT 기반 flee 만 이 주기로 평가해
+        // 감지 지연을 줄인다(3s→0.5s). 텔레메트리 서버 보고 주기 3s 는 서버 계약이라 불변.
+        private const val TRIGGER_EVAL_INTERVAL_MS = 500L
+        private const val TELEMETRY_INTERVAL_MS = TELEMETRY_INTERVAL_SECONDS * 1000L
+        // 빠른 flee 의 RTT 지속 기준(time). rttHigh(>=350ms)가 이 시간 지속되면 flee(rttSevere 는 즉시).
+        private const val TX_DEGRADED_SUSTAIN_MS = 1_000L
         private const val HTTP_CONFLICT = 409
         private const val LIVE_FRAME_MAX_AGE_MS = 500L
 
