@@ -70,7 +70,7 @@ object ServiceLocator {
             locationProvider = locationProvider,
             deviceRepository = NetworkModule.deviceRepository,
             identityStore = identityStore,
-            telemetryReporter = TelemetryReporter(appContext, NetworkModule.deviceRepository, locationProvider),
+            telemetryReporter = TelemetryReporter(appContext, NetworkModule.deviceRepository, locationProvider, networkManager),
             migrationControllerFactory = { runtime ->
                 AutoNetworkMigrationController(
                     networkManager = networkManager,
