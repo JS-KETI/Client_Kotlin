@@ -584,6 +584,8 @@ class PublisherRuntime(
         var fastSuppressUntilMs = 0L          // 전환 직후 cold-start flee 억제 만료 시각
         var previousMigCountFast = _status.value.migrationCount
         var lastHeavyEgressBps: Long? = null  // heavy block 이 갱신하는 직전 실측 egress(veto 용)
+        var rttPrevTick: Long? = null         // 직전 tick RTT(미분=상승 기울기 계산용)
+        var rttPrevTickMs = 0L
 
         while (currentCoroutineContext().isActive) {
             delay(TRIGGER_EVAL_INTERVAL_MS)
@@ -611,9 +613,17 @@ class PublisherRuntime(
                     val fastEst = fastStats?.estimatedSendRateBps
                     val rttSevere = fastRtt != null && fastRtt >= WIFI_DEGRADED_RTT_SEVERE_MS
                     val rttHigh = fastRtt != null && fastRtt >= WIFI_DEGRADED_RTT_MS
+                    // RTT 상승 추세(미분): 절대 문턱(350) 도달 전에 climb 을 잡는다. floor 이상에서만
+                    // 기울기를 평가해(저-RTT 지터 배제) degradedNow 로 넣고 sustain(1s)에 건다.
+                    val prevRtt = rttPrevTick
+                    val rttRising = fastRtt != null && prevRtt != null && rttPrevTickMs != 0L &&
+                        fastRtt >= RTT_DERIV_FLOOR_MS &&
+                        (tickNowMs - rttPrevTickMs).let { dt ->
+                            dt > 0 && (fastRtt - prevRtt) * 1000 / dt >= RTT_DERIV_MS_PER_S
+                        }
                     val estLow = fastEst != null && fastEst < WIFI_EGRESS_FLEE_BPS
                     val egressHealthy = (lastHeavyEgressBps ?: 0L) >= WIFI_EGRESS_FLEE_BPS
-                    val degradedNow = rttHigh || (estLow && !egressHealthy)
+                    val degradedNow = rttHigh || rttRising || (estLow && !egressHealthy)
                     fastRttLatch = if (rttSevere) {
                         true
                     } else if (degradedNow) {
@@ -623,9 +633,13 @@ class PublisherRuntime(
                         fastDegradedSinceMs = 0L
                         false
                     }
+                    rttPrevTick = fastRtt
+                    rttPrevTickMs = tickNowMs
                 } else {
                     fastDegradedSinceMs = 0L
                     fastRttLatch = false
+                    rttPrevTick = null
+                    rttPrevTickMs = 0L
                 }
                 // 빠른 신호가 켜지면 heavy block 을 기다리지 않고 즉시 반영(끄는 건 heavy block 이 담당).
                 if (fastRttLatch && !_status.value.txDegraded) {
@@ -1010,6 +1024,10 @@ class PublisherRuntime(
         private const val WIFI_DEGRADED_RTT_SEVERE_MS = 600L
         // 윈도우(3s)당 손실 증가분이 이 값 이상이면 손실 급증(경로 열화/혼잡 확정). 정상 0~2 대비 여유.
         private const val WIFI_DEGRADED_LOSS_DELTA = 15L
+        // RTT 상승 추세(미분) 기준 — 절대 문턱(350/600) 도달 전에 climb 을 잡는다. 0624 근거: 정상
+        // 변동 ±5 ms/s ↔ 열화 onset +60~83 ms/s(Pixel). floor 이상에서만 평가해 저-RTT 지터 배제.
+        private const val RTT_DERIV_MS_PER_S = 80L   // 상승 기울기 임계(ms/s, ~정상의 16배)
+        private const val RTT_DERIV_FLOOR_MS = 100L  // 이 RTT 이상일 때만 미분 평가(저-RTT 오탐 차단)
 
         // ── 하드 재연결(genuine failure) 판정 — soft stall 과 엄격히 분리 ──
         // 실측 egress(bytesSent) 가 이 시간 이상 한 발짝도 안 늘어야(=망이 1바이트도 못 흡수)
