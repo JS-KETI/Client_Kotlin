@@ -205,9 +205,12 @@ class AutoNetworkMigrationController(
             // 아래 migrate() 로 진행 — 실제 binding 을 target 으로 정렬한다.
         }
 
-        if (s.txStalled && s.publishingPath == NetworkPath.WIFI && target == NetworkPath.CELLULAR) {
+        // 정체(txStalled)뿐 아니라 송신 저하(txDegraded)로 떠난 경우에도 복귀 holdoff latch 를 건다.
+        // 그래야 RSSI 는 USABLE 인데 throughput 만 무너진 Wi-Fi(=txDegraded 가 떠난 바로 그 상황)로
+        // 복귀 게이트가 7초 만에 되돌아갔다가 다시 이탈하는 핑퐁을 막는다.
+        if ((s.txStalled || s.txDegraded) && s.publishingPath == NetworkPath.WIFI && target == NetworkPath.CELLULAR) {
             lastWifiStallFleeAtMs = SystemClock.elapsedRealtime()
-            Log.i(TAG, "wifi stall flee latch set target=CELLULAR")
+            Log.i(TAG, "wifi flee holdoff latch set target=CELLULAR (txStalled=${s.txStalled} txDegraded=${s.txDegraded})")
         }
 
         val debounceMs = when {
