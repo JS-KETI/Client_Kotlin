@@ -584,7 +584,7 @@ class PublisherRuntime(
         var heavySlowDegraded = false         // heavy 가 소유하는 loss/estimate 기반 degraded(fast 가 OR)
         var previousMigCountFast = _status.value.migrationCount
         var previousSessionFast = moqPublisher.sessionState.value
-        var lastHeavyEgressBps: Long? = null  // heavy block 이 갱신하는 직전 실측 egress(veto 용)
+        var fastSuppressUntilMs = 0L          // 경로 불연속(전환/reconnect) 직후 fast flee 억제 만료 시각
         var rttPrevTick: Long? = null         // 직전 tick RTT(미분=상승 기울기 계산용)
         var rttPrevTickMs = 0L
 
@@ -602,50 +602,50 @@ class PublisherRuntime(
             // ── 빠른 flee 평가(매 tick) — RTT 기반 txDegraded 를 0.5s 단위로 당겨 감지 지연 축소.
             // 전환 직후(migrationCount 변화)엔 cold-start RTT 스파이크 오발을 막기 위해 일정시간 억제.
             run {
-                // 경로 불연속(전환=migrationCount 변화, 또는 자발적 reconnect=session 변화) 처리:
-                // 전환 즉시 선강하(migration 시)·flee 억제·미분 리셋. heavy 를 기다리지 않아 predrop·
-                // 억제 타이밍을 단일화한다(fast/heavy 가 같은 migrationPredropUntilMs 를 본다).
+                // 경로 불연속 처리: 전환(migrationCount 변화) 또는 자발적 reconnect(session 변화).
+                // 둘 다 fast flee 억제 + 미분/이전-경로 degraded(fastRttLatch·heavySlowDegraded) 리셋.
+                // 단 인코더 선강하(predrop)와 heavy HOLD/RAMP 타이머(migrationPredropUntilMs)는 실제
+                // 전환(bitrate 강하)일 때만 — session flap 으로 heavy 판정이 과도 보류되지 않게.
                 val migCountNow = _status.value.migrationCount
                 val migrationHappened = migCountNow != previousMigCountFast
                 val sessionChangedFast = sessionStateNow != previousSessionFast
                 if (migrationHappened || sessionChangedFast) {
                     previousMigCountFast = migCountNow
                     previousSessionFast = sessionStateNow
-                    migrationPredropUntilMs = tickNowMs + MIGRATION_PREDROP_HOLD_MS
+                    fastSuppressUntilMs = tickNowMs + MIGRATION_PREDROP_HOLD_MS
                     fastDegradedSinceMs = 0L
+                    fastRttLatch = false
+                    heavySlowDegraded = false   // 이전 경로 stale degraded 가 새 경로로 안 넘어가게.
                     rttPrevTick = null
                     rttPrevTickMs = 0L
                     if (migrationHappened && _status.value.streamActive) {
-                        // 전환 직후 cold/validating 경로 blast 방지 — 인코더를 사다리 바닥으로 선강하.
+                        // 실제 전환일 때만 인코더 선강하 + heavy HOLD/RAMP 타이머 설정.
                         val floorIdx = ABR_BITRATE_LADDER_BPS.lastIndex
                         if (abrLadderIndex != floorIdx) {
                             abrLadderIndex = floorIdx
                             cameraEncoder.setTargetBitrate(ABR_BITRATE_LADDER_BPS[floorIdx].toInt())
                         }
+                        migrationPredropUntilMs = tickNowMs + MIGRATION_PREDROP_HOLD_MS
                         Log.i(TAG, "migration predrop: encoder->${ABR_BITRATE_LADDER_BPS[floorIdx]} holdMs=$MIGRATION_PREDROP_HOLD_MS")
                     }
                 }
-                // 빠른 RTT flee 평가: startup grace 통과 + 선강하 HOLD 만료 후에만.
+                // 빠른 flee 평가 — RTT 전용(estimate/loss 는 heavy 가 소유). startup grace + 억제 만료 후.
                 if (_status.value.streamActive &&
                     streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
-                    tickNowMs >= migrationPredropUntilMs
+                    tickNowMs >= fastSuppressUntilMs
                 ) {
-                    val fastStats = moqPublisher.transportSendStats()
-                    val fastRtt = fastStats?.rttMs
-                    val fastEst = fastStats?.estimatedSendRateBps
+                    val fastRtt = moqPublisher.transportSendStats()?.rttMs
                     val rttSevere = fastRtt != null && fastRtt >= WIFI_DEGRADED_RTT_SEVERE_MS
                     val rttHigh = fastRtt != null && fastRtt >= WIFI_DEGRADED_RTT_MS
                     // RTT 상승 추세(미분): 절대 문턱(350) 도달 전에 climb 을 잡는다. floor 이상에서만
-                    // 기울기를 평가해(저-RTT 지터 배제) degradedNow 로 넣고 sustain(1s)에 건다.
+                    // 기울기를 평가해(저-RTT 지터 배제) sustain(1s)에 건다.
                     val prevRtt = rttPrevTick
                     val rttRising = fastRtt != null && prevRtt != null && rttPrevTickMs != 0L &&
                         fastRtt >= RTT_DERIV_FLOOR_MS &&
                         (tickNowMs - rttPrevTickMs).let { dt ->
                             dt > 0 && (fastRtt - prevRtt) * 1000 / dt >= RTT_DERIV_MS_PER_S
                         }
-                    val estLow = fastEst != null && fastEst < WIFI_EGRESS_FLEE_BPS
-                    val egressHealthy = (lastHeavyEgressBps ?: 0L) >= WIFI_EGRESS_FLEE_BPS
-                    val degradedNow = rttHigh || rttRising || (estLow && !egressHealthy)
+                    val degradedNow = rttHigh || rttRising
                     fastRttLatch = if (rttSevere) {
                         true
                     } else if (degradedNow) {
@@ -742,8 +742,6 @@ class PublisherRuntime(
                     }
                     previousPacketsLost = packetsLostNow
                 }
-                // 빠른 flee 평가의 egress veto 용 — 직전 실측 egress(전환 샘플이면 null)를 보존.
-                lastHeavyEgressBps = egressBps
 
                 if (streaming) {
                     streamingBpsSamples += 1
