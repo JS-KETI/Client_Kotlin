@@ -794,7 +794,8 @@ class PublisherRuntime(
                             // 평시 3 샘플(~9s) 연속일 때만 한 단계씩 (level skip 금지). 단 선강하 회복
                             // 구간(MIGRATION_PREDROP_RAMP_MS)에선 빠른 hold 로 신속 회복.
                             abrUpHoldSamples += 1
-                            val upHoldNeeded = if (nowMs < migrationPredropUntilMs + MIGRATION_PREDROP_RAMP_MS) {
+                            val upHoldNeeded = if (migrationPredropUntilMs != 0L &&
+                                nowMs < migrationPredropUntilMs + MIGRATION_PREDROP_RAMP_MS) {
                                 ABR_PREDROP_RAMP_HOLD_SAMPLES
                             } else {
                                 ABR_UP_HOLD_SAMPLES
@@ -826,7 +827,8 @@ class PublisherRuntime(
                         // 선강하 회복 구간(MIGRATION_PREDROP_RAMP_MS)엔 egress 가 인코더 출력(바닥)에
                         // 묶여 낮으므로 egress 기반 stall term 을 보류한다(자기유발 오탐 방지). capacity
                         // (estimate) 기반 term 은 유지 — 새 경로가 실제로 못 받치면 정상 판정.
-                        val inPredropRamp = nowMs < migrationPredropUntilMs + MIGRATION_PREDROP_RAMP_MS
+                        val inPredropRamp = migrationPredropUntilMs != 0L &&
+                            nowMs < migrationPredropUntilMs + MIGRATION_PREDROP_RAMP_MS
                         val sendRateCollapsed = (estimateLow && !egressHigh) ||
                             (!inPredropRamp && egressLow && bps >= egressBacklogWriteThreshold)
                         val writeNearZero = bps <= TX_STALL_LOW_BPS_THRESHOLD
