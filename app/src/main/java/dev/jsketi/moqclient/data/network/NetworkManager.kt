@@ -44,4 +44,10 @@ interface NetworkManager {
 
     /** Clears process binding so new sockets follow the OS default network again. */
     fun clearProcessBinding()
+
+    /**
+     * 현재 네트워크 타입을 텔레메트리/관제 표시용 문자열로 반환한다(report-only).
+     * "WIFI" | "5G" | "LTE" | "CELLULAR" | null(판단 불가). 절대 예외를 던지지 않는다.
+     */
+    fun currentNetworkType(): String?
 }
