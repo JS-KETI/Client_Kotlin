@@ -3,6 +3,7 @@ package dev.jsketi.moqclient.data.rest
 import android.content.Context
 import android.os.BatteryManager
 import dev.jsketi.moqclient.data.location.LocationProvider
+import dev.jsketi.moqclient.data.network.NetworkManager
 import dev.jsketi.moqclient.data.rest.dto.DeviceTelemetryRequest
 import dev.jsketi.moqclient.domain.model.PublishState
 import dev.jsketi.moqclient.domain.model.PublisherStatus
@@ -10,7 +11,8 @@ import dev.jsketi.moqclient.domain.model.PublisherStatus
 class TelemetryReporter(
     context: Context,
     private val deviceRepository: DeviceRepository,
-    private val locationProvider: LocationProvider
+    private val locationProvider: LocationProvider,
+    private val networkManager: NetworkManager
 ) {
     private val batteryManager: BatteryManager =
         context.applicationContext.getSystemService(BatteryManager::class.java)
@@ -30,7 +32,8 @@ class TelemetryReporter(
                 missionStatus = if (status.streamActive) "in_progress" else status.publishState.toMissionStatus(),
                 publisherTxBps = status.txBps,
                 streamRevision = status.streamRevision,
-                migrationRevision = status.migrationRevision
+                migrationRevision = status.migrationRevision,
+                networkType = networkManager.currentNetworkType()
             )
         ).getOrThrow()
         Unit
