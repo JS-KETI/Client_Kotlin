@@ -579,10 +579,11 @@ class PublisherRuntime(
         var migrationPredropUntilMs = 0L
         // ── 빠른 flee 평가(매 TRIGGER_EVAL_INTERVAL_MS tick) 상태 ──
         // RTT 기반 flee 를 0.5s 마다 평가해 감지 지연을 줄인다(텔레메트리/egress/ABR 은 그대로 3s).
-        var fastRttLatch = false              // 빠른 RTT flee 신호(heavy block 이 txDegraded 에 OR)
-        var fastDegradedSinceMs = 0L          // rttHigh 지속 시작 시각(time 기준 sustain)
-        var fastSuppressUntilMs = 0L          // 전환 직후 cold-start flee 억제 만료 시각
+        var fastRttLatch = false              // 빠른 RTT flee 신호(txDegraded 에 OR)
+        var fastDegradedSinceMs = 0L          // rttHigh/미분 지속 시작 시각(time 기준 sustain)
+        var heavySlowDegraded = false         // heavy 가 소유하는 loss/estimate 기반 degraded(fast 가 OR)
         var previousMigCountFast = _status.value.migrationCount
+        var previousSessionFast = moqPublisher.sessionState.value
         var lastHeavyEgressBps: Long? = null  // heavy block 이 갱신하는 직전 실측 egress(veto 용)
         var rttPrevTick: Long? = null         // 직전 tick RTT(미분=상승 기울기 계산용)
         var rttPrevTickMs = 0L
@@ -601,13 +602,34 @@ class PublisherRuntime(
             // ── 빠른 flee 평가(매 tick) — RTT 기반 txDegraded 를 0.5s 단위로 당겨 감지 지연 축소.
             // 전환 직후(migrationCount 변화)엔 cold-start RTT 스파이크 오발을 막기 위해 일정시간 억제.
             run {
+                // 경로 불연속(전환=migrationCount 변화, 또는 자발적 reconnect=session 변화) 처리:
+                // 전환 즉시 선강하(migration 시)·flee 억제·미분 리셋. heavy 를 기다리지 않아 predrop·
+                // 억제 타이밍을 단일화한다(fast/heavy 가 같은 migrationPredropUntilMs 를 본다).
                 val migCountNow = _status.value.migrationCount
-                if (migCountNow != previousMigCountFast) {
+                val migrationHappened = migCountNow != previousMigCountFast
+                val sessionChangedFast = sessionStateNow != previousSessionFast
+                if (migrationHappened || sessionChangedFast) {
                     previousMigCountFast = migCountNow
-                    fastSuppressUntilMs = tickNowMs + MIGRATION_PREDROP_HOLD_MS
+                    previousSessionFast = sessionStateNow
+                    migrationPredropUntilMs = tickNowMs + MIGRATION_PREDROP_HOLD_MS
                     fastDegradedSinceMs = 0L
+                    rttPrevTick = null
+                    rttPrevTickMs = 0L
+                    if (migrationHappened && _status.value.streamActive) {
+                        // 전환 직후 cold/validating 경로 blast 방지 — 인코더를 사다리 바닥으로 선강하.
+                        val floorIdx = ABR_BITRATE_LADDER_BPS.lastIndex
+                        if (abrLadderIndex != floorIdx) {
+                            abrLadderIndex = floorIdx
+                            cameraEncoder.setTargetBitrate(ABR_BITRATE_LADDER_BPS[floorIdx].toInt())
+                        }
+                        Log.i(TAG, "migration predrop: encoder->${ABR_BITRATE_LADDER_BPS[floorIdx]} holdMs=$MIGRATION_PREDROP_HOLD_MS")
+                    }
                 }
-                if (_status.value.streamActive && tickNowMs >= fastSuppressUntilMs) {
+                // 빠른 RTT flee 평가: startup grace 통과 + 선강하 HOLD 만료 후에만.
+                if (_status.value.streamActive &&
+                    streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
+                    tickNowMs >= migrationPredropUntilMs
+                ) {
                     val fastStats = moqPublisher.transportSendStats()
                     val fastRtt = fastStats?.rttMs
                     val fastEst = fastStats?.estimatedSendRateBps
@@ -641,9 +663,11 @@ class PublisherRuntime(
                     rttPrevTick = null
                     rttPrevTickMs = 0L
                 }
-                // 빠른 신호가 켜지면 heavy block 을 기다리지 않고 즉시 반영(끄는 건 heavy block 이 담당).
-                if (fastRttLatch && !_status.value.txDegraded) {
-                    updateStatus { it.copy(txDegraded = true) }
+                // txDegraded = fast(RTT) OR heavy(loss/estimate). 매 tick 양방향 즉시 반영 →
+                // transient 가 해소되면 false 도 바로 나가(컨트롤러 collectLatest 취소 가능) 끄기 지연 제거.
+                val wantTxDegraded = _status.value.streamActive && (fastRttLatch || heavySlowDegraded)
+                if (wantTxDegraded != _status.value.txDegraded) {
+                    updateStatus { it.copy(txDegraded = wantTxDegraded) }
                 }
             }
 
@@ -721,8 +745,6 @@ class PublisherRuntime(
                 // 빠른 flee 평가의 egress veto 용 — 직전 실측 egress(전환 샘플이면 null)를 보존.
                 lastHeavyEgressBps = egressBps
 
-                // RTT 심각(1샘플 즉시 flee) 신호 — 판정 샘플에서만 set(전환/비스트리밍은 false 유지).
-                var severeDegradedSample = false
                 if (streaming) {
                     streamingBpsSamples += 1
                     val nowMs = SystemClock.elapsedRealtime()
@@ -732,18 +754,7 @@ class PublisherRuntime(
                         consecutiveDegradedSamples = 0
                         hardStreak = 0
                         abrUpHoldSamples = 0
-                        if (migrationChanged) {
-                            // 전환(rebind/claim) 직후 cold/validating 경로에 풀 비트레이트를 쏟지 않도록
-                            // 인코더를 바닥으로 선강하한다. path 가 warm/validate 되는 동안 backlog·PTO 폭주를
-                            // 줄이고, 이후 MIGRATION_PREDROP_RAMP_MS 동안 빠르게 회복한다.
-                            val floorIdx = ABR_BITRATE_LADDER_BPS.lastIndex
-                            if (abrLadderIndex != floorIdx) {
-                                abrLadderIndex = floorIdx
-                                cameraEncoder.setTargetBitrate(ABR_BITRATE_LADDER_BPS[floorIdx].toInt())
-                            }
-                            migrationPredropUntilMs = nowMs + MIGRATION_PREDROP_HOLD_MS
-                            Log.i(TAG, "migration predrop: encoder->${ABR_BITRATE_LADDER_BPS[floorIdx]} holdMs=$MIGRATION_PREDROP_HOLD_MS")
-                        }
+                        // 선강하(predrop)는 빠른 평가(fast)가 전환 즉시 수행한다(타이밍 단일화).
                     } else if (nowMs < migrationPredropUntilMs) {
                         // 선강하 HOLD: 전환 직후 cold-start 구간 — 바닥 비트레이트 유지, stall/ABR/degraded
                         // 판정 보류(transition 과 동일). cold 경로의 일시적 RTT/egress 저하를 오탐하지 않는다.
@@ -778,7 +789,7 @@ class PublisherRuntime(
                             cameraEncoder.setTargetBitrate(next.toInt())
                             Log.i(TAG, "abr down: $currentTargetBps -> $next (available=$available)")
                         } else if (abrLadderIndex > 0 && sendRateBps != null &&
-                            abrUpCapacityBps(sendRateBps, egressBps) >=
+                            sendRateBps >=
                             ABR_BITRATE_LADDER_BPS[abrLadderIndex - 1] * 3 / 2
                         ) {
                             // 업시프트는 보수적으로: 한 단계 위의 1.5 배 여유(estimate 기준)가
@@ -835,22 +846,18 @@ class PublisherRuntime(
                         //  (b) rttHigh / lossSurge: 그보다 약한 열화 — TX_DEGRADED_SAMPLES 지속 시 flee.
                         //  (c) estimateDegraded: capacity 추정 자체가 낮음(링크 나쁨). 단 실측 egress 가
                         //      문턱 이상이면 일시 cwnd 수축으로 보고 veto(RTT/손실 실신호는 veto 대상 아님).
-                        val rtt = sendStats?.rttMs
-                        val rttSevere = rtt != null && rtt >= WIFI_DEGRADED_RTT_SEVERE_MS
-                        val rttHigh = rtt != null && rtt >= WIFI_DEGRADED_RTT_MS
+                        // RTT 기반 degraded(severe/high/미분)는 빠른 평가(fast)가 소유한다 — 여기
+                        // heavy 에선 loss/estimate 만 본다(중복·이중소유 방지).
                         val lossSurge = packetsLostDelta != null && packetsLostDelta >= WIFI_DEGRADED_LOSS_DELTA
                         val estimateDegraded = sendRateBps != null && sendRateBps < WIFI_EGRESS_FLEE_BPS
                         val egressDegradedHigh = egressBps != null && egressBps >= WIFI_EGRESS_FLEE_BPS
-                        val degradedSustainable = rttHigh || lossSurge ||
-                            (estimateDegraded && !egressDegradedHigh)
+                        val degradedSustainable = lossSurge || (estimateDegraded && !egressDegradedHigh)
                         // ABR 강하 "직후" 샘플만 유예(!abrDownshifted) — 낮춘 비트레이트가 아직 반영
                         // 안 됐으므로 그 샘플은 안 센다(바닥으로 막 내린 샘플 포함). 정상(steady) 바닥
                         // 샘플은 강하가 없어(abrDownshifted=false) 그대로 카운트되므로 "바닥에서도 목표를
                         // 못 받치면 이탈"은 유지된다.
                         val degraded = degradedSustainable && !abrDownshifted
                         consecutiveDegradedSamples = if (degraded) consecutiveDegradedSamples + 1 else 0
-                        // RTT 심각은 지속 없이 즉시 flee(healthy wifi-relay SRTT 는 이 값에 못 미침).
-                        severeDegradedSample = rttSevere
 
                         // 하드 실패 후보(보수적): 실측 egress 가 HARD_EGRESS_STALL_MS 이상 한 발짝도
                         // 안 늘었고(=망이 1바이트도 못 흡수) write 도 ~0 으로 죽어 있는 샘플. egress 가
@@ -877,13 +884,12 @@ class PublisherRuntime(
                 val softStalled = streaming &&
                     streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
                     consecutiveLowSamples >= TX_STALL_SAMPLES
-                // 실신호 기반 전환 신호 — 컨트롤러가 Wi-Fi 송출 중 Cellular 로 선제 전환에 사용.
-                // RTT 심각(severeDegradedSample)은 1샘플 즉시, 그 외(RTT 급등/손실/capacity)는
-                // TX_DEGRADED_SAMPLES 지속 시 발화.
-                val txDegraded = (streaming &&
+                // heavy(느린) degraded — loss/estimate 기반(RTT 는 fast 가 소유). 산출 후 fast 와 OR.
+                // 끄기는 fast 가 매 tick 양방향 push 하므로 여기선 latch 만 갱신.
+                heavySlowDegraded = streaming &&
                     streamingBpsSamples > TX_STALL_GRACE_SAMPLES &&
-                    (severeDegradedSample || consecutiveDegradedSamples >= TX_DEGRADED_SAMPLES)) ||
-                    fastRttLatch
+                    consecutiveDegradedSamples >= TX_DEGRADED_SAMPLES
+                val txDegraded = heavySlowDegraded || fastRttLatch
                 // 하드 실패: (1) MoQ 세션이 실제 FAILED 거나 (2) egress 동결+write 죽음 또는 writeFrame
                 // 연속 실패가 HARD_STREAK_SAMPLES 이상 지속. 전환 샘플 직후가 아닐 때만(grace) 본다.
                 val sessionFailed = moqPublisher.sessionState.value == MoqSessionState.FAILED
@@ -973,9 +979,6 @@ class PublisherRuntime(
             }
         }
     }
-
-    private fun abrUpCapacityBps(sendRateBps: Long, egressBps: Long?): Long =
-        if (egressBps != null) minOf(sendRateBps, egressBps) else sendRateBps
 
     private suspend fun reportTelemetry(status: PublisherStatus) {
         if (status.deviceId.isBlank()) return
