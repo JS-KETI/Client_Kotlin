@@ -46,8 +46,9 @@ interface NetworkManager {
     fun clearProcessBinding()
 
     /**
-     * 현재 네트워크 타입을 텔레메트리/관제 표시용 문자열로 반환한다(report-only).
-     * "WIFI" | "5G" | "LTE" | "CELLULAR" | null(판단 불가). 절대 예외를 던지지 않는다.
+     * [path] 의 네트워크 타입을 텔레메트리/관제 표시용 문자열로 반환한다(report-only).
+     * 호출부는 보통 실제 송출 경로(`PublisherStatus.publishingPath`)를 넘긴다 — OS 기본망([activePath])이 아니다.
+     * "WIFI" | "5G" | "LTE" | "CELLULAR" | null([path] 가 null, 즉 미송출). 절대 예외를 던지지 않는다.
      */
-    fun currentNetworkType(): String?
+    fun networkTypeFor(path: NetworkPath?): String?
 }

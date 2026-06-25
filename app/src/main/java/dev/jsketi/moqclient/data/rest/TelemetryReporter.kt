@@ -33,7 +33,7 @@ class TelemetryReporter(
                 publisherTxBps = status.txBps,
                 streamRevision = status.streamRevision,
                 migrationRevision = status.migrationRevision,
-                networkType = networkManager.currentNetworkType()
+                networkType = networkManager.networkTypeFor(status.publishingPath)
             )
         ).getOrThrow()
         Unit

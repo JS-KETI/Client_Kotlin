@@ -580,10 +580,13 @@ class NetworkManagerImpl(
 
     /**
      * 텔레메트리/관제 표시용 네트워크 타입(report-only). 새 감지 로직 없이 기존 자산만 재사용한다:
-     * [activePath](OS 기본 path) + [readDataNetworkTypeOrNa](NR/LTE 매핑, READ_PHONE_STATE 가드).
-     * NR→"5G" 로만 변환. 권한 미부여/미지원/구분불가 시 "n/a"→"CELLULAR" 폴백. 예외 미전파.
+     * 인자로 받은 [path](호출부가 보통 실제 송출 경로 `PublisherStatus.publishingPath` 를 넘긴다) +
+     * [readDataNetworkTypeOrNa](NR/LTE 매핑, READ_PHONE_STATE 가드). OS 기본망([activePath])이 아니라
+     * [path] 기준이라, 마이그레이션으로 셀룰러 송출 중이면(OS 기본망은 Wi-Fi 로 남아 있어도) 실제 경로를 보고한다.
+     * NR→"5G" 로만 변환. 권한 미부여/미지원/구분불가 시 "n/a"→"CELLULAR" 폴백. [path]==null 이면 null. 예외 미전파.
      */
-    override fun currentNetworkType(): String? = when (activePath.value) {
+    override fun networkTypeFor(path: NetworkPath?): String? = when (path) {
+        null -> null
         NetworkPath.WIFI -> "WIFI"
         NetworkPath.CELLULAR -> {
             val tm = telephonyManager
