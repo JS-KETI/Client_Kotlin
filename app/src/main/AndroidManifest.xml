@@ -44,7 +44,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
-            android:screenOrientation="sensorLandscape"
+            android:screenOrientation="fullSensor"
             android:theme="@style/Theme.MoqClient">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
