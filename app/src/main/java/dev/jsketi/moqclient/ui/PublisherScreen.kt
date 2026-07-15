@@ -2,6 +2,7 @@ package dev.jsketi.moqclient.ui
 
 import android.content.ClipData
 import android.content.Intent
+import android.content.res.Configuration
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -29,6 +30,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -105,6 +107,11 @@ private fun PublisherScreenContent(
     onExportLogs: () -> Unit
 ) {
     var previewExpanded by remember { mutableStateOf(false) }
+    // configChanges 로 Activity 재생성 없이 회전을 처리하므로 레이아웃은 LocalConfiguration 으로 분기.
+    // 프리뷰 박스 비율은 현재 단말 방향 기준(세로 3:4, 가로 4:3) — 송출 영상 방향(스트림 시작 시점
+    // 방향으로 고정)과는 별개의 UI 표시용 값이다.
+    val isPortrait = LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT
+    val previewAspectRatio = if (isPortrait) 3f / 4f else 4f / 3f
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
@@ -117,7 +124,7 @@ private fun PublisherScreenContent(
         }
     ) { innerPadding ->
         if (previewExpanded) {
-            // Fullscreen camera — tap anywhere on the preview to return to the two-pane layout.
+            // Fullscreen camera — tap anywhere on the preview to return to the main layout.
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -126,9 +133,37 @@ private fun PublisherScreenContent(
             ) {
                 CameraPreview(
                     previewView = previewView,
+                    aspectRatio = previewAspectRatio,
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable { previewExpanded = false }
+                )
+            }
+        } else if (isPortrait) {
+            // Single-column portrait layout: camera on top, controls scroll below it.
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                CameraPreview(
+                    previewView = previewView,
+                    aspectRatio = previewAspectRatio,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { previewExpanded = true }
+                )
+
+                PublisherControls(
+                    uiState = uiState,
+                    onConnect = onConnect,
+                    onToggleStream = onToggleStream,
+                    onDisconnect = onDisconnect,
+                    onExportLogs = onExportLogs,
+                    modifier = Modifier.fillMaxWidth()
                 )
             }
         } else {
@@ -149,59 +184,80 @@ private fun PublisherScreenContent(
                 ) {
                     CameraPreview(
                         previewView = previewView,
+                        aspectRatio = previewAspectRatio,
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable { previewExpanded = true }
                     )
                 }
 
-                Column(
+                PublisherControls(
+                    uiState = uiState,
+                    onConnect = onConnect,
+                    onToggleStream = onToggleStream,
+                    onDisconnect = onDisconnect,
+                    onExportLogs = onExportLogs,
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxHeight()
                         .verticalScroll(rememberScrollState())
-                        .padding(end = 16.dp, top = 12.dp, bottom = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    DeviceIdCard(
-                        deviceId = uiState.deviceId,
-                        publishState = uiState.publishState,
-                        broadcastPath = uiState.broadcastPath
-                    )
-
-                    NetworkStatusCard(
-                        wifiState = uiState.wifiState,
-                        cellularState = uiState.cellularState,
-                        activePath = uiState.activePath,
-                        publishingPath = uiState.publishingPath
-                    )
-
-                    ActionButtons(
-                        publishState = uiState.publishState,
-                        streamActive = uiState.streamActive,
-                        operationInFlight = uiState.operationInFlight,
-                        onConnect = onConnect,
-                        onToggleStream = onToggleStream,
-                        onDisconnect = onDisconnect
-                    )
-
-                    // 필드 장애 시 비개발자가 로그 zip 을 공유 시트로 바로 보내는 버튼.
-                    // 데모 동선을 해치지 않도록 컨트롤 컬럼 맨 아래에 둔다.
-                    OutlinedButton(
-                        onClick = onExportLogs,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Export Logs")
-                    }
-
-                    Text(
-                        text = "Tap the camera to enlarge",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+                        .padding(end = 16.dp, top = 12.dp, bottom = 12.dp)
+                )
             }
         }
+    }
+}
+
+/** 세로(Column)/가로(Row) 레이아웃이 공유하는 컨트롤 묶음. 스크롤 여부는 호출부 modifier 가 결정한다. */
+@Composable
+private fun PublisherControls(
+    uiState: PublisherUiState,
+    onConnect: () -> Unit,
+    onToggleStream: () -> Unit,
+    onDisconnect: () -> Unit,
+    onExportLogs: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        DeviceIdCard(
+            deviceId = uiState.deviceId,
+            publishState = uiState.publishState,
+            broadcastPath = uiState.broadcastPath
+        )
+
+        NetworkStatusCard(
+            wifiState = uiState.wifiState,
+            cellularState = uiState.cellularState,
+            activePath = uiState.activePath,
+            publishingPath = uiState.publishingPath
+        )
+
+        ActionButtons(
+            publishState = uiState.publishState,
+            streamActive = uiState.streamActive,
+            operationInFlight = uiState.operationInFlight,
+            onConnect = onConnect,
+            onToggleStream = onToggleStream,
+            onDisconnect = onDisconnect
+        )
+
+        // 필드 장애 시 비개발자가 로그 zip 을 공유 시트로 바로 보내는 버튼.
+        // 데모 동선을 해치지 않도록 컨트롤 컬럼 맨 아래에 둔다.
+        OutlinedButton(
+            onClick = onExportLogs,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Export Logs")
+        }
+
+        Text(
+            text = "Tap the camera to enlarge",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 

@@ -17,13 +17,14 @@ import dev.jsketi.moqclient.ui.theme.MoqClientTheme
 @Composable
 fun CameraPreview(
     previewView: PreviewView?,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    aspectRatio: Float = 4f / 3f
 ) {
     // Width is controlled by the caller (small by default, full when expanded);
-    // height follows the 16:9 aspect ratio.
+    // height follows [aspectRatio] — 4:3 in landscape layouts, 3:4 in portrait.
     Box(
         modifier = modifier
-            .aspectRatio(4f / 3f)
+            .aspectRatio(aspectRatio)
             .background(MaterialTheme.colorScheme.surfaceVariant),
         contentAlignment = Alignment.Center
     ) {
