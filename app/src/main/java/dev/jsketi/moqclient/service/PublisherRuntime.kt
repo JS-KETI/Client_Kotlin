@@ -14,6 +14,7 @@ import dev.jsketi.moqclient.data.rest.DeviceIdentityStore
 import dev.jsketi.moqclient.data.rest.DeviceRepository
 import dev.jsketi.moqclient.data.rest.TelemetryReporter
 import dev.jsketi.moqclient.data.rest.dto.DeviceSummary
+import dev.jsketi.moqclient.domain.model.CodecConfig
 import dev.jsketi.moqclient.domain.model.NetworkPath
 import dev.jsketi.moqclient.domain.model.PublishState
 import dev.jsketi.moqclient.domain.model.PublisherStatus
@@ -75,6 +76,12 @@ class PublisherRuntime(
     private var streamStarted: Boolean = false
     private var serverRegistered: Boolean = false
     private var moqCatalogPublished: Boolean = false
+    // publishMedia() 로 발행된 catalog 의 인코더 설정. 세션의 catalog 는 발행 시 1회 고정이라,
+    // 스트림 재시작 시 새 설정(회전으로 해상도/SPS 변경 등)과 다르면 세션을 재수립해 재발행해야 한다.
+    private var publishedCodecConfig: CodecConfig? = null
+    // 카메라 bind(스트림 시작) 시점의 display rotation. runMetricsLoop 가 현재 rotation 과 비교해
+    // 송출 중 회전을 감지한다. null = 미송출 또는 preview 미부착(감지 불가).
+    @Volatile private var streamDisplayRotation: Int? = null
     private val operationMutex = Mutex()
 
     fun attachServiceLifecycleOwner(owner: LifecycleOwner) {
@@ -255,6 +262,7 @@ class PublisherRuntime(
                     }
                 serverRegistered = false
                 moqCatalogPublished = false
+                publishedCodecConfig = null
                 moqPublisher.finish()
             }
         } finally {
@@ -295,9 +303,29 @@ class PublisherRuntime(
         try {
             withContext(Dispatchers.Main.immediate) {
                 cameraEncoder.start(owner, preview)
+                // 카메라는 이 시점의 display rotation 으로 bind 된다 — 송출 중 회전 감지의 기준값.
+                streamDisplayRotation = preview?.display?.rotation
             }
             val config = withTimeout(CODEC_CONFIG_TIMEOUT_MS) {
                 cameraEncoder.codecConfig.filterNotNull().first()
+            }
+            val published = publishedCodecConfig
+            if (moqCatalogPublished && published != null && !codecConfigMatches(published, config)) {
+                // 같은 세션 안에서 인코더 설정(해상도/SPS)이 바뀌면 기존 catalog 로는 새 스트림을
+                // 디코딩할 수 없다(catalog 는 세션 발행 시 고정). 세션을 내리고 새 catalog 로
+                // 재발행하며, 진짜 세션 재수립이므로 streamRevision 을 올려 관제 player 를 remount
+                // 시킨다. stall 복구(hardReconnect)의 쿨다운과 무관한 사용자 주도 경로라 직접 올린다.
+                Log.i(
+                    TAG,
+                    "codec config changed ${published.width}x${published.height} -> " +
+                        "${config.width}x${config.height}; re-establishing session for new catalog"
+                )
+                moqPublisher.finish()
+                moqCatalogPublished = false
+                publishedCodecConfig = null
+                val old = _status.value.streamRevision
+                updateStatus { it.copy(streamRevision = old + 1) }
+                Log.i(TAG, "streamRevision incremented: $old -> ${old + 1} (reason=codec config changed)")
             }
             if (!moqCatalogPublished) {
                 moqPublisher.publishMedia(config.codecString, config.sps, config.pps)
@@ -418,6 +446,7 @@ class PublisherRuntime(
                 moqPublisher.sessionState.first { it == MoqSessionState.CONNECTED }
             }
             moqCatalogPublished = true
+            publishedCodecConfig = config
             val summary = ensureServerRegistered()
             streamStarted = true
             // publishingPath 는 OS default 로 추정하지 않는다 — 이전 Cellular bind 가 남아 있으면
@@ -446,6 +475,7 @@ class PublisherRuntime(
             }
             moqPublisher.finish()
             moqCatalogPublished = false
+            publishedCodecConfig = null
             throw t
         }
     }
@@ -460,6 +490,7 @@ class PublisherRuntime(
         moqPublisher.finish()
         serverRegistered = false
         moqCatalogPublished = false
+        publishedCodecConfig = null
         updateStatus {
             it.copy(
                 deviceId = "",
@@ -485,6 +516,7 @@ class PublisherRuntime(
                 cameraEncoder.stop()
             }
             streamStarted = false
+            streamDisplayRotation = null
             updateStatus {
                 it.copy(
                     publishState = if (it.deviceId.isBlank()) PublishState.IDLE else PublishState.CONNECTED,
@@ -497,6 +529,35 @@ class PublisherRuntime(
             migrationController?.resetBindingState("stopStream")
         }
     }
+
+    /**
+     * 송출 중 화면 회전을 영상에 반영하기 위한 스트림 재시작(수동 stop→start 자동화).
+     *
+     * 새 카메라 bind 가 현재 display rotation 을 집는다. 해상도가 바뀌는 회전(세로↔가로)이면
+     * [startStreamLocked] 의 catalog 재발행 경로(세션 재수립 + streamRevision 증가 → 관제 remount)가
+     * 이어지고, 해상도가 같은 회전(가로 180° 뒤집기)이면 세션 유지 상태로 버퍼 방향만 바로잡힌다.
+     */
+    private suspend fun restartStreamForRotation(fromRotation: Int, toRotation: Int) {
+        operationMutex.withLock {
+            if (!streamStarted) return
+            Log.i(TAG, "STREAM-RESTART rotation: display $fromRotation -> $toRotation; restarting stream to follow orientation")
+            val stopped = stopStreamLocked()
+            if (stopped.isFailure) {
+                val e = stopped.exceptionOrNull()
+                Log.e(TAG, "rotation restart aborted: stopStream failed: ${e?.message}", e)
+                return
+            }
+            startStreamLocked().onFailure { e ->
+                Log.e(TAG, "rotation restart: startStream failed — stream left stopped: ${e.message}", e)
+            }
+        }
+    }
+
+    /** catalog(init segment) 관점에서 두 인코더 설정이 동일한지 — 해상도 + codec 문자열 + SPS/PPS 비교. */
+    private fun codecConfigMatches(a: CodecConfig, b: CodecConfig): Boolean =
+        a.width == b.width && a.height == b.height &&
+            a.codecString == b.codecString &&
+            a.sps.contentEquals(b.sps) && a.pps.contentEquals(b.pps)
 
     private suspend fun deleteServerRegistration(deviceId: String): Result<Unit> = runCatching {
         if (deviceId.isBlank()) return@runCatching
@@ -575,6 +636,12 @@ class PublisherRuntime(
         var fastSuppressUntilMs = 0L          // 경로 불연속(전환/reconnect) 직후 fast flee 억제 만료 시각
         var rttPrevTick: Long? = null         // 직전 tick RTT(미분=상승 기울기 계산용)
         var rttPrevTickMs = 0L
+        // ── 송출 중 화면 회전 감지 상태 ──
+        // 카메라 bind 시점(streamDisplayRotation)과 현재 display rotation 이 다른 값으로
+        // ROTATION_RESTART_SUSTAIN_TICKS 지속되면 스트림을 재시작해 영상 방향을 단말에 맞춘다.
+        var pendingRotation: Int? = null
+        var pendingRotationTicks = 0
+        var rotationRestartJob: Job? = null
 
         while (currentCoroutineContext().isActive) {
             delay(TRIGGER_EVAL_INTERVAL_MS)
@@ -586,6 +653,32 @@ class PublisherRuntime(
             previousSessionState = sessionStateNow
             val tickNowMs = SystemClock.elapsedRealtime()
             val uptimeSeconds = (tickNowMs - startedAtElapsedMs) / 1_000
+
+            // ── 송출 중 화면 회전 감지(매 tick) — 회전이 지속되면 스트림 재시작으로 영상 방향 반영 ──
+            run {
+                val bindRotation = streamDisplayRotation
+                val nowRotation = previewView?.display?.rotation
+                if (_status.value.streamActive && bindRotation != null && nowRotation != null &&
+                    nowRotation != bindRotation && rotationRestartJob?.isActive != true
+                ) {
+                    if (pendingRotation == nowRotation) {
+                        pendingRotationTicks += 1
+                    } else {
+                        pendingRotation = nowRotation
+                        pendingRotationTicks = 1
+                    }
+                    if (pendingRotationTicks >= ROTATION_RESTART_SUSTAIN_TICKS) {
+                        pendingRotation = null
+                        pendingRotationTicks = 0
+                        rotationRestartJob = serviceScope?.launch {
+                            restartStreamForRotation(bindRotation, nowRotation)
+                        }
+                    }
+                } else {
+                    pendingRotation = null
+                    pendingRotationTicks = 0
+                }
+            }
 
             // ── 빠른 flee 평가(매 tick) — RTT 기반 txDegraded 를 0.5s 단위로 당겨 감지 지연 축소.
             // 전환 직후(migrationCount 변화)엔 cold-start RTT 스파이크 오발을 막기 위해 일정시간 억제.
@@ -1029,6 +1122,10 @@ class PublisherRuntime(
         private const val HARD_STREAK_SAMPLES = 3
         // 하드 재연결 사이 최소 간격(쿨다운). 30s 안에는 두 번째 하드 reconnect 를 막아 churn 차단.
         private const val HARD_RECONNECT_COOLDOWN_MS = 30_000L
+
+        // 송출 중 회전 감지 디바운스 — 같은 새 rotation 이 이 tick 수(0.5s×2 ≈ 1s) 지속될 때만
+        // 스트림을 재시작한다(회전 도중 흔들림/일시값으로 인한 불필요한 재시작 방지).
+        private const val ROTATION_RESTART_SUSTAIN_TICKS = 2
 
         // 인코더 ABR 사다리(비트레이트만 조절 — 해상도/fps/profile 불변). index 0 = 기본값으로,
         // CameraEncoderImpl 의 시작 비트레이트(2 Mbps)와 일치해야 한다. 바닥(500k)은 의도적으로
