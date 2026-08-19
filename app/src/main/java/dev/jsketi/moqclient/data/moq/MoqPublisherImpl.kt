@@ -19,6 +19,11 @@ import uniffi.moq.MoqSession
 
 private const val TAG = "MoqPublisherImpl"
 
+// 멀티패스(#38): 세션 확립 후 보조 경로 개설 재시도 — 셀룰러 라디오 웜업 지연 흡수.
+private const val MULTIPATH_ADD_PATH_TRIES = 3
+private const val MULTIPATH_ADD_PATH_RETRY_MS = 2_000L
+private const val DEFAULT_RELAY_PORT = 4443
+
 /**
  * Adapter: wraps moq-ffi UniFFI Kotlin bindings to the MoqPublisher port.
  *
@@ -38,6 +43,8 @@ class MoqPublisherImpl(
 
     private var client: MoqClient? = null
     private var multipathProvider: (() -> MultipathSockets)? = null
+    // 이번 connect 시도에서 멀티패스가 무장됐을 때의 보조 경로 원격 주소 ("IP:port").
+    private var multipathSecondaryAddr: String? = null
     private var session: MoqSession? = null
     private var origin: MoqOriginProducer? = null
     private var broadcast: MoqBroadcastProducer? = null
@@ -388,12 +395,15 @@ class MoqPublisherImpl(
                     Log.i(TAG, "[connLoop] attempt=$attempt: QUIC backend=$quicBackend")
                 }
 
+                multipathSecondaryAddr = null
                 multipathProvider?.let { provider ->
                     runCatching {
+                        val (primary, secondary) = resolveMultipathAddrs(relayUrl)
                         val mp = provider()
-                        attemptClient.setMultipath(mp.fdA, mp.fdB, mp.primaryAddr, mp.secondaryAddr)
+                        attemptClient.setMultipath(mp.wifiFd, mp.cellFd, primary, secondary)
+                        multipathSecondaryAddr = secondary
                         Log.i(TAG, "[connLoop] attempt=$attempt: multipath armed " +
-                            "primary=${mp.primaryAddr} secondary=${mp.secondaryAddr}")
+                            "primary=$primary secondary=$secondary")
                     }.onFailure { e ->
                         Log.w(TAG, "[connLoop] attempt=$attempt: multipath arm FAIL " +
                             "${e.javaClass.simpleName}: ${e.message} — falling back to single path")
@@ -426,6 +436,19 @@ class MoqPublisherImpl(
                 firstPresentationTimeUs = null
                 _sessionState.value = MoqSessionState.CONNECTED
                 Log.i(TAG, "[connLoop] attempt=$attempt: session ESTABLISHED, awaiting closed() …")
+
+                // 멀티패스(#38): 세션 확립 직후 보조 경로 자동 개설. 실패해도 단일 경로로 지속.
+                multipathSecondaryAddr?.let { secondary ->
+                    publisherScope.launch {
+                        for (tryN in 1..MULTIPATH_ADD_PATH_TRIES) {
+                            if (connectionGeneration != generation || session !== established) return@launch
+                            if (addPath(secondary).isSuccess) return@launch
+                            delay(MULTIPATH_ADD_PATH_RETRY_MS)
+                        }
+                        Log.w(TAG, "[addPath] giving up after $MULTIPATH_ADD_PATH_TRIES tries — " +
+                            "continuing on the primary path only")
+                    }
+                }
 
                 val tSession = System.nanoTime()
                 established.closed()
@@ -460,6 +483,21 @@ class MoqPublisherImpl(
             }
         }
         Log.i(TAG, "[connLoop] EXIT gen=$generation totalAttempts=$attempt")
+    }
+
+    /**
+     * relayUrl("https://host:4443/anon")에서 멀티패스 주/보조 원격 주소("IP:port")를 해석한다.
+     * 보조 포트 = 주 포트 + 1 (relay 이중 리슨 규약, #38). IO 디스패처에서만 호출(블로킹 DNS).
+     */
+    private fun resolveMultipathAddrs(relayUrl: String): Pair<String, String> {
+        val uri = java.net.URI(relayUrl)
+        val host = checkNotNull(uri.host) { "relayUrl has no host: $relayUrl" }
+        val primaryPort = if (uri.port > 0) uri.port else DEFAULT_RELAY_PORT
+        val ip = checkNotNull(java.net.InetAddress.getByName(host).hostAddress) {
+            "failed to resolve relay host: $host"
+        }
+        val fmt = { port: Int -> if (ip.contains(':')) "[$ip]:$port" else "$ip:$port" }
+        return fmt(primaryPort) to fmt(primaryPort + 1)
     }
 
     private fun dumpCauseChain(label: String, t: Throwable) {

@@ -5,11 +5,13 @@ import dev.jsketi.moqclient.BuildConfig
 import dev.jsketi.moqclient.data.camera.CameraEncoderImpl
 import dev.jsketi.moqclient.data.location.LocationProviderImpl
 import dev.jsketi.moqclient.data.moq.MoqPublisherImpl
+import dev.jsketi.moqclient.data.moq.MultipathSockets
 import dev.jsketi.moqclient.data.network.CellularWarmup
 import dev.jsketi.moqclient.data.network.NetworkManagerImpl
 import dev.jsketi.moqclient.data.rest.DeviceIdentityStore
 import dev.jsketi.moqclient.data.rest.NetworkModule
 import dev.jsketi.moqclient.data.rest.TelemetryReporter
+import dev.jsketi.moqclient.domain.model.NetworkPath
 import dev.jsketi.moqclient.domain.usecase.ConnectUseCase
 import dev.jsketi.moqclient.domain.usecase.StreamToggleUseCase
 import dev.jsketi.moqclient.domain.usecase.SwitchNetworkUseCase
@@ -63,6 +65,18 @@ object ServiceLocator {
         val identityStore = DeviceIdentityStore(appContext)
         val locationProvider = LocationProviderImpl(appContext)
         val switchNetworkUseCase = SwitchNetworkUseCase(networkManager, moqPublisher)
+
+        // 멀티패스(#38): noq 백엔드일 때만 무장. connect 시도마다 Wi-Fi/LTE 소켓 fd 를 새로 만든다
+        // (fd 는 네이티브가 소비). quinn 기본값이면 provider 미장착 → 완전히 기존 단일 경로 동작.
+        if (BuildConfig.MOQ_QUIC_BACKEND.equals("noq", ignoreCase = true)) {
+            moqPublisher.setMultipathProvider {
+                MultipathSockets(
+                    wifiFd = switchNetworkUseCase.createPathSocketFd(NetworkPath.WIFI),
+                    cellFd = switchNetworkUseCase.createPathSocketFd(NetworkPath.CELLULAR),
+                )
+            }
+        }
+
         return PublisherRuntime(
             networkManager = networkManager,
             cellularWarmupFactory = { CellularWarmup(networkManager.cellularNetwork) },
@@ -71,7 +85,7 @@ object ServiceLocator {
             locationProvider = locationProvider,
             deviceRepository = NetworkModule.deviceRepository,
             identityStore = identityStore,
-            telemetryReporter = TelemetryReporter(appContext, NetworkModule.deviceRepository, locationProvider, networkManager),
+            telemetryReporter = TelemetryReporter(appContext, NetworkModule.deviceRepository, locationProvider, networkManager, moqPublisher),
             migrationControllerFactory = { runtime ->
                 AutoNetworkMigrationController(
                     networkManager = networkManager,

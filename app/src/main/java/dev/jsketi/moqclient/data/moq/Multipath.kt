@@ -3,15 +3,14 @@ package dev.jsketi.moqclient.data.moq
 /**
  * Two pre-bound UDP socket fds for dual-path publishing (issue #38).
  *
- * fdA/fdB are detached duplicates owned by native code after use — a provider must create
- * fresh ones for every connect attempt. A carries the relay's primary address (Wi-Fi),
- * B the secondary (cellular). Addresses are "IP:port" strings (already resolved).
+ * The fds are detached duplicates owned by native code after use — a provider must create
+ * fresh ones for every connect attempt. wifiFd carries the relay's primary port (path 0),
+ * cellFd the secondary port (path 1). Relay addresses are resolved by the publisher from
+ * the relay URL, so providers only supply sockets.
  */
 data class MultipathSockets(
-    val fdA: Int,
-    val fdB: Int,
-    val primaryAddr: String,
-    val secondaryAddr: String,
+    val wifiFd: Int,
+    val cellFd: Int,
 )
 
 /**

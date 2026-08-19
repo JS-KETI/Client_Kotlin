@@ -75,8 +75,10 @@ interface MoqPublisher {
 
     /**
      * Arm dual-path (multipath) mode. The provider runs on every connect attempt to create two
-     * fresh pre-bound socket fds (A = Wi-Fi/primary, B = cellular/secondary) — fds are consumed
-     * by native code and cannot be reused across attempts. Implies the noq backend.
+     * fresh pre-bound socket fds (wifiFd = primary path, cellFd = secondary) — fds are consumed
+     * by native code and cannot be reused across attempts. The publisher resolves the relay's
+     * primary/secondary addresses from the relay URL (secondary = primary port + 1) and opens
+     * the secondary path automatically after the session is established. Implies the noq backend.
      * Pass null to disarm (single path). Must be armed before connect().
      */
     fun setMultipathProvider(provider: (() -> MultipathSockets)?)

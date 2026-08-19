@@ -31,6 +31,14 @@ class SwitchNetworkUseCase(
         return invoke(target)
     }
 
+    /**
+     * 멀티패스 경로용 소켓 fd 생성 (#38) — 전환용이 아니라 "경로 추가"용으로 현장 검증된
+     * 바인딩 파이프라인(소켓 생성 → Network.bindSocket → dup fd detach)을 재활용한다.
+     * 반환된 fd는 네이티브가 소유하며 호출측이 닫으면 안 된다. 대상 Network 부재 시 예외.
+     */
+    fun createPathSocketFd(target: NetworkPath): Int =
+        createBoundDatagramSocketFd(nextAttemptId(), target)
+
     suspend operator fun invoke(target: NetworkPath): Result<NetworkPath> = runCatching {
         val attemptId = nextAttemptId()
         val startedAt = SystemClock.elapsedRealtime()
