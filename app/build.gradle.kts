@@ -44,6 +44,9 @@ android {
         buildConfigField("String", "RELAY_PATH",  "\"/anon\"")
         buildConfigField("String", "STREAM_ID",   "\"main\"")
 
+        // QUIC 백엔드 선택: "quinn"(기본) | "noq"(멀티패스 실험). 문제 시 이 값만 되돌리면 즉시 롤백.
+        buildConfigField("String", "MOQ_QUIC_BACKEND", "\"quinn\"")
+
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -130,9 +133,10 @@ dependencies {
     implementation(libs.play.services.location)
 
     // MoQ UniFFI bindings + native lib built from moq-ffi-v0.2.0 with the rebind() +
-    // send_stats() patches and the web-transport-quinn priority-inversion fix.
+    // send_stats() patches, the web-transport-{quinn,noq} priority-inversion fixes,
+    // and a selectable noq backend (setBackend — multipath groundwork, default quinn).
     // Rebuild pipeline: patches/README.md.
-    implementation(files("libs/moq-rebind-stats-0.2.0.aar"))
+    implementation(files("libs/moq-rebind-stats-noq-0.2.0.aar"))
     implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
 
     debugImplementation(libs.androidx.compose.ui.tooling)

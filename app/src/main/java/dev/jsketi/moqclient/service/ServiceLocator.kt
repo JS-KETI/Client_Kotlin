@@ -1,6 +1,7 @@
 package dev.jsketi.moqclient.service
 
 import android.content.Context
+import dev.jsketi.moqclient.BuildConfig
 import dev.jsketi.moqclient.data.camera.CameraEncoderImpl
 import dev.jsketi.moqclient.data.location.LocationProviderImpl
 import dev.jsketi.moqclient.data.moq.MoqPublisherImpl
@@ -58,7 +59,7 @@ object ServiceLocator {
 
     private fun createRuntime(appContext: Context): PublisherRuntime {
         val networkManager = NetworkManagerImpl(appContext)
-        val moqPublisher = MoqPublisherImpl()
+        val moqPublisher = MoqPublisherImpl(quicBackend = BuildConfig.MOQ_QUIC_BACKEND)
         val identityStore = DeviceIdentityStore(appContext)
         val locationProvider = LocationProviderImpl(appContext)
         val switchNetworkUseCase = SwitchNetworkUseCase(networkManager, moqPublisher)

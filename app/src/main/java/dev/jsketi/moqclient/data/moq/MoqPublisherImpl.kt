@@ -25,7 +25,10 @@ private const val TAG = "MoqPublisherImpl"
  * Lifecycle: connect() prepares relay metadata, publishMedia() opens the MoQ session
  * after the H.264 init bytes are available, then writeFrame()* -> finish().
  */
-class MoqPublisherImpl : MoqPublisher {
+class MoqPublisherImpl(
+    // QUIC 백엔드: "quinn"(기본) | "noq". 멀티패스 전환 실험용 — connect 전 1회 적용.
+    private val quicBackend: String = "quinn",
+) : MoqPublisher {
 
     private val _txByteCounter = MutableStateFlow(0L)
     override val txByteCounter: StateFlow<Long> = _txByteCounter
@@ -324,6 +327,11 @@ class MoqPublisherImpl : MoqPublisher {
                         Log.w(TAG, "[connLoop] attempt=$attempt: setTlsDisableVerify FAIL " +
                             "${e.javaClass.simpleName}: ${e.message} — proceeding with default TLS")
                     }
+
+                if (!quicBackend.equals("quinn", ignoreCase = true)) {
+                    attemptClient.setBackend(quicBackend)
+                    Log.i(TAG, "[connLoop] attempt=$attempt: QUIC backend=$quicBackend")
+                }
 
                 Log.d(TAG, "[connLoop] attempt=$attempt: setPublish(producer) …")
                 attemptClient.setPublish(producer)
