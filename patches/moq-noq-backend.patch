@@ -1,7 +1,193 @@
 diff --git a/rs/moq-native/src/noq.rs b/rs/moq-native/src/noq.rs
 --- a/rs/moq-native/src/noq.rs
 +++ b/rs/moq-native/src/noq.rs
-@@ -136,6 +136,10 @@
+@@ -2,13 +2,36 @@
+ use crate::server::{ServerConfig, ServerId, ServerTlsInfo};
+ use crate::tls::{FingerprintVerifier, ServeCerts};
+ use anyhow::Context;
+-use std::sync::{Arc, RwLock};
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex, RwLock};
+ use std::time::Duration;
+ use std::{net, time};
+ use url::Url;
+ 
+ use web_transport_noq::noq;
+ 
++/// Per-path statistics snapshot exposed to the FFI layer (issue #38).
++#[derive(Debug, Clone)]
++pub struct NoqPathStats {
++	pub id: u64,
++	pub backup: bool,
++	pub rtt_ms: u64,
++	pub tx_bytes: u64,
++	pub rx_bytes: u64,
++	pub lost_packets: u64,
++	pub cwnd: u64,
++}
++
++/// Shared multipath state; survives clones of [`NoqClient`] (issue #38).
++#[derive(Clone, Default)]
++struct MultipathState {
++	conn: Arc<Mutex<Option<noq::Connection>>>,
++	// key = FFI-visible path handle (0 is reserved for the primary path)
++	paths: Arc<Mutex<HashMap<u64, (noq::Path, bool)>>>,
++	next_id: Arc<AtomicU64>,
++}
++
+ // ── Client ──────────────────────────────────────────────────────────
+ 
+ #[derive(Clone)]
+@@ -16,6 +39,7 @@
+ 	pub quic: noq::Endpoint,
+ 	pub transport: Arc<noq::TransportConfig>,
+ 	pub versions: moq_lite::Versions,
++	multipath: MultipathState,
+ }
+ 
+ impl NoqClient {
+@@ -27,6 +51,12 @@
+ 		transport.keep_alive_interval(Some(time::Duration::from_secs(4)));
+ 		transport.mtu_discovery_config(None); // Disable MTU discovery
+ 
++		// Opt-in multipath (issue #38): nonzero enables the Multipath Extension.
++		// Left unset the transport behaves exactly like before (single path).
++		if let Some(max_paths) = config.noq_multipath {
++			transport.max_concurrent_multipath_paths(max_paths);
++		}
++
+ 		let max_streams = config.max_streams.unwrap_or(crate::DEFAULT_MAX_STREAMS);
+ 		let max_streams = noq::VarInt::from_u64(max_streams).unwrap_or(noq::VarInt::MAX);
+ 		transport.max_concurrent_bidi_streams(max_streams);
+@@ -46,9 +76,118 @@
+ 			quic,
+ 			transport,
+ 			versions: config.versions(),
++			multipath: MultipathState::default(),
+ 		})
+ 	}
+ 
++	/// Swap the endpoint socket for a [`crate::dual_socket::DualUdpSocket`] built from two
++	/// pre-bound sockets (e.g. Android Wi-Fi / cellular). Call before `connect()`.
++	pub fn install_dual_socket(
++		&self,
++		a: std::net::UdpSocket,
++		b: std::net::UdpSocket,
++		seed: &[(net::SocketAddr, u8)],
++	) -> anyhow::Result<()> {
++		let runtime = noq::default_runtime().context("no async runtime")?;
++		let a = runtime.wrap_udp_socket(a).context("wrap socket a")?;
++		let b = runtime.wrap_udp_socket(b).context("wrap socket b")?;
++		let dual = crate::dual_socket::DualUdpSocket::new(a, b, seed);
++		self.quic
++			.rebind_abstract(Box::new(dual))
++			.context("failed to install dual socket")
++	}
++
++	/// Open an additional path to `remote` (multipath must be negotiated).
++	/// Returns an FFI-visible path handle (>= 1; 0 is the primary path).
++	pub async fn open_path(&self, remote: net::SocketAddr) -> anyhow::Result<u64> {
++		let conn = self
++			.multipath
++			.conn
++			.lock()
++			.unwrap()
++			.clone()
++			.context("no active connection")?;
++		anyhow::ensure!(conn.is_multipath_enabled(), "multipath not negotiated");
++		let path = conn
++			.open_path(remote, noq_proto::PathStatus::Available)
++			.await
++			.context("open_path failed")?;
++		let id = self.multipath.next_id.fetch_add(1, Ordering::Relaxed) + 1;
++		self.multipath.paths.lock().unwrap().insert(id, (path, false));
++		Ok(id)
++	}
++
++	/// Abandon a path. In-flight data is retransmitted on the remaining paths.
++	pub fn close_path(&self, id: u64) -> anyhow::Result<()> {
++		let entry = self.multipath.paths.lock().unwrap().remove(&id);
++		match entry {
++			Some((path, _)) => path.close().map_err(|e| anyhow::anyhow!("close_path: {e}")),
++			None => anyhow::bail!("unknown path id {id}"),
++		}
++	}
++
++	/// Demote a path to backup (kept alive, not scheduled) or promote it back.
++	pub fn set_path_backup(&self, id: u64, backup: bool) -> anyhow::Result<()> {
++		let status = if backup {
++			noq_proto::PathStatus::Backup
++		} else {
++			noq_proto::PathStatus::Available
++		};
++		if id == 0 {
++			let conn = self
++				.multipath
++				.conn
++				.lock()
++				.unwrap()
++				.clone()
++				.context("no active connection")?;
++			let path = conn.path(noq::PathId::ZERO).context("primary path unavailable")?;
++			return path
++				.set_status(status)
++				.map_err(|e| anyhow::anyhow!("set_path_backup: {e}"));
++		}
++		let mut paths = self.multipath.paths.lock().unwrap();
++		let (path, flag) = paths.get_mut(&id).context("unknown path id")?;
++		path.set_status(status)
++			.map_err(|e| anyhow::anyhow!("set_path_backup: {e}"))?;
++		*flag = backup;
++		Ok(())
++	}
++
++	/// Snapshot per-path statistics (primary path reported as id 0).
++	pub fn path_stats(&self) -> Vec<NoqPathStats> {
++		let mut out = Vec::new();
++		let conn = self.multipath.conn.lock().unwrap().clone();
++		let Some(conn) = conn else {
++			return out;
++		};
++		if let Some(st) = conn.path_stats(noq::PathId::ZERO) {
++			out.push(NoqPathStats {
++				id: 0,
++				backup: false,
++				rtt_ms: st.rtt.as_millis() as u64,
++				tx_bytes: st.udp_tx.bytes,
++				rx_bytes: st.udp_rx.bytes,
++				lost_packets: st.lost_packets,
++				cwnd: st.cwnd,
++			});
++		}
++		for (id, (path, backup)) in self.multipath.paths.lock().unwrap().iter() {
++			let st = path.stats();
++			out.push(NoqPathStats {
++				id: *id,
++				backup: *backup,
++				rtt_ms: st.rtt.as_millis() as u64,
++				tx_bytes: st.udp_tx.bytes,
++				rx_bytes: st.udp_rx.bytes,
++				lost_packets: st.lost_packets,
++				cwnd: st.cwnd,
++			});
++		}
++		out.sort_by_key(|s| s.id);
++		out
++	}
++
+ 	pub async fn connect(&self, tls: &rustls::ClientConfig, url: Url) -> anyhow::Result<web_transport_noq::Session> {
+ 		let mut url = url;
+ 		let mut config = tls.clone();
+@@ -110,6 +249,7 @@
+ 
+ 		let connection = self.quic.connect_with(config, ip, &host)?.await?;
+ 		tracing::Span::current().record("id", connection.stable_id());
++		*self.multipath.conn.lock().unwrap() = Some(connection.clone());
+ 
+ 		let mut request = web_transport_noq::proto::ConnectRequest::new(url.clone());
+ 		for alpn in self.versions.alpns() {
+@@ -136,6 +276,10 @@
  
  		Ok(session)
  	}
@@ -15,7 +201,28 @@ diff --git a/rs/moq-native/src/noq.rs b/rs/moq-native/src/noq.rs
 diff --git a/rs/moq-native/src/client.rs b/rs/moq-native/src/client.rs
 --- a/rs/moq-native/src/client.rs
 +++ b/rs/moq-native/src/client.rs
-@@ -280,10 +280,15 @@
+@@ -53,6 +53,12 @@
+ 	#[arg(id = "client-backend", long = "client-backend", env = "MOQ_CLIENT_BACKEND")]
+ 	pub backend: Option<QuicBackend>,
+ 
++	/// Enable noq multipath with the given max concurrent paths (noq backend only, issue #38).
++	/// Unset = single path, identical to previous behavior.
++	#[serde(skip_serializing_if = "Option::is_none")]
++	#[arg(id = "noq-multipath", long = "noq-multipath", env = "MOQ_NOQ_MULTIPATH")]
++	pub noq_multipath: Option<u32>,
++
+ 	/// Maximum number of concurrent QUIC streams per connection (both bidi and uni).
+ 	#[serde(skip_serializing_if = "Option::is_none")]
+ 	#[arg(
+@@ -103,6 +109,7 @@
+ 		Self {
+ 			bind: "[::]:0".parse().unwrap(),
+ 			backend: None,
++			noq_multipath: None,
+ 			max_streams: None,
+ 			version: Vec::new(),
+ 			tls: ClientTls::default(),
+@@ -280,10 +287,56 @@
  			return quinn.rebind(socket);
  		}
  
@@ -30,13 +237,180 @@ diff --git a/rs/moq-native/src/client.rs b/rs/moq-native/src/client.rs
  
 -		anyhow::bail!("rebind requires the quinn backend");
 +		anyhow::bail!("rebind requires the quinn or noq backend");
++	}
++
++	/// Install a dual socket (Wi-Fi + cellular) on the noq endpoint. Call before connect (issue #38).
++	#[cfg(feature = "noq")]
++	pub fn noq_install_dual_socket(
++		&self,
++		a: net::UdpSocket,
++		b: net::UdpSocket,
++		seed: &[(net::SocketAddr, u8)],
++	) -> anyhow::Result<()> {
++		self.noq
++			.as_ref()
++			.context("noq backend not active")?
++			.install_dual_socket(a, b, seed)
++	}
++
++	/// Open an additional multipath path to `remote`. Returns a path handle (0 = primary).
++	#[cfg(feature = "noq")]
++	pub async fn noq_open_path(&self, remote: net::SocketAddr) -> anyhow::Result<u64> {
++		self.noq.as_ref().context("noq backend not active")?.open_path(remote).await
++	}
++
++	/// Abandon a path; in-flight data is retransmitted on the remaining paths.
++	#[cfg(feature = "noq")]
++	pub fn noq_close_path(&self, id: u64) -> anyhow::Result<()> {
++		self.noq.as_ref().context("noq backend not active")?.close_path(id)
++	}
++
++	/// Demote a path to backup or promote it back to available.
++	#[cfg(feature = "noq")]
++	pub fn noq_set_path_backup(&self, id: u64, backup: bool) -> anyhow::Result<()> {
++		self.noq
++			.as_ref()
++			.context("noq backend not active")?
++			.set_path_backup(id, backup)
++	}
++
++	/// Per-path statistics snapshot (empty when not connected via noq).
++	#[cfg(feature = "noq")]
++	pub fn noq_path_stats(&self) -> Vec<crate::noq::NoqPathStats> {
++		self.noq.as_ref().map(|c| c.path_stats()).unwrap_or_default()
  	}
  
  	#[cfg(not(any(feature = "noq", feature = "quinn", feature = "quiche", feature = "iroh")))]
+diff --git a/rs/moq-native/src/lib.rs b/rs/moq-native/src/lib.rs
+--- a/rs/moq-native/src/lib.rs
++++ b/rs/moq-native/src/lib.rs
+@@ -13,6 +13,8 @@
+ 
+ mod client;
+ mod crypto;
++#[cfg(feature = "noq")]
++mod dual_socket;
+ mod log;
+ #[cfg(feature = "noq")]
+ mod noq;
+diff --git a/rs/moq-native/Cargo.toml b/rs/moq-native/Cargo.toml
+--- a/rs/moq-native/Cargo.toml
++++ b/rs/moq-native/Cargo.toml
+@@ -21,7 +21,7 @@
+     "dep:reqwest",
+     "dep:rustls-webpki",
+ ]
+-noq = ["dep:web-transport-noq", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki"]
++noq = ["dep:web-transport-noq", "dep:noq-proto", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki"]
+ quiche = ["dep:web-transport-quiche", "dep:rcgen"]
+ aws-lc-rs = ["rustls/aws-lc-rs", "rcgen?/aws_lc_rs", "quinn?/rustls-aws-lc-rs"]
+ iroh = ["dep:web-transport-iroh", "dep:web-transport-proto"]
+@@ -62,6 +62,8 @@
+ url = "2"
+ web-transport-iroh = { workspace = true, optional = true }
+ web-transport-noq = { workspace = true, optional = true }
++# noq 0.17 root does not re-export PathStatus (API gap) — depend on proto directly.
++noq-proto = { version = "0.16", optional = true }
+ web-transport-proto = { workspace = true, optional = true }
+ web-transport-quiche = { workspace = true, optional = true }
+ web-transport-quinn = { workspace = true, optional = true }
 diff --git a/rs/moq-ffi/src/session.rs b/rs/moq-ffi/src/session.rs
 --- a/rs/moq-ffi/src/session.rs
 +++ b/rs/moq-ffi/src/session.rs
-@@ -110,6 +110,20 @@
+@@ -12,6 +12,9 @@
+ 	publish: Option<Arc<MoqOriginProducer>>,
+ 	consume: Option<Arc<MoqOriginProducer>>,
+ 	native: Option<moq_native::Client>,
++	// Multipath (issue #38): two pre-bound sockets (Wi-Fi / cellular) + remote→socket seed,
++	// installed on the noq endpoint right before connect.
++	dual: Option<(std::net::UdpSocket, std::net::UdpSocket, Vec<(std::net::SocketAddr, u8)>)>,
+ }
+ 
+ impl Client {
+@@ -29,6 +32,12 @@
+ 			.with_publish(publish)
+ 			.with_consume(consume);
+ 
++		if let Some((a, b, seed)) = self.dual.take() {
++			client
++				.noq_install_dual_socket(a, b, &seed)
++				.map_err(|err| MoqError::Connect(format!("dual socket: {err}")))?;
++		}
++
+ 		let session = client
+ 			.connect(url)
+ 			.await
+@@ -42,6 +51,17 @@
+ 		}))
+ 	}
+ 
++	async fn add_path(&self, remote: std::net::SocketAddr) -> Result<u64, MoqError> {
++		let native = self
++			.native
++			.as_ref()
++			.ok_or_else(|| MoqError::Connect("cannot add path before connect".to_string()))?;
++		native
++			.noq_open_path(remote)
++			.await
++			.map_err(|err| MoqError::Connect(format!("addPath: {err}")))
++	}
++
+ 	fn rebind(&self, addr: String) -> Result<(), MoqError> {
+ 		let parsed: std::net::SocketAddr = addr
+ 			.parse()
+@@ -71,6 +91,43 @@
+ 		)))
+ 	}
+ 
++	#[cfg(target_family = "unix")]
++	fn set_multipath(
++		&mut self,
++		fd_a: i32,
++		fd_b: i32,
++		primary: String,
++		secondary: String,
++	) -> Result<(), MoqError> {
++		use std::os::fd::FromRawFd;
++
++		if fd_a < 0 || fd_b < 0 {
++			return Err(MoqError::Connect(format!("setMultipath: invalid fds {fd_a}/{fd_b}")));
++		}
++		let primary: std::net::SocketAddr = primary
++			.parse()
++			.map_err(|e| MoqError::Connect(format!("setMultipath: primary addr: {e}")))?;
++		let secondary: std::net::SocketAddr = secondary
++			.parse()
++			.map_err(|e| MoqError::Connect(format!("setMultipath: secondary addr: {e}")))?;
++
++		// Takes ownership of dup fds supplied by Android/Kotlin. The caller must not close them.
++		let a = unsafe { std::net::UdpSocket::from_raw_fd(fd_a) };
++		let b = unsafe { std::net::UdpSocket::from_raw_fd(fd_b) };
++
++		self.config.backend = Some(moq_native::QuicBackend::Noq);
++		self.config.noq_multipath = Some(4);
++		self.dual = Some((a, b, vec![(primary, 0), (secondary, 1)]));
++		Ok(())
++	}
++
++	#[cfg(not(target_family = "unix"))]
++	fn set_multipath(&mut self, fd_a: i32, fd_b: i32, _p: String, _s: String) -> Result<(), MoqError> {
++		Err(MoqError::Connect(format!(
++			"setMultipath: fd-based sockets unsupported on this target (fds={fd_a}/{fd_b})"
++		)))
++	}
++
+ 	fn rebind_socket(&self, socket: std::net::UdpSocket) -> Result<(), MoqError> {
+ 		let native = self
+ 			.native
+@@ -99,6 +156,7 @@
+ 				publish: None,
+ 				consume: None,
+ 				native: None,
++				dual: None,
+ 			}),
+ 		})
+ 	}
+@@ -110,6 +168,20 @@
  		}
  	}
  
@@ -57,6 +431,106 @@ diff --git a/rs/moq-ffi/src/session.rs b/rs/moq-ffi/src/session.rs
  	/// Set the origin to publish local broadcasts to the remote.
  	pub fn set_publish(&self, origin: Option<Arc<MoqOriginProducer>>) {
  		if let Some(mut state) = self.task.lock() {
+@@ -153,12 +225,99 @@
+ 		state.rebind_fd(fd)
+ 	}
+ 
++	/// Arm multipath (issue #38): two pre-bound UDP socket fds (A = primary net, B = secondary)
++	/// plus the relay's primary/secondary addresses as "IP:port" strings.
++	/// Implies the noq backend. Must be called before `connect()`.
++	pub fn set_multipath(&self, fd_a: i32, fd_b: i32, primary: String, secondary: String) -> Result<(), MoqError> {
++		let _guard = crate::ffi::RUNTIME.enter();
++		let mut state = self.task.lock().ok_or(MoqError::Cancelled)?;
++		state.set_multipath(fd_a, fd_b, primary, secondary)
++	}
++
++	/// Open an additional multipath path to `remote` ("IP:port").
++	/// Returns a path handle; 0 always refers to the primary path.
++	pub async fn add_path(&self, remote: String) -> Result<u64, MoqError> {
++		let remote: std::net::SocketAddr = remote
++			.parse()
++			.map_err(|e| MoqError::Connect(format!("addPath: invalid address: {e}")))?;
++		self.task.run(move |state| async move { state.add_path(remote).await }).await
++	}
++
++	/// Abandon a path; in-flight data is retransmitted on the remaining paths.
++	pub fn close_path(&self, path_id: u64) -> Result<(), MoqError> {
++		let _guard = crate::ffi::RUNTIME.enter();
++		let state = self.task.lock().ok_or(MoqError::Cancelled)?;
++		let native = state
++			.native
++			.as_ref()
++			.ok_or_else(|| MoqError::Connect("cannot close path before connect".to_string()))?;
++		native
++			.noq_close_path(path_id)
++			.map_err(|err| MoqError::Connect(format!("closePath: {err}")))
++	}
++
++	/// Demote a path to backup (kept alive, unscheduled) or promote it back.
++	pub fn set_path_backup(&self, path_id: u64, backup: bool) -> Result<(), MoqError> {
++		let _guard = crate::ffi::RUNTIME.enter();
++		let state = self.task.lock().ok_or(MoqError::Cancelled)?;
++		let native = state
++			.native
++			.as_ref()
++			.ok_or_else(|| MoqError::Connect("cannot set path status before connect".to_string()))?;
++		native
++			.noq_set_path_backup(path_id, backup)
++			.map_err(|err| MoqError::Connect(format!("setPathBackup: {err}")))
++	}
++
++	/// Per-path statistics snapshot. Empty when multipath is not active.
++	pub fn path_stats(&self) -> Vec<MoqPathStats> {
++		let _guard = crate::ffi::RUNTIME.enter();
++		let Some(state) = self.task.lock() else {
++			return Vec::new();
++		};
++		let Some(native) = state.native.as_ref() else {
++			return Vec::new();
++		};
++		native
++			.noq_path_stats()
++			.into_iter()
++			.map(|s| MoqPathStats {
++				id: s.id,
++				backup: s.backup,
++				rtt_ms: s.rtt_ms,
++				tx_bytes: s.tx_bytes,
++				rx_bytes: s.rx_bytes,
++				lost_packets: s.lost_packets,
++				cwnd: s.cwnd,
++			})
++			.collect()
++	}
++
+ 	/// Cancel all current and future `connect()` calls.
+ 	pub fn cancel(&self) {
+ 		self.task.cancel();
+ 	}
+ }
+ 
++/// Per-path transport statistics for a multipath connection (issue #38).
++#[derive(uniffi::Record)]
++pub struct MoqPathStats {
++	/// Path handle (0 = the primary path used for the initial connection).
++	pub id: u64,
++	/// Whether the path is currently demoted to backup.
++	pub backup: bool,
++	/// Smoothed round-trip time, in milliseconds.
++	pub rtt_ms: u64,
++	/// Total UDP bytes sent on this path.
++	pub tx_bytes: u64,
++	/// Total UDP bytes received on this path.
++	pub rx_bytes: u64,
++	/// Total packets detected as lost on this path.
++	pub lost_packets: u64,
++	/// Current congestion window, in bytes.
++	pub cwnd: u64,
++}
++
+ /// Transport-level send statistics snapshot for the active QUIC connection.
+ ///
+ /// Per-field `None` means the transport backend does not provide that metric.
 diff --git a/rs/moq-ffi/Cargo.toml b/rs/moq-ffi/Cargo.toml
 --- a/rs/moq-ffi/Cargo.toml
 +++ b/rs/moq-ffi/Cargo.toml
@@ -77,3 +551,150 @@ diff --git a/Cargo.toml b/Cargo.toml
  [patch.crates-io]
  web-transport-quinn = { path = "vendor/web-transport-quinn" }
 +web-transport-noq = { path = "vendor/web-transport-noq" }
+diff --git a/rs/moq-native/src/dual_socket.rs b/rs/moq-native/src/dual_socket.rs
+new file mode 100644
+--- /dev/null
++++ b/rs/moq-native/src/dual_socket.rs
+@@ -0,0 +1,142 @@
++//! Dual-socket adapter for noq multipath (issue #38).
++//!
++//! Wraps two runtime-provided [`AsyncUdpSocket`]s as one endpoint socket.
++//! Paths are keyed by *remote address* (e.g. relay :4443 vs :4444): outgoing
++//! datagrams are routed by a learn-map ("reply through the socket that last
++//! received from this remote"), optionally pre-seeded by the caller so the
++//! first packet toward a known remote already egresses the right socket.
++//!
++//! In production socket A is bound to Wi-Fi and socket B to cellular via
++//! Android `Network.bindSocket`; the seed maps the relay's primary port to A
++//! and the secondary port to B. Validated by tools/noq-poc (T3/T4c).
++
++use std::collections::HashMap;
++use std::fmt;
++use std::io::{self, IoSliceMut};
++use std::net::SocketAddr;
++use std::num::NonZeroUsize;
++use std::pin::Pin;
++use std::sync::{Arc, Mutex};
++use std::task::{Context, Poll};
++
++use web_transport_noq::noq;
++use noq::udp::{RecvMeta, Transmit};
++use noq::{AsyncUdpSocket, UdpSender};
++
++pub struct DualUdpSocket {
++	a: Box<dyn AsyncUdpSocket>,
++	b: Box<dyn AsyncUdpSocket>,
++	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
++}
++
++impl fmt::Debug for DualUdpSocket {
++	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++		f.debug_struct("DualUdpSocket")
++			.field("a", &self.a.local_addr().ok())
++			.field("b", &self.b.local_addr().ok())
++			.finish()
++	}
++}
++
++impl DualUdpSocket {
++	pub fn new(
++		a: Box<dyn AsyncUdpSocket>,
++		b: Box<dyn AsyncUdpSocket>,
++		seed: &[(SocketAddr, u8)],
++	) -> Self {
++		let route = Arc::new(Mutex::new(seed.iter().copied().collect::<HashMap<_, _>>()));
++		Self { a, b, route }
++	}
++}
++
++impl AsyncUdpSocket for DualUdpSocket {
++	fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
++		Box::pin(DualSender {
++			a: self.a.create_sender(),
++			b: self.b.create_sender(),
++			route: self.route.clone(),
++		})
++	}
++
++	fn poll_recv(
++		&mut self,
++		cx: &mut Context<'_>,
++		bufs: &mut [IoSliceMut<'_>],
++		meta: &mut [RecvMeta],
++	) -> Poll<io::Result<usize>> {
++		match self.a.poll_recv(cx, bufs, meta) {
++			Poll::Ready(Ok(n)) => {
++				let mut r = self.route.lock().unwrap();
++				for m in meta.iter().take(n) {
++					r.insert(m.addr, 0);
++				}
++				return Poll::Ready(Ok(n));
++			}
++			Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
++			Poll::Pending => {}
++		}
++		match self.b.poll_recv(cx, bufs, meta) {
++			Poll::Ready(Ok(n)) => {
++				let mut r = self.route.lock().unwrap();
++				for m in meta.iter().take(n) {
++					r.insert(m.addr, 1);
++				}
++				Poll::Ready(Ok(n))
++			}
++			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
++			Poll::Pending => Poll::Pending,
++		}
++	}
++
++	fn local_addr(&self) -> io::Result<SocketAddr> {
++		self.a.local_addr()
++	}
++
++	fn max_receive_segments(&self) -> NonZeroUsize {
++		self.a.max_receive_segments().min(self.b.max_receive_segments())
++	}
++
++	fn may_fragment(&self) -> bool {
++		self.a.may_fragment() || self.b.may_fragment()
++	}
++}
++
++struct DualSender {
++	a: Pin<Box<dyn UdpSender>>,
++	b: Pin<Box<dyn UdpSender>>,
++	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
++}
++
++impl fmt::Debug for DualSender {
++	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++		f.write_str("DualSender")
++	}
++}
++
++impl UdpSender for DualSender {
++	fn poll_send(
++		self: Pin<&mut Self>,
++		transmit: &Transmit<'_>,
++		cx: &mut Context<'_>,
++	) -> Poll<io::Result<()>> {
++		let this = self.get_mut();
++		let idx = this
++			.route
++			.lock()
++			.unwrap()
++			.get(&transmit.destination)
++			.copied()
++			.unwrap_or(0);
++		if idx == 0 {
++			this.a.as_mut().poll_send(transmit, cx)
++		} else {
++			this.b.as_mut().poll_send(transmit, cx)
++		}
++	}
++
++	fn max_transmit_segments(&self) -> NonZeroUsize {
++		self.a.max_transmit_segments().min(self.b.max_transmit_segments())
++	}
++}
++
++impl Unpin for DualSender {}

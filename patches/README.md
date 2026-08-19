@@ -11,7 +11,7 @@
 | `moq-ffi-rebind.patch` | moq-ffi, moq-native | `MoqClient.rebind(addr)` 노출 — QUIC connection migration (Phase 1) |
 | `moq-send-stats.patch` | moq-lite, moq-ffi, Cargo.toml | `MoqSession.sendStats()` 노출 — 혼잡제어기 실측 송신 통계(estimated_send_rate/rtt/bytes_sent/packets_lost). 정체(tx stall) 판정용. Cargo.toml 의 `[patch.crates-io]` 포함 |
 | `web-transport-quinn-priority.patch` | vendor/web-transport-quinn | 우선순위 부호 반전 버그 수정 — 정체 시 최신 그룹 우선(newest-first)이라는 MoQ 설계가 quinn 의 higher-first 의미론과 만나 oldest-first FIFO 로 뒤집히는 문제 |
-| `moq-noq-backend.patch` | moq-native, moq-ffi, Cargo.toml | noq 백엔드 활성화(멀티패스 기반 작업, 이슈 #38) — noq rebind 패리티 + `MoqClient.setBackend("quinn"/"noq")` + moq-ffi noq feature 병행 컴파일 + wtn vendor `[patch.crates-io]` 등록. 기본 동작은 여전히 quinn |
+| `moq-noq-backend.patch` | moq-native, moq-ffi, Cargo.toml | noq 백엔드 + 멀티패스 표면(이슈 #38) — noq rebind 패리티, `setBackend("quinn"/"noq")`, **DualUdpSocket**(learn-map, 경로=원격 포트) 및 `setMultipath/addPath/closePath/setPathBackup/pathStats` FFI, 옵트인 `noq_multipath` 설정, wtn vendor `[patch.crates-io]` 등록. 기본 동작은 여전히 quinn 단일 경로 |
 | `web-transport-noq-priority.patch` | vendor/web-transport-noq | wtq 와 동일한 우선순위 부호 반전 버그 수정 (noq 백엔드 경로용, `send.rs` 1줄) |
 
 ## 사전 준비 (이 머신 기준)
