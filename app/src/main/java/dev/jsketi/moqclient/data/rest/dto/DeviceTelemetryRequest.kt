@@ -34,5 +34,7 @@ data class DeviceTelemetryRequest(
     val publisherTxBps: Long,
     val streamRevision: Int = 0,
     val migrationRevision: Int = 0,
-    val networkType: String? = null
+    val networkType: String? = null,
+    // 멀티패스 경로별 통계(#38). 단일 경로(멀티패스 미협상)면 null — 구 서버 호환(additive).
+    val paths: List<PathTelemetry>? = null
 )
