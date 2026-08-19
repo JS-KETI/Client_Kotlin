@@ -1,6 +1,6 @@
 # moq AAR 패치 + 빌드 파이프라인
 
-`app/libs/moq-rebind-stats-0.2.0.aar` 를 재현하는 전체 절차. 원본 소스는
+`app/libs/moq-rebind-stats-noq-0.2.0.aar` 를 재현하는 전체 절차. 원본 소스는
 [moq-dev/moq](https://github.com/moq-dev/moq) 태그 `moq-ffi-v0.2.0`
 (= Maven `dev.moq:moq:0.2.0` 과 동일 버전).
 
@@ -11,6 +11,8 @@
 | `moq-ffi-rebind.patch` | moq-ffi, moq-native | `MoqClient.rebind(addr)` 노출 — QUIC connection migration (Phase 1) |
 | `moq-send-stats.patch` | moq-lite, moq-ffi, Cargo.toml | `MoqSession.sendStats()` 노출 — 혼잡제어기 실측 송신 통계(estimated_send_rate/rtt/bytes_sent/packets_lost). 정체(tx stall) 판정용. Cargo.toml 의 `[patch.crates-io]` 포함 |
 | `web-transport-quinn-priority.patch` | vendor/web-transport-quinn | 우선순위 부호 반전 버그 수정 — 정체 시 최신 그룹 우선(newest-first)이라는 MoQ 설계가 quinn 의 higher-first 의미론과 만나 oldest-first FIFO 로 뒤집히는 문제 |
+| `moq-noq-backend.patch` | moq-native, moq-ffi, Cargo.toml | noq 백엔드 활성화(멀티패스 기반 작업, 이슈 #38) — noq rebind 패리티 + `MoqClient.setBackend("quinn"/"noq")` + moq-ffi noq feature 병행 컴파일 + wtn vendor `[patch.crates-io]` 등록. 기본 동작은 여전히 quinn |
+| `web-transport-noq-priority.patch` | vendor/web-transport-noq | wtq 와 동일한 우선순위 부호 반전 버그 수정 (noq 백엔드 경로용, `send.rs` 1줄) |
 
 ## 사전 준비 (이 머신 기준)
 
@@ -45,9 +47,13 @@ cd Client_Kotlin/external/moq   # 태그 moq-ffi-v0.2.0 checkout 상태
 # 0) 패치 적용 (이미 적용돼 있으면 생략)
 git apply ../../patches/moq-ffi-rebind.patch
 git apply ../../patches/moq-send-stats.patch
+git apply ../../patches/moq-noq-backend.patch
 REG=~/.cargo/registry/src/index.crates.io-*/web-transport-quinn-0.11.8
 mkdir -p vendor && cp -r $REG vendor/web-transport-quinn
 (cd vendor/web-transport-quinn && git apply ../../../../patches/web-transport-quinn-priority.patch)
+curl -sL -o /tmp/wtn.crate https://static.crates.io/crates/web-transport-noq/web-transport-noq-0.0.3.crate
+tar -xzf /tmp/wtn.crate -C vendor && mv vendor/web-transport-noq-0.0.3 vendor/web-transport-noq
+(cd vendor/web-transport-noq && git apply ../../../../patches/web-transport-noq-priority.patch)
 
 # 1) 환경 (git-bash)
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=rust-lld
@@ -83,7 +89,7 @@ cp external/moq/out-kt/uniffi/moq/moq.kt tools/moq-aar/src/main/java/uniffi/moq/
 cp external/moq/target/aarch64-linux-android/release/libmoq_ffi.so \
    tools/moq-aar/src/main/jniLibs/arm64-v8a/
 ./gradlew -p tools/moq-aar assembleRelease
-cp tools/moq-aar/build/outputs/aar/moq-aar-release.aar app/libs/moq-rebind-stats-0.2.0.aar
+cp tools/moq-aar/build/outputs/aar/moq-aar-release.aar app/libs/moq-rebind-stats-noq-0.2.0.aar
 ```
 
 ## 서버 relay (적용 완료 — 2026-06-10, Server_Springboot c0ed39d)

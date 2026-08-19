@@ -1,0 +1,79 @@
+diff --git a/rs/moq-native/src/noq.rs b/rs/moq-native/src/noq.rs
+--- a/rs/moq-native/src/noq.rs
++++ b/rs/moq-native/src/noq.rs
+@@ -136,6 +136,10 @@
+ 
+ 		Ok(session)
+ 	}
++
++	pub fn rebind(&self, socket: std::net::UdpSocket) -> anyhow::Result<()> {
++		self.quic.rebind(socket).context("failed to rebind QUIC endpoint")
++	}
+ }
+ 
+ // ── Server ──────────────────────────────────────────────────────────
+diff --git a/rs/moq-native/src/client.rs b/rs/moq-native/src/client.rs
+--- a/rs/moq-native/src/client.rs
++++ b/rs/moq-native/src/client.rs
+@@ -280,10 +280,15 @@
+ 			return quinn.rebind(socket);
+ 		}
+ 
+-		#[cfg(not(feature = "quinn"))]
++		#[cfg(feature = "noq")]
++		if let Some(noq) = self.noq.as_ref() {
++			return noq.rebind(socket);
++		}
++
++		#[cfg(not(any(feature = "quinn", feature = "noq")))]
+ 		let _ = socket;
+ 
+-		anyhow::bail!("rebind requires the quinn backend");
++		anyhow::bail!("rebind requires the quinn or noq backend");
+ 	}
+ 
+ 	#[cfg(not(any(feature = "noq", feature = "quinn", feature = "quiche", feature = "iroh")))]
+diff --git a/rs/moq-ffi/src/session.rs b/rs/moq-ffi/src/session.rs
+--- a/rs/moq-ffi/src/session.rs
++++ b/rs/moq-ffi/src/session.rs
+@@ -110,6 +110,20 @@
+ 		}
+ 	}
+ 
++	/// Select the QUIC backend ("quinn" or "noq"). Must be called before `connect()`.
++	/// Defaults to quinn when never called.
++	pub fn set_backend(&self, backend: String) -> Result<(), MoqError> {
++		let parsed = match backend.to_ascii_lowercase().as_str() {
++			"quinn" => moq_native::QuicBackend::Quinn,
++			"noq" => moq_native::QuicBackend::Noq,
++			other => return Err(MoqError::Connect(format!("unknown QUIC backend: {other}"))),
++		};
++		if let Some(mut state) = self.task.lock() {
++			state.config.backend = Some(parsed);
++		}
++		Ok(())
++	}
++
+ 	/// Set the origin to publish local broadcasts to the remote.
+ 	pub fn set_publish(&self, origin: Option<Arc<MoqOriginProducer>>) {
+ 		if let Some(mut state) = self.task.lock() {
+diff --git a/rs/moq-ffi/Cargo.toml b/rs/moq-ffi/Cargo.toml
+--- a/rs/moq-ffi/Cargo.toml
++++ b/rs/moq-ffi/Cargo.toml
+@@ -24,7 +24,7 @@
+ hang = { workspace = true }
+ moq-lite = { workspace = true, features = ["serde"] }
+ moq-mux = { workspace = true }
+-moq-native = { workspace = true, default-features = true }
++moq-native = { workspace = true, default-features = true, features = ["noq"] }
+ thiserror = "2"
+ tokio = { workspace = true, features = ["macros"] }
+ tracing = "0.1"
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -56,3 +56,4 @@
+ 
+ [patch.crates-io]
+ web-transport-quinn = { path = "vendor/web-transport-quinn" }
++web-transport-noq = { path = "vendor/web-transport-noq" }

@@ -1,0 +1,12 @@
+diff --git a/src/send.rs b/src/send.rs
+--- a/src/send.rs
++++ b/src/send.rs
+@@ -148,7 +148,7 @@
+     type Error = WriteError;
+ 
+     fn set_priority(&mut self, order: u8) {
+-        Self::set_priority(self, order.into()).ok();
++        Self::set_priority(self, -i32::from(order)).ok();
+     }
+ 
+     fn reset(&mut self, code: u32) {
