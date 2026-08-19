@@ -116,3 +116,29 @@ docker run --rm -v "$(pwd):/src" rust:1-bookworm bash -c \
 # 검증: --version 0.12.1 / --help 에 server-bind·tls-cert·tls-key·auth-public·log-level /
 #        동일 인자 스모크 기동 → Server_Springboot 리소스 교체 후 커밋 (deploy.yml 이 JAR 동봉·배포)
 ```
+
+### relay noq 멀티패스 단계 (이슈 #38 — 적용 준비 완료, 도커 빌드·배포 대기)
+
+위 0.12.1 워크트리(wtq 벤더 완료 상태) 기준으로 추가 적용:
+
+```bash
+cd Client_Kotlin/external/moq-relay-0.12.1
+
+# 1) noq 멀티패스 패치 (이중 리슨 --server-noq-second-bind + --server-noq-multipath + DualUdpSocket)
+git apply ../../patches/moq-relay-noq-multipath.patch
+
+# 2) wtn 벤더 + 우선순위 부호 반전 (quinn 벤더 패치와 동일 사유 — noq 경로용)
+curl -sL -o /tmp/wtn.crate https://static.crates.io/crates/web-transport-noq/web-transport-noq-0.0.3.crate
+tar -xzf /tmp/wtn.crate -C vendor && mv vendor/web-transport-noq-0.0.3 vendor/web-transport-noq
+(cd vendor/web-transport-noq && git apply ../../../../patches/web-transport-noq-priority.patch)
+printf 'web-transport-noq = { path = "vendor/web-transport-noq" }\n' >> Cargo.toml   # [patch.crates-io] 하단
+
+# 3) 리눅스 빌드 — noq feature 포함 (quinn 도 기본 포함되어 런타임 --server-backend 로 선택)
+docker run --rm -v "$(pwd):/src" rust:1-bookworm bash -c \
+  "apt-get update -qq && apt-get install -y -qq cmake && cp -r /src /build && cd /build && \
+   cargo build --release -p moq-relay --features noq && cp target/release/moq-relay /src/out-relay/"
+
+# 4) 배포 인자 (EmbeddedMoqRelay/Server_Springboot 측 — 멀티패스 활성 시):
+#    --server-backend noq --server-noq-multipath 4 --server-noq-second-bind "[::]:4444"
+#    + EC2 보안그룹 UDP 4444 오픈 필요. 인자 없이 기동하면 종전과 동일(quinn 단일 경로).
+```

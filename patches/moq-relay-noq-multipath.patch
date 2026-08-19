@@ -1,0 +1,227 @@
+diff --git a/rs/moq-native/src/lib.rs b/rs/moq-native/src/lib.rs
+index 8fa30b33..e8cbdbc7 100644
+--- a/rs/moq-native/src/lib.rs
++++ b/rs/moq-native/src/lib.rs
+@@ -17,6 +17,8 @@ mod crypto;
+ pub mod jemalloc;
+ mod log;
+ #[cfg(feature = "noq")]
++mod dual_socket;
++#[cfg(feature = "noq")]
+ mod noq;
+ #[cfg(feature = "quinn")]
+ mod quinn;
+diff --git a/rs/moq-native/src/noq.rs b/rs/moq-native/src/noq.rs
+index aa5317f0..8ed9149b 100644
+--- a/rs/moq-native/src/noq.rs
++++ b/rs/moq-native/src/noq.rs
+@@ -155,6 +155,11 @@ impl NoqServer {
+ 		transport.keep_alive_interval(Some(Duration::from_secs(5)));
+ 		transport.mtu_discovery_config(None); // Disable MTU discovery
+ 
++		// Opt-in multipath (issue #38): nonzero enables the Multipath Extension.
++		if let Some(max_paths) = config.noq_multipath {
++			transport.max_concurrent_multipath_paths(max_paths);
++		}
++
+ 		let max_streams = config.max_streams.unwrap_or(crate::DEFAULT_MAX_STREAMS);
+ 		let max_streams = noq::VarInt::from_u64(max_streams).unwrap_or(noq::VarInt::MAX);
+ 		transport.max_concurrent_bidi_streams(max_streams);
+@@ -214,9 +219,24 @@ impl NoqServer {
+ 
+ 		let socket = std::net::UdpSocket::bind(listen).context("failed to bind UDP socket")?;
+ 
+-		// Create the generic QUIC endpoint.
+-		let quic = noq::Endpoint::new(endpoint_config, Some(tls), socket, runtime)
+-			.context("failed to create QUIC endpoint")?;
++		// Create the generic QUIC endpoint. With a second bind (multipath path separation,
++		// issue #38) both sockets are wrapped in a DualUdpSocket: replies always leave
++		// through the socket that received the remote, so per-path source ports stay correct.
++		let quic = match config.noq_second_bind.as_deref() {
++			Some(second) => {
++				let second = crate::util::resolve(Some(second), crate::server::DEFAULT_BIND)
++					.context("failed to resolve second bind address")?;
++				let socket_b =
++					std::net::UdpSocket::bind(second).context("failed to bind second UDP socket")?;
++				let a = runtime.wrap_udp_socket(socket).context("wrap primary socket")?;
++				let b = runtime.wrap_udp_socket(socket_b).context("wrap second socket")?;
++				let dual = crate::dual_socket::DualUdpSocket::new(a, b, &[]);
++				noq::Endpoint::new_with_abstract_socket(endpoint_config, Some(tls), Box::new(dual), runtime)
++					.context("failed to create QUIC endpoint")?
++			}
++			None => noq::Endpoint::new(endpoint_config, Some(tls), socket, runtime)
++				.context("failed to create QUIC endpoint")?,
++		};
+ 
+ 		// Spawn cert reload listener only after endpoint creation succeeds,
+ 		// so we don't leave a dangling signal listener on failure.
+diff --git a/rs/moq-native/src/server.rs b/rs/moq-native/src/server.rs
+index 4134fb6b..ad3ae199 100644
+--- a/rs/moq-native/src/server.rs
++++ b/rs/moq-native/src/server.rs
+@@ -112,6 +112,18 @@ pub struct ServerConfig {
+ 	#[arg(id = "server-backend", long = "server-backend", env = "MOQ_SERVER_BACKEND")]
+ 	pub backend: Option<QuicBackend>,
+ 
++	/// Enable noq multipath with the given max concurrent paths (noq backend only, issue #38).
++	/// Unset = single path, identical to previous behavior.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	#[arg(id = "server-noq-multipath", long = "server-noq-multipath", env = "MOQ_SERVER_NOQ_MULTIPATH")]
++	pub noq_multipath: Option<u32>,
++
++	/// Second UDP listen address for multipath path separation (e.g. "[::]:4444", issue #38).
++	/// Requires the noq backend; wraps both sockets in a DualUdpSocket.
++	#[serde(default, skip_serializing_if = "Option::is_none")]
++	#[arg(id = "server-noq-second-bind", long = "server-noq-second-bind", env = "MOQ_SERVER_NOQ_SECOND_BIND")]
++	pub noq_second_bind: Option<String>,
++
+ 	/// Server ID to embed in connection IDs for QUIC-LB compatibility.
+ 	/// If set, connection IDs will be derived semi-deterministically.
+ 	#[arg(id = "server-quic-lb-id", long = "server-quic-lb-id", env = "MOQ_SERVER_QUIC_LB_ID")]
+diff --git a/rs/moq-native/src/dual_socket.rs b/rs/moq-native/src/dual_socket.rs
+new file mode 100644
+--- /dev/null
++++ b/rs/moq-native/src/dual_socket.rs
+@@ -0,0 +1,142 @@
++//! Dual-socket adapter for noq multipath (issue #38).
++//!
++//! Wraps two runtime-provided [`AsyncUdpSocket`]s as one endpoint socket.
++//! Paths are keyed by *remote address* (e.g. relay :4443 vs :4444): outgoing
++//! datagrams are routed by a learn-map ("reply through the socket that last
++//! received from this remote"), optionally pre-seeded by the caller so the
++//! first packet toward a known remote already egresses the right socket.
++//!
++//! In production socket A is bound to Wi-Fi and socket B to cellular via
++//! Android `Network.bindSocket`; the seed maps the relay's primary port to A
++//! and the secondary port to B. Validated by tools/noq-poc (T3/T4c).
++
++use std::collections::HashMap;
++use std::fmt;
++use std::io::{self, IoSliceMut};
++use std::net::SocketAddr;
++use std::num::NonZeroUsize;
++use std::pin::Pin;
++use std::sync::{Arc, Mutex};
++use std::task::{Context, Poll};
++
++use web_transport_noq::noq;
++use noq::udp::{RecvMeta, Transmit};
++use noq::{AsyncUdpSocket, UdpSender};
++
++pub struct DualUdpSocket {
++	a: Box<dyn AsyncUdpSocket>,
++	b: Box<dyn AsyncUdpSocket>,
++	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
++}
++
++impl fmt::Debug for DualUdpSocket {
++	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++		f.debug_struct("DualUdpSocket")
++			.field("a", &self.a.local_addr().ok())
++			.field("b", &self.b.local_addr().ok())
++			.finish()
++	}
++}
++
++impl DualUdpSocket {
++	pub fn new(
++		a: Box<dyn AsyncUdpSocket>,
++		b: Box<dyn AsyncUdpSocket>,
++		seed: &[(SocketAddr, u8)],
++	) -> Self {
++		let route = Arc::new(Mutex::new(seed.iter().copied().collect::<HashMap<_, _>>()));
++		Self { a, b, route }
++	}
++}
++
++impl AsyncUdpSocket for DualUdpSocket {
++	fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
++		Box::pin(DualSender {
++			a: self.a.create_sender(),
++			b: self.b.create_sender(),
++			route: self.route.clone(),
++		})
++	}
++
++	fn poll_recv(
++		&mut self,
++		cx: &mut Context<'_>,
++		bufs: &mut [IoSliceMut<'_>],
++		meta: &mut [RecvMeta],
++	) -> Poll<io::Result<usize>> {
++		match self.a.poll_recv(cx, bufs, meta) {
++			Poll::Ready(Ok(n)) => {
++				let mut r = self.route.lock().unwrap();
++				for m in meta.iter().take(n) {
++					r.insert(m.addr, 0);
++				}
++				return Poll::Ready(Ok(n));
++			}
++			Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
++			Poll::Pending => {}
++		}
++		match self.b.poll_recv(cx, bufs, meta) {
++			Poll::Ready(Ok(n)) => {
++				let mut r = self.route.lock().unwrap();
++				for m in meta.iter().take(n) {
++					r.insert(m.addr, 1);
++				}
++				Poll::Ready(Ok(n))
++			}
++			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
++			Poll::Pending => Poll::Pending,
++		}
++	}
++
++	fn local_addr(&self) -> io::Result<SocketAddr> {
++		self.a.local_addr()
++	}
++
++	fn max_receive_segments(&self) -> NonZeroUsize {
++		self.a.max_receive_segments().min(self.b.max_receive_segments())
++	}
++
++	fn may_fragment(&self) -> bool {
++		self.a.may_fragment() || self.b.may_fragment()
++	}
++}
++
++struct DualSender {
++	a: Pin<Box<dyn UdpSender>>,
++	b: Pin<Box<dyn UdpSender>>,
++	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
++}
++
++impl fmt::Debug for DualSender {
++	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++		f.write_str("DualSender")
++	}
++}
++
++impl UdpSender for DualSender {
++	fn poll_send(
++		self: Pin<&mut Self>,
++		transmit: &Transmit<'_>,
++		cx: &mut Context<'_>,
++	) -> Poll<io::Result<()>> {
++		let this = self.get_mut();
++		let idx = this
++			.route
++			.lock()
++			.unwrap()
++			.get(&transmit.destination)
++			.copied()
++			.unwrap_or(0);
++		if idx == 0 {
++			this.a.as_mut().poll_send(transmit, cx)
++		} else {
++			this.b.as_mut().poll_send(transmit, cx)
++		}
++	}
++
++	fn max_transmit_segments(&self) -> NonZeroUsize {
++		self.a.max_transmit_segments().min(self.b.max_transmit_segments())
++	}
++}
++
++impl Unpin for DualSender {}
