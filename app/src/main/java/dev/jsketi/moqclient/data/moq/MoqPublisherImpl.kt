@@ -37,6 +37,7 @@ class MoqPublisherImpl(
     override val sessionState: StateFlow<MoqSessionState> = _sessionState
 
     private var client: MoqClient? = null
+    private var multipathProvider: (() -> MultipathSockets)? = null
     private var session: MoqSession? = null
     private var origin: MoqOriginProducer? = null
     private var broadcast: MoqBroadcastProducer? = null
@@ -193,6 +194,60 @@ class MoqPublisherImpl(
         }
     }
 
+    override fun setMultipathProvider(provider: (() -> MultipathSockets)?) {
+        multipathProvider = provider
+        Log.i(TAG, "[multipath] provider ${if (provider != null) "armed" else "disarmed"}")
+    }
+
+    override suspend fun addPath(remote: String): Result<Long> =
+        runCatching {
+            val moqClient = checkNotNull(client) { "MoQ client is not connected" }
+            val t0 = System.nanoTime()
+            Log.i(TAG, "[addPath] ENTER remote=$remote")
+            val id = moqClient.addPath(remote).toLong()
+            val dtMs = (System.nanoTime() - t0) / 1_000_000
+            Log.i(TAG, "[addPath] OK remote=$remote id=$id dt=${dtMs}ms")
+            id
+        }.onFailure { e ->
+            Log.w(TAG, "[addPath] FAIL remote=$remote ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+    override fun closePath(pathId: Long): Result<Unit> =
+        runCatching {
+            val moqClient = checkNotNull(client) { "MoQ client is not connected" }
+            moqClient.closePath(pathId.toULong())
+            Log.i(TAG, "[closePath] OK id=$pathId")
+            Unit
+        }.onFailure { e ->
+            Log.w(TAG, "[closePath] FAIL id=$pathId ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+    override fun setPathBackup(pathId: Long, backup: Boolean): Result<Unit> =
+        runCatching {
+            val moqClient = checkNotNull(client) { "MoQ client is not connected" }
+            moqClient.setPathBackup(pathId.toULong(), backup)
+            Log.i(TAG, "[setPathBackup] OK id=$pathId backup=$backup")
+            Unit
+        }.onFailure { e ->
+            Log.w(TAG, "[setPathBackup] FAIL id=$pathId ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+    override fun pathStats(): List<TransportPathStats> {
+        val current = client ?: return emptyList()
+        val stats = runCatching { current.pathStats() }.getOrNull() ?: return emptyList()
+        return stats.map {
+            TransportPathStats(
+                id = it.id.toLong(),
+                backup = it.backup,
+                rttMs = it.rttMs.toLong(),
+                txBytes = it.txBytes.toLong(),
+                rxBytes = it.rxBytes.toLong(),
+                lostPackets = it.lostPackets.toLong(),
+                cwnd = it.cwnd.toLong(),
+            )
+        }
+    }
+
     override suspend fun rebind(socketAddress: String): Result<Unit> =
         runCatching {
             val t0 = System.nanoTime()
@@ -331,6 +386,18 @@ class MoqPublisherImpl(
                 if (!quicBackend.equals("quinn", ignoreCase = true)) {
                     attemptClient.setBackend(quicBackend)
                     Log.i(TAG, "[connLoop] attempt=$attempt: QUIC backend=$quicBackend")
+                }
+
+                multipathProvider?.let { provider ->
+                    runCatching {
+                        val mp = provider()
+                        attemptClient.setMultipath(mp.fdA, mp.fdB, mp.primaryAddr, mp.secondaryAddr)
+                        Log.i(TAG, "[connLoop] attempt=$attempt: multipath armed " +
+                            "primary=${mp.primaryAddr} secondary=${mp.secondaryAddr}")
+                    }.onFailure { e ->
+                        Log.w(TAG, "[connLoop] attempt=$attempt: multipath arm FAIL " +
+                            "${e.javaClass.simpleName}: ${e.message} — falling back to single path")
+                    }
                 }
 
                 Log.d(TAG, "[connLoop] attempt=$attempt: setPublish(producer) …")
