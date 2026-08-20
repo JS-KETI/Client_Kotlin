@@ -142,3 +142,29 @@ docker run --rm -v "$(pwd):/src" rust:1-bookworm bash -c \
 #    --server-backend noq --server-noq-multipath 4 --server-noq-second-bind "[::]:4444"
 #    + EC2 보안그룹 UDP 4444 오픈 필요. 인자 없이 기동하면 종전과 동일(quinn 단일 경로).
 ```
+
+#### 대안: 도커 없이 WSL 에서 빌드 (2026-08-20 검증 — 정적 musl, glibc 무관)
+
+도커 엔진이 없거나 죽었을 때. sudo 불필요(전부 홈 디렉터리 설치):
+
+```bash
+# WSL Ubuntu 1회 준비
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+source ~/.cargo/env && rustup target add x86_64-unknown-linux-musl
+cd ~ && curl -sL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ && mv zig-linux-x86_64-0.13.0 zig
+curl -sL https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.0/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz | tar -xJ -C /tmp \
+  && cp /tmp/cargo-zigbuild-*/cargo-zigbuild ~/.cargo/bin/
+curl -sL https://github.com/Kitware/CMake/releases/download/v3.31.8/cmake-3.31.8-linux-x86_64.tar.gz | tar -xz && mv cmake-3.31.8-linux-x86_64 cmake
+
+# 빌드 (호스트에 gcc 가 없으므로 빌드스크립트 링커로 zigbuild 래퍼를 지정)
+export PATH="$HOME/zig:$HOME/cmake/bin:$HOME/.cargo/bin:$PATH"
+cd /mnt/c/.../Client_Kotlin/external/moq-relay-0.12.1
+cargo zigbuild --target x86_64-unknown-linux-gnu --target-dir ~/relay-target >/dev/null 2>&1 || true   # 래퍼 생성용
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=$(ls ~/.cache/cargo-zigbuild/*/wrappers/*/zigcc-x86_64-unknown-linux-gnu-*.sh | head -1)
+cargo zigbuild --release --target x86_64-unknown-linux-musl -p moq-relay --features noq --target-dir ~/relay-target
+# 산출물: ~/relay-target/x86_64-unknown-linux-musl/release/moq-relay (완전 정적 — ldd "not a dynamic executable")
+# 검증: --version 0.12.1 / --help 에 server-backend·server-noq-multipath·server-noq-second-bind
+```
+
+주의: 도커(bookworm·glibc 동적·aws-lc) 빌드와 달리 **musl 정적** 변종이다 — 기능 동일, 배포 호환성은 더 넓음.
+검증본: `out-relay/moq-relay-noq-musl` (기존 `out-relay/moq-relay` 앵커는 보존).
