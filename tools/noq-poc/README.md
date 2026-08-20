@@ -16,14 +16,26 @@ POC_MODE=single ./target/debug/noq-poc.exe   # T1/T2
 POC_MODE=dual   ./target/debug/noq-poc.exe   # T3/T4c
 ```
 
-리눅스(도커): `docker run --rm -v "$(pwd):/src" rust:1-bookworm bash -c "cd /src && cargo run"` (교차검증용)
+리눅스(WSL, 도커 불요 — sudo 없이 rustup+zig+cargo-zigbuild 조합):
+
+```bash
+# WSL Ubuntu 1회 준비: rustup(-y minimal) + musl target + ~/zig(0.13) + ~/.cargo/bin/cargo-zigbuild(프리빌트)
+export PATH="$HOME/zig:$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=~/.cache/cargo-zigbuild/*/wrappers/*/zigcc-x86_64-unknown-linux-gnu-*.sh
+cargo zigbuild --target x86_64-unknown-linux-musl --target-dir ~/poc-target
+POC_MODE=dual ~/poc-target/x86_64-unknown-linux-musl/debug/noq-poc
+```
+
+**리눅스 교차검증 결과 (2026-08-20, WSL Ubuntu 24.04)**: dual 모드 T3·T4c **Windows 와 동일하게 성공**
+(경로 검증 OK, close 후 백로그 1초 내 ~2.7MB 이동·write 지속·연결 생존). single 모드는 T1 까지 성공 —
+아래 표의 Windows 한정 실패 원인 규명 근거.
 
 ## 판정 결과 (2026-08-19, Windows 호스트)
 
 | 실험 | 구성 | 결과 | 의미 |
 |---|---|---|---|
 | 협상 | 양측 `max_concurrent_multipath_paths(4)` | ✅ multipath=true | 0.17끼리 협상 성립 |
-| T1 | 단일 와일드카드 소켓 + 다른 원격 IP 경로 | ❌ ValidationFailed | 단일 소켓으론 경로별 응답 src 가 안 맞음 (서버 rx는 됨, 클라로 응답 미도달) — #738 계열 |
+| T1 | 단일 와일드카드 소켓 + 다른 원격 IP 경로 | ❌ ValidationFailed (**Windows 한정**) | **리눅스에선 성공** — 실패 원인은 noq 결함이 아니라 Windows 소켓 계층의 경로별 응답 src(pktinfo) 스탬핑 한계. 안드로이드 클라는 어차피 NIC 별 소켓 2개가 필수라 설계 영향 없음 |
 | T2 | 동일 원격에 논리 경로 추가 | ⚠️ 열리긴 함 | 같은 물리 경로라 Wi-Fi/LTE 분리에 무의미 |
 | **T3** | **양단 DualUdpSocket(소켓 2개) + 경로=원격 포트(4443/4444)** | ✅ **검증 통과·양방향 소통** | **P2 어댑터 설계 성립. 명시 local_ip API(#738) 자체를 우회** |
 | T4 | 주 경로 블랙홀 (정책 개입 없음) | ⚠️ 연결 생존, ~5초 뒤 write 정지 | 스케줄러는 죽은 경로를 빨리 인지 못함 → **정책 계층 필수** (기획서 "전환 정책 유지" 실증) |
