@@ -44,8 +44,10 @@ android {
         buildConfigField("String", "RELAY_PATH",  "\"/anon\"")
         buildConfigField("String", "STREAM_ID",   "\"main\"")
 
-        // QUIC 백엔드 선택: "quinn"(기본) | "noq"(멀티패스 실험). 문제 시 이 값만 되돌리면 즉시 롤백.
-        buildConfigField("String", "MOQ_QUIC_BACKEND", "\"quinn\"")
+        // QUIC 백엔드 선택: "quinn"(기본) | "noq"(멀티패스 실험). 실험 빌드는 -PmoqQuicBackend=noq 로,
+        // 커밋된 기본값은 항상 quinn (즉시 롤백용 킬스위치).
+        val moqQuicBackend = (project.findProperty("moqQuicBackend") as String?) ?: "quinn"
+        buildConfigField("String", "MOQ_QUIC_BACKEND", "\"$moqQuicBackend\"")
 
         ndk {
             abiFilters += "arm64-v8a"
