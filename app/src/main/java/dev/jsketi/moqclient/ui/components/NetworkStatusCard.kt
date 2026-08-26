@@ -15,6 +15,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import dev.jsketi.moqclient.domain.model.NetworkPath
 import dev.jsketi.moqclient.domain.model.NetworkPathState
+import dev.jsketi.moqclient.domain.model.PathShare
 import dev.jsketi.moqclient.ui.theme.MoqClientTheme
 
 @Composable
@@ -23,6 +24,7 @@ fun NetworkStatusCard(
     cellularState: NetworkPathState,
     activePath: NetworkPath,
     publishingPath: NetworkPath?,
+    pathShares: List<PathShare> = emptyList(),
     modifier: Modifier = Modifier
 ) {
     Card(modifier = modifier.fillMaxWidth()) {
@@ -37,17 +39,24 @@ fun NetworkStatusCard(
             // activePath is the OS default network (status-bar route), not necessarily the path the
             // MoQ session publishes over — so it is tagged "OS default". publishingPath is the real
             // send path and is tagged "Publishing"; both tags can apply to the same row.
+            // With multipath (#48) both rows are session paths: each shows its live send share (%).
+            val wifiShare = pathShares.firstOrNull { it.kind == NetworkPath.WIFI }
+            val cellShare = pathShares.firstOrNull { it.kind == NetworkPath.CELLULAR }
             NetworkPathRow(
                 label = "Wi-Fi",
                 state = wifiState,
                 isOsDefault = activePath == NetworkPath.WIFI,
-                isPublishing = publishingPath == NetworkPath.WIFI
+                isPublishing = if (pathShares.isNotEmpty()) wifiShare != null
+                    else publishingPath == NetworkPath.WIFI,
+                sharePercent = wifiShare?.percent
             )
             NetworkPathRow(
                 label = "Cellular",
                 state = cellularState,
                 isOsDefault = activePath == NetworkPath.CELLULAR,
-                isPublishing = publishingPath == NetworkPath.CELLULAR
+                isPublishing = if (pathShares.isNotEmpty()) cellShare != null
+                    else publishingPath == NetworkPath.CELLULAR,
+                sharePercent = cellShare?.percent
             )
         }
     }
@@ -58,7 +67,8 @@ private fun NetworkPathRow(
     label: String,
     state: NetworkPathState,
     isOsDefault: Boolean,
-    isPublishing: Boolean
+    isPublishing: Boolean,
+    sharePercent: Int? = null
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -81,10 +91,12 @@ private fun NetworkPathRow(
                 )
             }
             if (isPublishing) {
+                // 분담률 0%(대기 경로)는 흐리게 — 살아 있지만 데이터가 실리지 않는 상태.
                 Text(
-                    text = "Publishing",
+                    text = if (sharePercent != null) "Publishing ${sharePercent}%" else "Publishing",
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary
+                    color = if (sharePercent == 0) MaterialTheme.colorScheme.onSurfaceVariant
+                        else MaterialTheme.colorScheme.primary
                 )
             }
         }

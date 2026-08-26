@@ -191,7 +191,8 @@ class PublisherViewModel(
                         txBps = status.txBps,
                         migrationCount = status.migrationCount,
                         uptimeSeconds = status.uptimeSeconds,
-                        publishingPath = status.publishingPath
+                        publishingPath = status.publishingPath,
+                        pathShares = status.pathShares
                     )
                 }
             }

@@ -232,7 +232,8 @@ private fun PublisherControls(
             wifiState = uiState.wifiState,
             cellularState = uiState.cellularState,
             activePath = uiState.activePath,
-            publishingPath = uiState.publishingPath
+            publishingPath = uiState.publishingPath,
+            pathShares = uiState.pathShares
         )
 
         ActionButtons(
