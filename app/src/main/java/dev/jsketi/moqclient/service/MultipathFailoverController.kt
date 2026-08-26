@@ -88,6 +88,7 @@ class MultipathFailoverController(
             return
         }
         if (!s.streamActive) return
+        if (!moqPublisher.isMultipathArmed()) return
         val stats = moqPublisher.pathStats()
         if (stats.none { it.id == 0L }) return // 주경로 이미 폐기 — 백업 단독 운행 중
         val secondaryId = stats.firstOrNull { it.id != 0L }?.id ?: return // 멀티패스 미가동

@@ -53,6 +53,12 @@ class TelemetryReporter(
      * 규약: 경로 0 = Wi-Fi(주), 1+ = 셀룰러(보조). egress/lostDelta 는 직전 report 대비 delta.
      */
     private fun buildPaths(): List<PathTelemetry>? {
+        // 단일 경로 폴백에서도 pathStats 는 path 0 을 반환한다 — armed 가 아니면 경로 라벨
+        // (0=WIFI 규약)이 성립하지 않으므로 보고하지 않는다(레거시 networkType 뱃지로 폴백).
+        if (!moqPublisher.isMultipathArmed()) {
+            prevPathStats.clear()
+            return null
+        }
         val stats = moqPublisher.pathStats()
         if (stats.isEmpty()) {
             prevPathStats.clear()

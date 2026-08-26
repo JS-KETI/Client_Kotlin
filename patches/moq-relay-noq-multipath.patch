@@ -1,9 +1,9 @@
 diff --git a/rs/moq-native/src/dual_socket.rs b/rs/moq-native/src/dual_socket.rs
 new file mode 100644
-index 00000000..898e8cd8
+index 00000000..9426bceb
 --- /dev/null
 +++ b/rs/moq-native/src/dual_socket.rs
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,207 @@
 +//! Dual-socket adapter for noq multipath (issue #38).
 +//!
 +//! Wraps two runtime-provided [`AsyncUdpSocket`]s as one endpoint socket.
@@ -20,6 +20,13 @@ index 00000000..898e8cd8
 +//! rewrites remote addresses to their IPv6-mapped form (`ensure_ipv6`), so an
 +//! un-normalized V4 seed key would never match `Transmit.destination` and all
 +//! datagrams would silently egress socket A.
++//!
++//! Fault isolation (issue #42): the noq connection driver treats ANY socket
++//! I/O error as fatal. One socket dying must not kill the connection while
++//! the other socket still works — send errors are reported as success (the
++//! datagram is dropped, which QUIC treats as loss), and a socket whose recv
++//! errors is marked dead and skipped; only when both sockets are dead is the
++//! error propagated.
 +
 +use std::collections::HashMap;
 +use std::fmt;
@@ -27,6 +34,7 @@ index 00000000..898e8cd8
 +use std::net::{SocketAddr, SocketAddrV6};
 +use std::num::NonZeroUsize;
 +use std::pin::Pin;
++use std::sync::atomic::{AtomicU32, Ordering};
 +use std::sync::{Arc, Mutex};
 +use std::task::{Context, Poll};
 +
@@ -46,10 +54,23 @@ index 00000000..898e8cd8
 +	}
 +}
 +
++/// Report a send error as a dropped datagram instead of propagating it: the
++/// connection driver treats any send error as fatal, while loss is recovered
++/// by QUIC.
++fn swallow_send_error(err: io::Error, err_count: &AtomicU32, label: &str) -> Poll<io::Result<()>> {
++	let n = err_count.fetch_add(1, Ordering::Relaxed);
++	if n < 3 || n % 256 == 0 {
++		tracing::warn!(socket = label, count = n + 1, "send error; dropping datagram: {err}");
++	}
++	Poll::Ready(Ok(()))
++}
++
 +pub struct DualUdpSocket {
 +	a: Box<dyn AsyncUdpSocket>,
 +	b: Box<dyn AsyncUdpSocket>,
 +	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
++	a_dead: bool,
++	b_dead: bool,
 +}
 +
 +impl fmt::Debug for DualUdpSocket {
@@ -70,7 +91,7 @@ index 00000000..898e8cd8
 +		let route = Arc::new(Mutex::new(
 +			seed.iter().map(|&(addr, idx)| (canon(addr), idx)).collect::<HashMap<_, _>>(),
 +		));
-+		Self { a, b, route }
++		Self { a, b, route, a_dead: false, b_dead: false }
 +	}
 +}
 +
@@ -80,6 +101,7 @@ index 00000000..898e8cd8
 +			a: self.a.create_sender(),
 +			b: self.b.create_sender(),
 +			route: self.route.clone(),
++			err_count: AtomicU32::new(0),
 +		})
 +	}
 +
@@ -89,28 +111,45 @@ index 00000000..898e8cd8
 +		bufs: &mut [IoSliceMut<'_>],
 +		meta: &mut [RecvMeta],
 +	) -> Poll<io::Result<usize>> {
-+		match self.a.poll_recv(cx, bufs, meta) {
-+			Poll::Ready(Ok(n)) => {
-+				let mut r = self.route.lock().unwrap();
-+				for m in meta.iter().take(n) {
-+					r.insert(canon(m.addr), 0);
++		if !self.a_dead {
++			match self.a.poll_recv(cx, bufs, meta) {
++				Poll::Ready(Ok(n)) => {
++					let mut r = self.route.lock().unwrap();
++					for m in meta.iter().take(n) {
++						r.insert(canon(m.addr), 0);
++					}
++					return Poll::Ready(Ok(n));
 +				}
-+				return Poll::Ready(Ok(n));
-+			}
-+			Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-+			Poll::Pending => {}
-+		}
-+		match self.b.poll_recv(cx, bufs, meta) {
-+			Poll::Ready(Ok(n)) => {
-+				let mut r = self.route.lock().unwrap();
-+				for m in meta.iter().take(n) {
-+					r.insert(canon(m.addr), 1);
++				Poll::Ready(Err(e)) => {
++					tracing::warn!("dual socket A recv error; marking dead: {e}");
++					self.a_dead = true;
 +				}
-+				Poll::Ready(Ok(n))
++				Poll::Pending => {}
 +			}
-+			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-+			Poll::Pending => Poll::Pending,
 +		}
++		if !self.b_dead {
++			match self.b.poll_recv(cx, bufs, meta) {
++				Poll::Ready(Ok(n)) => {
++					let mut r = self.route.lock().unwrap();
++					for m in meta.iter().take(n) {
++						r.insert(canon(m.addr), 1);
++					}
++					return Poll::Ready(Ok(n));
++				}
++				Poll::Ready(Err(e)) => {
++					tracing::warn!("dual socket B recv error; marking dead: {e}");
++					self.b_dead = true;
++				}
++				Poll::Pending => {}
++			}
++		}
++		if self.a_dead && self.b_dead {
++			return Poll::Ready(Err(io::Error::new(
++				io::ErrorKind::NotConnected,
++				"both sockets dead",
++			)));
++		}
++		Poll::Pending
 +	}
 +
 +	fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -130,6 +169,7 @@ index 00000000..898e8cd8
 +	a: Pin<Box<dyn UdpSender>>,
 +	b: Pin<Box<dyn UdpSender>>,
 +	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
++	err_count: AtomicU32,
 +}
 +
 +impl fmt::Debug for DualSender {
@@ -152,10 +192,16 @@ index 00000000..898e8cd8
 +			.get(&canon(transmit.destination))
 +			.copied()
 +			.unwrap_or(0);
-+		if idx == 0 {
++		let res = if idx == 0 {
 +			this.a.as_mut().poll_send(transmit, cx)
 +		} else {
 +			this.b.as_mut().poll_send(transmit, cx)
++		};
++		match res {
++			Poll::Ready(Err(e)) => {
++				swallow_send_error(e, &this.err_count, if idx == 0 { "A" } else { "B" })
++			}
++			other => other,
 +		}
 +	}
 +

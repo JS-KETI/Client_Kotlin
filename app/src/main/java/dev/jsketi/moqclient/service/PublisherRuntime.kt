@@ -466,7 +466,7 @@ class PublisherRuntime(
             // 태그한다: 멀티패스 armed 면 primary(path0)=Wi-Fi 소켓, 단일 폴백이면 OS default.
             val selfClaimedPath = when {
                 migrationController?.isEnabled() == true -> null
-                moqPublisher.pathStats().isNotEmpty() -> NetworkPath.WIFI
+                moqPublisher.isMultipathArmed() -> NetworkPath.WIFI
                 else -> networkManager.activePath.value
             }
             updateStatus {

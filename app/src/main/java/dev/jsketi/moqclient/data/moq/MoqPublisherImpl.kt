@@ -256,6 +256,8 @@ class MoqPublisherImpl(
         )
     }
 
+    override fun isMultipathArmed(): Boolean = multipathSecondaryAddr != null
+
     override fun pathStats(): List<TransportPathStats> {
         val current = client ?: return emptyList()
         val stats = runCatching { current.pathStats() }.getOrNull() ?: return emptyList()
@@ -463,11 +465,9 @@ class MoqPublisherImpl(
                             if (connectionGeneration != generation || session !== established) return@launch
                             val added = addPath(secondary)
                             if (added.isSuccess) {
-                                // 보조 경로는 Backup 으로 운용(#38 E2E 관측): 두 경로가 동시에
-                                // Available 이면 noq 0.17 스케줄러가 비디오 스트림을 고RTT 경로에
-                                // 볼모로 잡아 정지시킨다. Backup 은 주 경로 사망 시에만 사용됨
-                                // ("used if there are no available paths") → 평시 단일경로 화질 +
-                                // 무중단 페일오버(G1)에 부합. 합산(G2)은 후속 연구로 분리.
+                                // 보조 경로는 Backup 으로 운용: 평시 주경로 단독 송출(G1 무중단
+                                // 우선), 주경로 사망 시에만 사용된다("used if there are no
+                                // available paths"). 2경로 동시 Available 합산(G2)은 후속 연구.
                                 added.getOrNull()?.let { id ->
                                     setPathBackup(id, backup = true)
                                 }

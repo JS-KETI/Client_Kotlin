@@ -101,6 +101,13 @@ interface MoqPublisher {
     /** Per-path transport statistics. Empty when multipath is not active. */
     fun pathStats(): List<TransportPathStats>
 
+    /**
+     * True when the current connect attempt armed dual-socket multipath (Wi-Fi + cellular).
+     * False in the single-path fallback — there pathStats() may still report path 0, so this
+     * is the only reliable "paths are per-network" signal (path labels/claims depend on it).
+     */
+    fun isMultipathArmed(): Boolean
+
     /** Finish the broadcast and close the MoQ session cleanly. */
     suspend fun finish()
 }
