@@ -108,6 +108,15 @@ interface MoqPublisher {
      */
     fun isMultipathArmed(): Boolean
 
+    /**
+     * Provider for a pre-bound single-path fallback socket fd (#44). Runs when a connect
+     * attempt fails to arm multipath: the fd (bound to the current OS-default Network) pins
+     * the fallback connection so its source address cannot change when another network
+     * appears — noq's classic migration stalls the session otherwise. Return null to fall
+     * back to an unpinned wildcard socket. fds are consumed by native code, one per attempt.
+     */
+    fun setFallbackSocketProvider(provider: (() -> Int?)?)
+
     /** Finish the broadcast and close the MoQ session cleanly. */
     suspend fun finish()
 }

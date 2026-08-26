@@ -43,6 +43,8 @@ class MoqPublisherImpl(
 
     private var client: MoqClient? = null
     private var multipathProvider: (() -> MultipathSockets)? = null
+
+    private var fallbackSocketProvider: (() -> Int?)? = null
     // 이번 connect 시도에서 멀티패스가 무장됐을 때의 보조 경로 원격 주소 ("IP:port").
     private var multipathSecondaryAddr: String? = null
     private var session: MoqSession? = null
@@ -258,6 +260,11 @@ class MoqPublisherImpl(
 
     override fun isMultipathArmed(): Boolean = multipathSecondaryAddr != null
 
+    override fun setFallbackSocketProvider(provider: (() -> Int?)?) {
+        fallbackSocketProvider = provider
+        Log.i(TAG, "[fallback] socket provider ${if (provider != null) "armed" else "disarmed"}")
+    }
+
     override fun pathStats(): List<TransportPathStats> {
         val current = client ?: return emptyList()
         val stats = runCatching { current.pathStats() }.getOrNull() ?: return emptyList()
@@ -428,6 +435,21 @@ class MoqPublisherImpl(
                     }.onFailure { e ->
                         Log.w(TAG, "[connLoop] attempt=$attempt: multipath arm FAIL " +
                             "${e.javaClass.simpleName}: ${e.message} — falling back to single path")
+                        // #44: 폴백 소켓을 시작 네트워크에 고정 — OS default 가 다른 망으로
+                        // 넘어가도 소스 주소가 불변이라 (noq 가 처리 못 하는) 고전 마이그레이션이
+                        // 아예 발생하지 않는다. 실패 시 종전 와일드카드 폴백 유지.
+                        fallbackSocketProvider?.let { fp ->
+                            runCatching { fp()?.also { fd -> attemptClient.setBoundSocket(fd) } }
+                                .onSuccess { fd ->
+                                    if (fd != null) {
+                                        Log.i(TAG, "[connLoop] attempt=$attempt: fallback socket pinned fd=$fd")
+                                    }
+                                }
+                                .onFailure { pe ->
+                                    Log.w(TAG, "[connLoop] attempt=$attempt: fallback pin FAIL " +
+                                        "${pe.javaClass.simpleName}: ${pe.message} — wildcard fallback")
+                                }
+                        }
                     }
                 }
 

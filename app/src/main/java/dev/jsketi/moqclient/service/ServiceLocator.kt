@@ -75,6 +75,13 @@ object ServiceLocator {
                     cellFd = switchNetworkUseCase.createPathSocketFd(NetworkPath.CELLULAR),
                 )
             }
+            // #44: 멀티패스 arm 실패(한쪽 망 부재) 시 단일 폴백을 현재 OS default 네트워크에
+            // 고정 바인딩 — 다른 망 등장에 따른 소스 변경(고전 마이그레이션)을 원천 차단.
+            moqPublisher.setFallbackSocketProvider {
+                runCatching {
+                    switchNetworkUseCase.createPathSocketFd(networkManager.activePath.value)
+                }.getOrNull()
+            }
         }
 
         return PublisherRuntime(
