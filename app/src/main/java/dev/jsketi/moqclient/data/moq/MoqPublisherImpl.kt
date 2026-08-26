@@ -33,6 +33,8 @@ private const val DEFAULT_RELAY_PORT = 4443
 class MoqPublisherImpl(
     // QUIC 백엔드: "quinn"(기본) | "noq". 멀티패스 전환 실험용 — connect 전 1회 적용.
     private val quicBackend: String = "quinn",
+    // G2 실험(#52): true 면 보조 경로를 Backup 강등 없이 Available 로 유지(분산 스케줄링).
+    private val dualScheduling: Boolean = false,
 ) : MoqPublisher {
 
     private val _txByteCounter = MutableStateFlow(0L)
@@ -507,11 +509,17 @@ class MoqPublisherImpl(
                             if (connectionGeneration != generation || session !== established) return@launch
                             val added = addPath(secondary)
                             if (added.isSuccess) {
-                                // 보조 경로는 Backup 으로 운용: 평시 주경로 단독 송출(G1 무중단
-                                // 우선), 주경로 사망 시에만 사용된다("used if there are no
-                                // available paths"). 2경로 동시 Available 합산(G2)은 후속 연구.
-                                added.getOrNull()?.let { id ->
-                                    setPathBackup(id, backup = true)
+                                if (dualScheduling) {
+                                    // G2 실험(#52): 양쪽 Available — 분배는 noq 스케줄러 몫이고
+                                    // 실분배는 pathShares(%) 계기판으로 관찰한다.
+                                    Log.i(TAG, "[connLoop] dual scheduling — secondary stays Available")
+                                } else {
+                                    // 보조 경로는 Backup 으로 운용: 평시 주경로 단독 송출(G1 무중단
+                                    // 우선), 주경로 사망 시에만 사용된다("used if there are no
+                                    // available paths").
+                                    added.getOrNull()?.let { id ->
+                                        setPathBackup(id, backup = true)
+                                    }
                                 }
                                 return@launch
                             }

@@ -61,7 +61,11 @@ object ServiceLocator {
 
     private fun createRuntime(appContext: Context): PublisherRuntime {
         val networkManager = NetworkManagerImpl(appContext)
-        val moqPublisher = MoqPublisherImpl(quicBackend = BuildConfig.MOQ_QUIC_BACKEND)
+        val moqPublisher = MoqPublisherImpl(
+            quicBackend = BuildConfig.MOQ_QUIC_BACKEND,
+            // G2 실험(#52): -PmoqMultipathScheduling=dual 빌드에서만 true.
+            dualScheduling = BuildConfig.MOQ_MULTIPATH_SCHEDULING.equals("dual", ignoreCase = true)
+        )
         val identityStore = DeviceIdentityStore(appContext)
         val locationProvider = LocationProviderImpl(appContext)
         val switchNetworkUseCase = SwitchNetworkUseCase(networkManager, moqPublisher)
@@ -111,7 +115,8 @@ object ServiceLocator {
                     // Wi-Fi 재합류(#46)용 — 복귀한 Wi-Fi Network 에 바인딩된 새 fd
                     wifiSocketFdFactory = { switchNetworkUseCase.createPathSocketFd(NetworkPath.WIFI) },
                     // P3(#40): noq(멀티패스) 모드 전용 — Wi-Fi 사망/송신 정체 시 백업 승격 후 주경로 폐기
-                    enabled = BuildConfig.MOQ_QUIC_BACKEND.equals("noq", ignoreCase = true)
+                    enabled = BuildConfig.MOQ_QUIC_BACKEND.equals("noq", ignoreCase = true),
+                    dualScheduling = BuildConfig.MOQ_MULTIPATH_SCHEDULING.equals("dual", ignoreCase = true)
                 )
             }
         )
