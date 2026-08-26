@@ -98,6 +98,14 @@ interface MoqPublisher {
     /** Demote a live path to backup (kept alive, not scheduled) or promote it back. */
     fun setPathBackup(pathId: Long, backup: Boolean): Result<Unit>
 
+    /**
+     * Re-add the primary (Wi-Fi) path after its Network died and returned (#46): hot-swaps
+     * the dual socket's Wi-Fi slot with the given pre-bound fd (the old fd died with its
+     * Network), then opens a fresh path toward the relay's primary port. Multipath must be
+     * armed; the old primary path should already be closed. Returns the new path handle.
+     */
+    suspend fun readdPrimaryPath(socketFd: Int): Result<Long>
+
     /** Per-path transport statistics. Empty when multipath is not active. */
     fun pathStats(): List<TransportPathStats>
 

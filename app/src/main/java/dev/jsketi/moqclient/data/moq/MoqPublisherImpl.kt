@@ -46,6 +46,8 @@ class MoqPublisherImpl(
 
     private var fallbackSocketProvider: (() -> Int?)? = null
     // 이번 connect 시도에서 멀티패스가 무장됐을 때의 보조 경로 원격 주소 ("IP:port").
+    private var multipathPrimaryAddr: String? = null
+
     private var multipathSecondaryAddr: String? = null
     private var session: MoqSession? = null
     private var origin: MoqOriginProducer? = null
@@ -241,6 +243,17 @@ class MoqPublisherImpl(
             Log.w(TAG, "[setPathBackup] FAIL id=$pathId ${e.javaClass.simpleName}: ${e.message}")
         }
 
+    override suspend fun readdPrimaryPath(socketFd: Int): Result<Long> =
+        runCatching {
+            val primary = checkNotNull(multipathPrimaryAddr) { "multipath is not armed" }
+            val moqClient = checkNotNull(client) { "MoQ client is not connected" }
+            moqClient.replacePrimarySocket(socketFd)
+            Log.i(TAG, "[readdPrimary] Wi-Fi socket slot replaced fd=$socketFd")
+            addPath(primary).getOrThrow()
+        }.onFailure { e ->
+            Log.w(TAG, "[readdPrimary] FAIL ${e.javaClass.simpleName}: ${e.message}")
+        }
+
     /**
      * 멀티패스 활성 시 연결 단위 스탯(bytes_sent 등)이 경로별로 흩어져 0 에 수렴하는 문제 보정(#38):
      * pathStats 합산으로 TransportSendStats 를 재구성한다. estimate 는 Σ(cwnd×8/rtt) 근사.
@@ -268,7 +281,10 @@ class MoqPublisherImpl(
     override fun pathStats(): List<TransportPathStats> {
         val current = client ?: return emptyList()
         val stats = runCatching { current.pathStats() }.getOrNull() ?: return emptyList()
+        val primaryPort = multipathPrimaryAddr?.substringAfterLast(':')?.toIntOrNull()
+            ?: DEFAULT_RELAY_PORT
         return stats.map {
+            val remotePort = it.remotePort.toInt()
             TransportPathStats(
                 id = it.id.toLong(),
                 backup = it.backup,
@@ -277,6 +293,8 @@ class MoqPublisherImpl(
                 rxBytes = it.rxBytes.toLong(),
                 lostPackets = it.lostPackets.toLong(),
                 cwnd = it.cwnd.toLong(),
+                remotePort = remotePort,
+                primary = remotePort == primaryPort,
             )
         }
     }
@@ -423,12 +441,14 @@ class MoqPublisherImpl(
                     Log.i(TAG, "[connLoop] attempt=$attempt: QUIC backend=$quicBackend")
                 }
 
+                multipathPrimaryAddr = null
                 multipathSecondaryAddr = null
                 multipathProvider?.let { provider ->
                     runCatching {
                         val (primary, secondary) = resolveMultipathAddrs(relayUrl)
                         val mp = provider()
                         attemptClient.setMultipath(mp.wifiFd, mp.cellFd, primary, secondary)
+                        multipathPrimaryAddr = primary
                         multipathSecondaryAddr = secondary
                         Log.i(TAG, "[connLoop] attempt=$attempt: multipath armed " +
                             "primary=$primary secondary=$secondary")
