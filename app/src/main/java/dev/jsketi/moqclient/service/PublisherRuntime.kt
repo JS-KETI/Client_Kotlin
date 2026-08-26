@@ -53,7 +53,9 @@ class PublisherRuntime(
     private val identityStore: DeviceIdentityStore,
     private val telemetryReporter: TelemetryReporter,
     // Deferred construction breaks the runtime <-> controller cycle: the controller needs `this`.
-    private val migrationControllerFactory: (PublisherRuntime) -> AutoNetworkMigrationController
+    private val migrationControllerFactory: (PublisherRuntime) -> AutoNetworkMigrationController,
+    // P3(#40): 멀티패스(noq) 경로 사망 페일오버 정책. 위와 같은 사유로 지연 생성.
+    private val multipathFailoverFactory: (PublisherRuntime) -> MultipathFailoverController
 ) {
     private val _status = MutableStateFlow(PublisherStatus())
     val status: StateFlow<PublisherStatus> = _status.asStateFlow()
@@ -65,6 +67,7 @@ class PublisherRuntime(
     private var metricsJob: Job? = null
     private var frameJob: Job? = null
     private var migrationController: AutoNetworkMigrationController? = null
+    private var multipathFailoverController: MultipathFailoverController? = null
     private val frameWriteFailures = AtomicLong(0)
     // Soft cut(latest-only refresh) 신호. frameJob 이 매 frame 이 값(elapsedRealtime)보다 오래된
     // 백로그를 버리도록 한다. requestLatestOnlyRefresh()가 now 로 갱신 → 그 시점 이전 인코더 backlog
@@ -237,9 +240,12 @@ class PublisherRuntime(
             // Auto network migration owns the "Publishing" path: it migrates (bind + rebind) and only
             // then moves the tag. Replaces the old session/handle observers.
             migrationController = migrationControllerFactory(this).also { it.start(scope) }
+            multipathFailoverController = multipathFailoverFactory(this).also { it.start(scope) }
         } catch (t: Throwable) {
             metricsJob?.cancel()
             metricsJob = null
+            multipathFailoverController?.stop()
+            multipathFailoverController = null
             migrationController?.stop()
             migrationController = null
             locationProvider.stop()
@@ -268,6 +274,8 @@ class PublisherRuntime(
         } finally {
             metricsJob?.cancelAndJoin()
             metricsJob = null
+            multipathFailoverController?.stop()
+            multipathFailoverController = null
             migrationController?.stop()
             migrationController = null
             locationProvider.stop()
