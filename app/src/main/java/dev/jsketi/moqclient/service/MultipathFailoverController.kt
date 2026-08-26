@@ -4,6 +4,7 @@ import android.os.SystemClock
 import android.util.Log
 import dev.jsketi.moqclient.data.moq.MoqPublisher
 import dev.jsketi.moqclient.data.moq.MoqSessionState
+import dev.jsketi.moqclient.data.moq.TransportPathStats
 import dev.jsketi.moqclient.data.network.NetworkManager
 import dev.jsketi.moqclient.domain.model.NetworkHealth
 import dev.jsketi.moqclient.domain.model.NetworkPath
@@ -46,7 +47,8 @@ class MultipathFailoverController(
     private val wifiSocketFdFactory: () -> Int,
     // noq(멀티패스) 전용. quinn 레거시 전환은 AutoNetworkMigrationController 소관.
     private val enabled: Boolean,
-    // G2 실험(#52): 분산 모드에서는 품질 이탈이 스케줄러 재분배로 흡수되므로 wifi-lost 만 처리.
+    // G2 분산 모드(#52/#55): 품질 신호 시 주경로를 강등(전량 인계)하고 회복 시 재승격한다 —
+    // noq 스케줄러는 loss 사후 반응형이라 급락을 스스로 흡수하지 못한다(151419Z 실측).
     private val dualScheduling: Boolean = false,
 ) {
 
@@ -111,9 +113,9 @@ class MultipathFailoverController(
         // 경로 역할은 id 가 아니라 primary 플래그(=원격 포트가 relay 주 포트)로 식별한다 —
         // 재합류(#46) 후 Wi-Fi 경로는 새 id(2+)를 받는다.
         val stats = moqPublisher.pathStats()
-        val primaryId = stats.firstOrNull { it.primary }?.id
+        val primaryStat = stats.firstOrNull { it.primary }
         val secondaryId = stats.firstOrNull { !it.primary }?.id
-        if (primaryId == null) {
+        if (primaryStat == null) {
             // 주(Wi-Fi) 경로 폐기 후 백업 단독 운행 중 — Wi-Fi 복귀 재합류(#46).
             // 품질 이탈로 떠난 경우엔 holdoff + USABLE 회복까지 재합류를 미룬다(#51, 핑퐁 방지).
             if (s.wifiAlive && secondaryId != null) {
@@ -125,36 +127,91 @@ class MultipathFailoverController(
             }
             return
         }
+        val primaryId = primaryStat.id
         if (secondaryId == null) return // 보조 경로 미개설 — 페일오버할 곳이 없다
-        val reason = when {
-            !s.wifiAlive -> "wifi-lost"
-            s.wifiHealth == NetworkHealth.WEAK -> "wifi-weak"
-            s.txStalled -> "tx-stalled"
-            s.txDegraded -> "tx-degraded"
-            else -> return
+
+        // Wi-Fi Network 소멸은 강등 상태와 무관하게 경로 폐기(백로그 즉시 재전송) — 유일하게
+        // 비가역이라 세션당 1회 래치로 보호한다.
+        if (!s.wifiAlive) {
+            if (!failoverLatch.compareAndSet(false, true)) return
+            Log.i(TAG, "[failover] trigger=wifi-lost promote=path$secondaryId close=path$primaryId")
+            moqPublisher.setPathBackup(secondaryId, backup = false)
+                .onFailure { Log.w(TAG, "[failover] promote path$secondaryId FAIL: ${it.message}") }
+            moqPublisher.closePath(primaryId)
+                .onFailure { Log.w(TAG, "[failover] close path$primaryId FAIL: ${it.message}") }
+            runtime.markPublishingPath(NetworkPath.CELLULAR)
+            return
         }
-        if (dualScheduling && reason != "wifi-lost") return // 분산 모드: 약화는 재분배가 흡수(#52)
-        if (reason != "wifi-lost") {
-            // 품질 신호는 상류(runtime 스트릭/RSSI 판정)에서 이미 디바운스됨 — legacy 파리티로
-            // 짧게만 재확인. 신호가 바뀌면 collectLatest 가 이 대기를 취소한다.
-            delay(FLEE_CONFIRM_MS)
-            val stillValid = when (reason) {
-                "wifi-weak" -> networkManager.wifiHealth.value == NetworkHealth.WEAK
-                "tx-stalled" -> runtime.status.value.txStalled
-                else -> runtime.status.value.txDegraded
-            }
-            if (!stillValid) return
+
+        if (dualScheduling) {
+            handleDualQuality(s, primaryStat)
+            return
         }
+
+        // backup 모드 품질 이탈(#51): 보조 승격 + 주경로 폐기.
+        val reason = qualityFleeReason(s) ?: return
+        // 품질 신호는 상류(runtime 스트릭/RSSI 판정)에서 이미 디바운스됨 — legacy 파리티로
+        // 짧게만 재확인. 신호가 바뀌면 collectLatest 가 이 대기를 취소한다.
+        delay(FLEE_CONFIRM_MS)
+        if (!qualityStillBad(reason)) return
         if (!failoverLatch.compareAndSet(false, true)) return
-        if (reason != "wifi-lost") {
-            lastQualityFleeAtMs = SystemClock.elapsedRealtime()
-        }
+        lastQualityFleeAtMs = SystemClock.elapsedRealtime()
         Log.i(TAG, "[failover] trigger=$reason promote=path$secondaryId close=path$primaryId")
         moqPublisher.setPathBackup(secondaryId, backup = false)
             .onFailure { Log.w(TAG, "[failover] promote path$secondaryId FAIL: ${it.message}") }
         moqPublisher.closePath(primaryId)
             .onFailure { Log.w(TAG, "[failover] close path$primaryId FAIL: ${it.message}") }
         runtime.markPublishingPath(NetworkPath.CELLULAR)
+    }
+
+    /**
+     * dual 하이브리드(#55): noq 스케줄러는 loss/RTT 사후 반응형이라 링크레이트 급락에 늦다
+     * (실측 151419Z: 큐 폭발 후에야 이동, 정지 6~12s). 품질 신호가 뜨면 주경로를 Backup 으로
+     * **강등**해 전량을 즉시 보조로 넘기고(close 아님 — 소켓·경로 무손상), 회복이 확인되면
+     * 재승격해 분배를 재개한다. 강등/재승격은 가역이라 래치 없이 pathStats 의 backup 플래그로
+     * 상태를 판정한다.
+     */
+    private suspend fun handleDualQuality(s: Signals, primaryStat: TransportPathStats) {
+        if (primaryStat.backup) {
+            // 강등 중 — 회복(RSSI USABLE + 정체 해소 + holdoff + sustain) 시 재승격.
+            if (s.wifiHealth != NetworkHealth.USABLE || s.txStalled || s.txDegraded) return
+            val holdoffOver = lastQualityFleeAtMs == 0L ||
+                SystemClock.elapsedRealtime() - lastQualityFleeAtMs >= WIFI_READD_HOLDOFF_MS
+            if (!holdoffOver) return
+            delay(WIFI_READD_SUSTAIN_MS)
+            if (networkManager.wifiHealth.value != NetworkHealth.USABLE ||
+                runtime.status.value.txStalled || runtime.status.value.txDegraded
+            ) {
+                return
+            }
+            Log.i(TAG, "[promote] Wi-Fi recovered — path${primaryStat.id} back to Available (분배 재개)")
+            moqPublisher.setPathBackup(primaryStat.id, backup = false)
+                .onFailure { Log.w(TAG, "[promote] path${primaryStat.id} FAIL: ${it.message}") }
+            runtime.markPublishingPath(NetworkPath.WIFI)
+            lastQualityFleeAtMs = 0L
+            return
+        }
+        val reason = qualityFleeReason(s) ?: return
+        delay(FLEE_CONFIRM_MS)
+        if (!qualityStillBad(reason)) return
+        lastQualityFleeAtMs = SystemClock.elapsedRealtime()
+        Log.i(TAG, "[demote] trigger=$reason path${primaryStat.id} → Backup (전량 보조 인계)")
+        moqPublisher.setPathBackup(primaryStat.id, backup = true)
+            .onFailure { Log.w(TAG, "[demote] path${primaryStat.id} FAIL: ${it.message}") }
+        runtime.markPublishingPath(NetworkPath.CELLULAR)
+    }
+
+    private fun qualityFleeReason(s: Signals): String? = when {
+        s.wifiHealth == NetworkHealth.WEAK -> "wifi-weak"
+        s.txStalled -> "tx-stalled"
+        s.txDegraded -> "tx-degraded"
+        else -> null
+    }
+
+    private fun qualityStillBad(reason: String): Boolean = when (reason) {
+        "wifi-weak" -> networkManager.wifiHealth.value == NetworkHealth.WEAK
+        "tx-stalled" -> runtime.status.value.txStalled
+        else -> runtime.status.value.txDegraded
     }
 
     /**
