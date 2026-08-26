@@ -70,7 +70,9 @@ class TelemetryReporter(
             val lostDelta = (s.lostPackets - (prev?.lostPackets ?: 0L)).coerceAtLeast(0L)
             PathTelemetry(
                 id = s.id.toInt(),
-                kind = if (s.id == 0L) "WIFI"
+                // 라벨은 id 가 아니라 소켓 슬롯(=원격 포트) 기준 — Wi-Fi 재합류(#46) 후에는
+                // Wi-Fi 경로가 새 id(2+)를 받기 때문.
+                kind = if (s.primary) "WIFI"
                     else networkManager.networkTypeFor(NetworkPath.CELLULAR) ?: "CELLULAR",
                 backup = s.backup,
                 validated = true,
