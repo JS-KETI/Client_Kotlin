@@ -49,6 +49,11 @@ android {
         val moqQuicBackend = (project.findProperty("moqQuicBackend") as String?) ?: "quinn"
         buildConfigField("String", "MOQ_QUIC_BACKEND", "\"$moqQuicBackend\"")
 
+        // 멀티패스 스케줄링(#52): "backup"(기본 — 보조 경로 대기) | "dual"(G2 실험 — 양쪽 Available 분산).
+        // 실험 빌드는 -PmoqMultipathScheduling=dual 로, 커밋된 기본값은 항상 backup.
+        val moqMultipathScheduling = (project.findProperty("moqMultipathScheduling") as String?) ?: "backup"
+        buildConfigField("String", "MOQ_MULTIPATH_SCHEDULING", "\"$moqMultipathScheduling\"")
+
         ndk {
             abiFilters += "arm64-v8a"
         }
