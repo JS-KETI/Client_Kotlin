@@ -2,6 +2,7 @@ package dev.jsketi.moqclient.vm
 
 import dev.jsketi.moqclient.domain.model.NetworkPath
 import dev.jsketi.moqclient.domain.model.NetworkPathState
+import dev.jsketi.moqclient.domain.model.PathShare
 import dev.jsketi.moqclient.domain.model.PublishState
 
 data class PublisherUiState(
@@ -18,6 +19,8 @@ data class PublisherUiState(
     // activePath is the OS default network, not necessarily the MoQ publishing path.
     // publishingPath is the network the active MoQ session actually sends over; null when not publishing.
     val publishingPath: NetworkPath? = null,
+    // 멀티패스 송출 중 경로별 송신 분담(#48) — Network 카드가 두 경로 모두에 Publishing %를 단다.
+    val pathShares: List<PathShare> = emptyList(),
     val txBps: Long = 0L,
     val migrationCount: Int = 0,
     val uptimeSeconds: Long = 0L,

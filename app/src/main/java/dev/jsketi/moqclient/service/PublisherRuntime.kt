@@ -16,6 +16,7 @@ import dev.jsketi.moqclient.data.rest.TelemetryReporter
 import dev.jsketi.moqclient.data.rest.dto.DeviceSummary
 import dev.jsketi.moqclient.domain.model.CodecConfig
 import dev.jsketi.moqclient.domain.model.NetworkPath
+import dev.jsketi.moqclient.domain.model.PathShare
 import dev.jsketi.moqclient.domain.model.PublishState
 import dev.jsketi.moqclient.domain.model.PublisherStatus
 import kotlinx.coroutines.CancellationException
@@ -75,6 +76,9 @@ class PublisherRuntime(
     private val latestOnlyCutAtElapsedMs = AtomicLong(0L)
     // 마지막 하드 재연결 시각(elapsedRealtime). 30s 쿨다운 enforcement. 0 = 아직 없음.
     @Volatile private var lastHardReconnectAtMs: Long = 0L
+    // 경로별 송신 분담률(#48) 계산용 — 직전 metrics tick 의 per-path 누적 tx 와 시각.
+    private var pathShareTxPrev: Map<Long, Long> = emptyMap()
+    private var pathShareTickAtMs: Long = 0L
     private var startedAtElapsedMs: Long = 0L
     private var streamStarted: Boolean = false
     private var serverRegistered: Boolean = false
@@ -1031,7 +1035,36 @@ class PublisherRuntime(
                         "lowStreak=$consecutiveLowSamples hardStreak=$hardStreak"
                 )
 
-                updateStatus { it.copy(uptimeSeconds = uptimeSeconds, txBps = bps, txStalled = softStalled, txDegraded = txDegraded) }
+                // 경로별 송신 분담률(#48): per-path tx delta 로 %를 산출해 UI 카드에 공급.
+                // 라벨은 primary(=relay 주 포트) 기준 — 재합류 후 경로 id 가 바뀌어도 유효.
+                val pathShares = if (moqPublisher.isMultipathArmed()) {
+                    val nowMs = SystemClock.elapsedRealtime()
+                    val elapsedMs = (nowMs - pathShareTickAtMs).coerceAtLeast(1L)
+                    pathShareTickAtMs = nowMs
+                    val paths = moqPublisher.pathStats()
+                    val deltas = paths.map { p ->
+                        p to (p.txBytes - (pathShareTxPrev[p.id] ?: p.txBytes)).coerceAtLeast(0L)
+                    }
+                    pathShareTxPrev = paths.associate { it.id to it.txBytes }
+                    val total = deltas.sumOf { it.second }
+                    deltas.map { (p, delta) ->
+                        PathShare(
+                            kind = if (p.primary) NetworkPath.WIFI else NetworkPath.CELLULAR,
+                            egressBps = delta * 8_000 / elapsedMs,
+                            percent = when {
+                                total > 0L -> ((delta * 100 + total / 2) / total).toInt()
+                                !p.backup -> 100
+                                else -> 0
+                            },
+                            backup = p.backup,
+                        )
+                    }
+                } else {
+                    if (pathShareTxPrev.isNotEmpty()) pathShareTxPrev = emptyMap()
+                    emptyList()
+                }
+
+                updateStatus { it.copy(uptimeSeconds = uptimeSeconds, txBps = bps, txStalled = softStalled, txDegraded = txDegraded, pathShares = pathShares) }
 
                 // 같은 경로 위 대응. 하드 실패가 우선 — 진짜 죽음이면 reconnect(streamRevision++),
                 // 아니면 단순 정체이므로 soft cut(latest-only refresh)로 세션을 살린 채 backlog 만 버린다.
