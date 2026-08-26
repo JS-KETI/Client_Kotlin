@@ -15,7 +15,9 @@ data class MultipathSockets(
 
 /**
  * Per-path QUIC transport statistics snapshot (issue #38).
- * Path id 0 is always the primary path; ids >= 1 are paths opened via addPath().
+ * Path id 0 is the initial primary path; ids >= 1 are paths opened via addPath(). After a
+ * failover + Wi-Fi re-add (#46) the Wi-Fi path carries a new id, so consumers must identify
+ * roles via [primary] (remote port == relay primary port ⇒ Wi-Fi socket slot), not the id.
  */
 data class TransportPathStats(
     val id: Long,
@@ -25,4 +27,6 @@ data class TransportPathStats(
     val rxBytes: Long,
     val lostPackets: Long,
     val cwnd: Long,
+    val remotePort: Int,
+    val primary: Boolean,
 )

@@ -24,10 +24,10 @@ index d04ff8f9..d287c4d4 100644
  tokio = { workspace = true, features = ["macros"] }
  tracing = "0.1"
 diff --git a/rs/moq-ffi/src/session.rs b/rs/moq-ffi/src/session.rs
-index e7210d20..514eb63d 100644
+index e7210d20..d3ca2f11 100644
 --- a/rs/moq-ffi/src/session.rs
 +++ b/rs/moq-ffi/src/session.rs
-@@ -11,31 +11,171 @@ struct Client {
+@@ -11,31 +11,197 @@ struct Client {
  	config: moq_native::ClientConfig,
  	publish: Option<Arc<MoqOriginProducer>>,
  	consume: Option<Arc<MoqOriginProducer>>,
@@ -193,6 +193,32 @@ index e7210d20..514eb63d 100644
 +		)))
 +	}
 +
++	#[cfg(target_family = "unix")]
++	fn replace_primary_socket(&self, fd: i32) -> Result<(), MoqError> {
++		use std::os::fd::FromRawFd;
++
++		if fd < 0 {
++			return Err(MoqError::Connect(format!("replacePrimarySocket: invalid fd: {fd}")));
++		}
++
++		// Takes ownership of a dup fd supplied by Android/Kotlin. The caller must not close it.
++		let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
++		let native = self
++			.native
++			.as_ref()
++			.ok_or_else(|| MoqError::Connect("cannot replace socket before connect".to_string()))?;
++		native
++			.noq_replace_primary_socket(socket)
++			.map_err(|err| MoqError::Connect(format!("replacePrimarySocket: {err}")))
++	}
++
++	#[cfg(not(target_family = "unix"))]
++	fn replace_primary_socket(&self, fd: i32) -> Result<(), MoqError> {
++		Err(MoqError::Connect(format!(
++			"replacePrimarySocket: fd-based sockets unsupported on this target (fd={fd})"
++		)))
++	}
++
 +	fn rebind_socket(&self, socket: std::net::UdpSocket) -> Result<(), MoqError> {
 +		let native = self
 +			.native
@@ -205,7 +231,7 @@ index e7210d20..514eb63d 100644
  }
  
  #[derive(uniffi::Object)]
-@@ -54,6 +194,9 @@ impl MoqClient {
+@@ -54,6 +220,9 @@ impl MoqClient {
  				config: moq_native::ClientConfig::default(),
  				publish: None,
  				consume: None,
@@ -215,7 +241,7 @@ index e7210d20..514eb63d 100644
  			}),
  		})
  	}
-@@ -65,6 +208,20 @@ impl MoqClient {
+@@ -65,6 +234,20 @@ impl MoqClient {
  		}
  	}
  
@@ -236,7 +262,7 @@ index e7210d20..514eb63d 100644
  	/// Set the origin to publish local broadcasts to the remote.
  	pub fn set_publish(&self, origin: Option<Arc<MoqOriginProducer>>) {
  		if let Some(mut state) = self.task.lock() {
-@@ -85,7 +242,105 @@ impl MoqClient {
+@@ -85,7 +268,115 @@ impl MoqClient {
  	pub async fn connect(&self, url: String) -> Result<Arc<MoqSession>, MoqError> {
  		let url = Url::parse(&url)?;
  
@@ -281,6 +307,15 @@ index e7210d20..514eb63d 100644
 +		let _guard = crate::ffi::RUNTIME.enter();
 +		let mut state = self.task.lock().ok_or(MoqError::Cancelled)?;
 +		state.set_bound_socket(fd)
++	}
++
++	/// Hot-swap the multipath dual socket's Wi-Fi slot with an already-bound UDP socket fd
++	/// (issue #46). Call after the Wi-Fi Network returned; follow with addPath() toward the
++	/// relay's primary port to re-open the Wi-Fi path.
++	pub fn replace_primary_socket(&self, fd: i32) -> Result<(), MoqError> {
++		let _guard = crate::ffi::RUNTIME.enter();
++		let state = self.task.lock().ok_or(MoqError::Cancelled)?;
++		state.replace_primary_socket(fd)
 +	}
 +
 +	/// Open an additional multipath path to `remote` ("IP:port").
@@ -338,12 +373,13 @@ index e7210d20..514eb63d 100644
 +				rx_bytes: s.rx_bytes,
 +				lost_packets: s.lost_packets,
 +				cwnd: s.cwnd,
++				remote_port: s.remote_port,
 +			})
 +			.collect()
  	}
  
  	/// Cancel all current and future `connect()` calls.
-@@ -94,6 +349,40 @@ impl MoqClient {
+@@ -94,6 +385,43 @@ impl MoqClient {
  	}
  }
  
@@ -362,6 +398,9 @@ index e7210d20..514eb63d 100644
 +	pub rx_bytes: u64,
 +	/// Total packets detected as lost on this path.
 +	pub lost_packets: u64,
++	/// Remote (relay) port — the primary port always rides the Wi-Fi socket slot, the
++	/// secondary the cellular slot, regardless of the path handle (issue #46).
++	pub remote_port: u16,
 +	/// Current congestion window, in bytes.
 +	pub cwnd: u64,
 +}
@@ -384,7 +423,7 @@ index e7210d20..514eb63d 100644
  #[derive(uniffi::Object)]
  pub struct MoqSession {
  	inner: Option<moq_lite::Session>,
-@@ -126,4 +415,18 @@ impl MoqSession {
+@@ -126,4 +454,18 @@ impl MoqSession {
  		// NOTE: we don't abort the closed Task because it will be aborted via above ^
  		// We'll get a slightly better error message instead of Cancelled.
  	}
@@ -426,7 +465,7 @@ index f37ee862..dea4ced9 100644
  web-transport-quiche = { workspace = true, optional = true }
  web-transport-quinn = { workspace = true, optional = true }
 diff --git a/rs/moq-native/src/client.rs b/rs/moq-native/src/client.rs
-index 01951a49..05010746 100644
+index 01951a49..b25adc63 100644
 --- a/rs/moq-native/src/client.rs
 +++ b/rs/moq-native/src/client.rs
 @@ -53,6 +53,12 @@ pub struct ClientConfig {
@@ -450,7 +489,7 @@ index 01951a49..05010746 100644
  			max_streams: None,
  			version: Vec::new(),
  			tls: ClientTls::default(),
-@@ -274,6 +281,74 @@ impl Client {
+@@ -274,6 +281,83 @@ impl Client {
  		self
  	}
  
@@ -495,6 +534,15 @@ index 01951a49..05010746 100644
 +			.install_resilient_socket(socket)
 +	}
 +
++	/// Hot-swap the dual socket's Wi-Fi slot with a fresh pre-bound socket (issue #46).
++	#[cfg(feature = "noq")]
++	pub fn noq_replace_primary_socket(&self, socket: net::UdpSocket) -> anyhow::Result<()> {
++		self.noq
++			.as_ref()
++			.context("noq backend not active")?
++			.replace_primary_socket(socket)
++	}
++
 +	/// Open an additional multipath path to `remote`. Returns a path handle (0 = primary).
 +	#[cfg(feature = "noq")]
 +	pub async fn noq_open_path(&self, remote: net::SocketAddr) -> anyhow::Result<u64> {
@@ -527,10 +575,10 @@ index 01951a49..05010746 100644
  		anyhow::bail!("no QUIC backend compiled; enable noq, quinn, quiche, or iroh feature");
 diff --git a/rs/moq-native/src/dual_socket.rs b/rs/moq-native/src/dual_socket.rs
 new file mode 100644
-index 00000000..1a17fd8e
+index 00000000..60ea178e
 --- /dev/null
 +++ b/rs/moq-native/src/dual_socket.rs
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,345 @@
 +//! Dual-socket adapter for noq multipath (issue #38).
 +//!
 +//! Wraps two runtime-provided [`AsyncUdpSocket`]s as one endpoint socket.
@@ -555,6 +603,13 @@ index 00000000..1a17fd8e
 +//! dropped, which QUIC treats as loss until the path policy abandons the
 +//! path), and a socket whose recv errors is marked dead and skipped; only
 +//! when both sockets are dead is the error propagated.
++//!
++//! Hot swap (issue #46): slot A can be replaced at runtime through
++//! [`DualSocketHandle`] after the endpoint has taken ownership — a Wi-Fi
++//! Network that died and returned needs a fresh pre-bound socket (the old fd
++//! dies with its Network). Slot B is never replaced, keeping the cellular
++//! flows' source address stable. Senders track a generation counter and
++//! re-create their cached slot-A sender when it changes.
 +
 +use std::collections::HashMap;
 +use std::fmt;
@@ -593,19 +648,43 @@ index 00000000..1a17fd8e
 +	Poll::Ready(Ok(()))
 +}
 +
-+pub struct DualUdpSocket {
++struct Slots {
 +	a: Box<dyn AsyncUdpSocket>,
 +	b: Box<dyn AsyncUdpSocket>,
-+	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
++	// Bumped on every slot-A replacement; senders re-create their cached A sender on change.
++	a_gen: u64,
 +	a_dead: bool,
 +	b_dead: bool,
 +}
 +
++/// External handle for hot-swapping slot A after the endpoint owns the socket (issue #46).
++#[derive(Clone)]
++pub struct DualSocketHandle {
++	slots: Arc<Mutex<Slots>>,
++}
++
++impl DualSocketHandle {
++	/// Replace slot A (the Wi-Fi socket) with a fresh pre-bound socket and revive it.
++	pub fn replace_a(&self, socket: Box<dyn AsyncUdpSocket>) {
++		let mut slots = self.slots.lock().unwrap();
++		slots.a = socket;
++		slots.a_dead = false;
++		slots.a_gen += 1;
++		tracing::info!(generation = slots.a_gen, "dual socket A replaced");
++	}
++}
++
++pub struct DualUdpSocket {
++	slots: Arc<Mutex<Slots>>,
++	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
++}
++
 +impl fmt::Debug for DualUdpSocket {
 +	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++		let slots = self.slots.lock().unwrap();
 +		f.debug_struct("DualUdpSocket")
-+			.field("a", &self.a.local_addr().ok())
-+			.field("b", &self.b.local_addr().ok())
++			.field("a", &slots.a.local_addr().ok())
++			.field("b", &slots.b.local_addr().ok())
 +			.finish()
 +	}
 +}
@@ -619,15 +698,25 @@ index 00000000..1a17fd8e
 +		let route = Arc::new(Mutex::new(
 +			seed.iter().map(|&(addr, idx)| (canon(addr), idx)).collect::<HashMap<_, _>>(),
 +		));
-+		Self { a, b, route, a_dead: false, b_dead: false }
++		Self {
++			slots: Arc::new(Mutex::new(Slots { a, b, a_gen: 0, a_dead: false, b_dead: false })),
++			route,
++		}
++	}
++
++	/// Handle for replacing slot A after `rebind_abstract` consumes this socket (issue #46).
++	pub fn slots_handle(&self) -> DualSocketHandle {
++		DualSocketHandle { slots: self.slots.clone() }
 +	}
 +}
 +
 +impl AsyncUdpSocket for DualUdpSocket {
 +	fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
++		let b = self.slots.lock().unwrap().b.create_sender();
 +		Box::pin(DualSender {
-+			a: self.a.create_sender(),
-+			b: self.b.create_sender(),
++			slots: self.slots.clone(),
++			cached_a: None,
++			b,
 +			route: self.route.clone(),
 +			err_count: AtomicU32::new(0),
 +		})
@@ -639,8 +728,9 @@ index 00000000..1a17fd8e
 +		bufs: &mut [IoSliceMut<'_>],
 +		meta: &mut [RecvMeta],
 +	) -> Poll<io::Result<usize>> {
-+		if !self.a_dead {
-+			match self.a.poll_recv(cx, bufs, meta) {
++		let mut slots = self.slots.lock().unwrap();
++		if !slots.a_dead {
++			match slots.a.poll_recv(cx, bufs, meta) {
 +				Poll::Ready(Ok(n)) => {
 +					let mut r = self.route.lock().unwrap();
 +					for m in meta.iter().take(n) {
@@ -650,13 +740,13 @@ index 00000000..1a17fd8e
 +				}
 +				Poll::Ready(Err(e)) => {
 +					tracing::warn!("dual socket A recv error; marking dead: {e}");
-+					self.a_dead = true;
++					slots.a_dead = true;
 +				}
 +				Poll::Pending => {}
 +			}
 +		}
-+		if !self.b_dead {
-+			match self.b.poll_recv(cx, bufs, meta) {
++		if !slots.b_dead {
++			match slots.b.poll_recv(cx, bufs, meta) {
 +				Poll::Ready(Ok(n)) => {
 +					let mut r = self.route.lock().unwrap();
 +					for m in meta.iter().take(n) {
@@ -666,12 +756,12 @@ index 00000000..1a17fd8e
 +				}
 +				Poll::Ready(Err(e)) => {
 +					tracing::warn!("dual socket B recv error; marking dead: {e}");
-+					self.b_dead = true;
++					slots.b_dead = true;
 +				}
 +				Poll::Pending => {}
 +			}
 +		}
-+		if self.a_dead && self.b_dead {
++		if slots.a_dead && slots.b_dead {
 +			return Poll::Ready(Err(io::Error::new(
 +				io::ErrorKind::NotConnected,
 +				"both sockets dead",
@@ -681,20 +771,24 @@ index 00000000..1a17fd8e
 +	}
 +
 +	fn local_addr(&self) -> io::Result<SocketAddr> {
-+		self.a.local_addr()
++		self.slots.lock().unwrap().a.local_addr()
 +	}
 +
 +	fn max_receive_segments(&self) -> NonZeroUsize {
-+		self.a.max_receive_segments().min(self.b.max_receive_segments())
++		let slots = self.slots.lock().unwrap();
++		slots.a.max_receive_segments().min(slots.b.max_receive_segments())
 +	}
 +
 +	fn may_fragment(&self) -> bool {
-+		self.a.may_fragment() || self.b.may_fragment()
++		let slots = self.slots.lock().unwrap();
++		slots.a.may_fragment() || slots.b.may_fragment()
 +	}
 +}
 +
 +struct DualSender {
-+	a: Pin<Box<dyn UdpSender>>,
++	slots: Arc<Mutex<Slots>>,
++	// (generation, sender) — re-created when slot A is replaced.
++	cached_a: Option<(u64, Pin<Box<dyn UdpSender>>)>,
 +	b: Pin<Box<dyn UdpSender>>,
 +	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
 +	err_count: AtomicU32,
@@ -721,7 +815,15 @@ index 00000000..1a17fd8e
 +			.copied()
 +			.unwrap_or(0);
 +		let res = if idx == 0 {
-+			this.a.as_mut().poll_send(transmit, cx)
++			{
++				let slots = this.slots.lock().unwrap();
++				let stale = this.cached_a.as_ref().map(|(g, _)| *g) != Some(slots.a_gen);
++				if stale {
++					this.cached_a = Some((slots.a_gen, slots.a.create_sender()));
++				}
++			}
++			let (_, sender) = this.cached_a.as_mut().expect("cached_a just ensured");
++			sender.as_mut().poll_send(transmit, cx)
 +		} else {
 +			this.b.as_mut().poll_send(transmit, cx)
 +		};
@@ -734,7 +836,7 @@ index 00000000..1a17fd8e
 +	}
 +
 +	fn max_transmit_segments(&self) -> NonZeroUsize {
-+		self.a.max_transmit_segments().min(self.b.max_transmit_segments())
++		self.b.max_transmit_segments()
 +	}
 +}
 +
@@ -836,10 +938,10 @@ index 57df6c12..015bd7c8 100644
  #[cfg(feature = "noq")]
  mod noq;
 diff --git a/rs/moq-native/src/noq.rs b/rs/moq-native/src/noq.rs
-index 865d0b19..454fd224 100644
+index 865d0b19..20994935 100644
 --- a/rs/moq-native/src/noq.rs
 +++ b/rs/moq-native/src/noq.rs
-@@ -2,13 +2,36 @@ use crate::client::ClientConfig;
+@@ -2,13 +2,42 @@ use crate::client::ClientConfig;
  use crate::server::{ServerConfig, ServerId, ServerTlsInfo};
  use crate::tls::{FingerprintVerifier, ServeCerts};
  use anyhow::Context;
@@ -863,21 +965,27 @@ index 865d0b19..454fd224 100644
 +	pub rx_bytes: u64,
 +	pub lost_packets: u64,
 +	pub cwnd: u64,
++	// Remote (relay) port of the path. Identifies the socket slot regardless of the path
++	// handle: the primary port always rides slot A (Wi-Fi), the secondary slot B (issue #46).
++	pub remote_port: u16,
 +}
 +
 +/// Shared multipath state; survives clones of [`NoqClient`] (issue #38).
 +#[derive(Clone, Default)]
 +struct MultipathState {
 +	conn: Arc<Mutex<Option<noq::Connection>>>,
-+	// key = FFI-visible path handle (0 is reserved for the primary path)
-+	paths: Arc<Mutex<HashMap<u64, (noq::Path, bool)>>>,
++	// key = FFI-visible path handle (0 is reserved for the primary path);
++	// value = (path, backup flag, remote port)
++	paths: Arc<Mutex<HashMap<u64, (noq::Path, bool, u16)>>>,
 +	next_id: Arc<AtomicU64>,
++	// Hot-swap handle for the installed dual socket's slot A (issue #46).
++	dual_handle: Arc<Mutex<Option<crate::dual_socket::DualSocketHandle>>>,
 +}
 +
  // ── Client ──────────────────────────────────────────────────────────
  
  #[derive(Clone)]
-@@ -16,6 +39,7 @@ pub(crate) struct NoqClient {
+@@ -16,6 +45,7 @@ pub(crate) struct NoqClient {
  	pub quic: noq::Endpoint,
  	pub transport: Arc<noq::TransportConfig>,
  	pub versions: moq_lite::Versions,
@@ -885,7 +993,7 @@ index 865d0b19..454fd224 100644
  }
  
  impl NoqClient {
-@@ -27,6 +51,12 @@ impl NoqClient {
+@@ -27,6 +57,12 @@ impl NoqClient {
  		transport.keep_alive_interval(Some(time::Duration::from_secs(4)));
  		transport.mtu_discovery_config(None); // Disable MTU discovery
  
@@ -898,7 +1006,7 @@ index 865d0b19..454fd224 100644
  		let max_streams = config.max_streams.unwrap_or(crate::DEFAULT_MAX_STREAMS);
  		let max_streams = noq::VarInt::from_u64(max_streams).unwrap_or(noq::VarInt::MAX);
  		transport.max_concurrent_bidi_streams(max_streams);
-@@ -46,9 +76,150 @@ impl NoqClient {
+@@ -46,9 +82,170 @@ impl NoqClient {
  			quic,
  			transport,
  			versions: config.versions(),
@@ -918,9 +1026,27 @@ index 865d0b19..454fd224 100644
 +		let a = runtime.wrap_udp_socket(a).context("wrap socket a")?;
 +		let b = runtime.wrap_udp_socket(b).context("wrap socket b")?;
 +		let dual = crate::dual_socket::DualUdpSocket::new(a, b, seed);
++		*self.multipath.dual_handle.lock().unwrap() = Some(dual.slots_handle());
 +		self.quic
 +			.rebind_abstract(Box::new(dual))
 +			.context("failed to install dual socket")
++	}
++
++	/// Hot-swap the dual socket's slot A (issue #46) — used to re-add the Wi-Fi path after
++	/// its Network died and returned (the old fd dies with its Network). Slot B (cellular)
++	/// is untouched, keeping its flows' source address stable.
++	pub fn replace_primary_socket(&self, socket: std::net::UdpSocket) -> anyhow::Result<()> {
++		let handle = self
++			.multipath
++			.dual_handle
++			.lock()
++			.unwrap()
++			.clone()
++			.context("dual socket not installed")?;
++		let runtime = noq::default_runtime().context("no async runtime")?;
++		let socket = runtime.wrap_udp_socket(socket).context("wrap socket")?;
++		handle.replace_a(socket);
++		Ok(())
 +	}
 +
 +	/// Swap the endpoint socket for [`crate::dual_socket::ResilientUdpSocket`] (single-path
@@ -960,7 +1086,7 @@ index 865d0b19..454fd224 100644
 +			.await
 +			.context("open_path failed")?;
 +		let id = self.multipath.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-+		self.multipath.paths.lock().unwrap().insert(id, (path, false));
++		self.multipath.paths.lock().unwrap().insert(id, (path, false, remote.port()));
 +		Ok(id)
 +	}
 +
@@ -979,7 +1105,7 @@ index 865d0b19..454fd224 100644
 +		}
 +		let entry = self.multipath.paths.lock().unwrap().remove(&id);
 +		match entry {
-+			Some((path, _)) => path.close().map_err(|e| anyhow::anyhow!("close_path: {e}")),
++			Some((path, _, _)) => path.close().map_err(|e| anyhow::anyhow!("close_path: {e}")),
 +			None => anyhow::bail!("unknown path id {id}"),
 +		}
 +	}
@@ -1005,7 +1131,7 @@ index 865d0b19..454fd224 100644
 +				.map_err(|e| anyhow::anyhow!("set_path_backup: {e}"));
 +		}
 +		let mut paths = self.multipath.paths.lock().unwrap();
-+		let (path, flag) = paths.get_mut(&id).context("unknown path id")?;
++		let (path, flag, _) = paths.get_mut(&id).context("unknown path id")?;
 +		path.set_status(status)
 +			.map_err(|e| anyhow::anyhow!("set_path_backup: {e}"))?;
 +		*flag = backup;
@@ -1028,9 +1154,10 @@ index 865d0b19..454fd224 100644
 +				rx_bytes: st.udp_rx.bytes,
 +				lost_packets: st.lost_packets,
 +				cwnd: st.cwnd,
++				remote_port: conn.remote_address().port(),
 +			});
 +		}
-+		for (id, (path, backup)) in self.multipath.paths.lock().unwrap().iter() {
++		for (id, (path, backup, remote_port)) in self.multipath.paths.lock().unwrap().iter() {
 +			let st = path.stats();
 +			out.push(NoqPathStats {
 +				id: *id,
@@ -1040,6 +1167,7 @@ index 865d0b19..454fd224 100644
 +				rx_bytes: st.udp_rx.bytes,
 +				lost_packets: st.lost_packets,
 +				cwnd: st.cwnd,
++				remote_port: *remote_port,
 +			});
 +		}
 +		out.sort_by_key(|s| s.id);
@@ -1049,7 +1177,7 @@ index 865d0b19..454fd224 100644
  	pub async fn connect(&self, tls: &rustls::ClientConfig, url: Url) -> anyhow::Result<web_transport_noq::Session> {
  		let mut url = url;
  		let mut config = tls.clone();
-@@ -110,6 +281,7 @@ impl NoqClient {
+@@ -110,6 +307,7 @@ impl NoqClient {
  
  		let connection = self.quic.connect_with(config, ip, &host)?.await?;
  		tracing::Span::current().record("id", connection.stable_id());
@@ -1057,7 +1185,7 @@ index 865d0b19..454fd224 100644
  
  		let mut request = web_transport_noq::proto::ConnectRequest::new(url.clone());
  		for alpn in self.versions.alpns() {
-@@ -136,6 +308,10 @@ impl NoqClient {
+@@ -136,6 +334,10 @@ impl NoqClient {
  
  		Ok(session)
  	}
