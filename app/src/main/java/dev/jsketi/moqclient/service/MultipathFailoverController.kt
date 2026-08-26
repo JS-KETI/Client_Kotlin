@@ -46,6 +46,8 @@ class MultipathFailoverController(
     private val wifiSocketFdFactory: () -> Int,
     // noq(멀티패스) 전용. quinn 레거시 전환은 AutoNetworkMigrationController 소관.
     private val enabled: Boolean,
+    // G2 실험(#52): 분산 모드에서는 품질 이탈이 스케줄러 재분배로 흡수되므로 wifi-lost 만 처리.
+    private val dualScheduling: Boolean = false,
 ) {
 
     private var observeJob: Job? = null
@@ -131,6 +133,7 @@ class MultipathFailoverController(
             s.txDegraded -> "tx-degraded"
             else -> return
         }
+        if (dualScheduling && reason != "wifi-lost") return // 분산 모드: 약화는 재분배가 흡수(#52)
         if (reason != "wifi-lost") {
             // 품질 신호는 상류(runtime 스트릭/RSSI 판정)에서 이미 디바운스됨 — legacy 파리티로
             // 짧게만 재확인. 신호가 바뀌면 collectLatest 가 이 대기를 취소한다.
@@ -169,8 +172,11 @@ class MultipathFailoverController(
                 Log.i(TAG, "[readd] Wi-Fi path restored id=$newId — promote it, demote path$secondaryId")
                 moqPublisher.setPathBackup(newId, backup = false)
                     .onFailure { Log.w(TAG, "[readd] promote path$newId FAIL: ${it.message}") }
-                moqPublisher.setPathBackup(secondaryId, backup = true)
-                    .onFailure { Log.w(TAG, "[readd] demote path$secondaryId FAIL: ${it.message}") }
+                if (!dualScheduling) {
+                    moqPublisher.setPathBackup(secondaryId, backup = true)
+                        .onFailure { Log.w(TAG, "[readd] demote path$secondaryId FAIL: ${it.message}") }
+                } // dual(#52): 양쪽 Available 유지
+
                 runtime.markPublishingPath(NetworkPath.WIFI)
                 failoverLatch.set(false) // 다음 Wi-Fi 사망에 다시 대응
                 lastQualityFleeAtMs = 0L
