@@ -38,7 +38,10 @@ class AutoNetworkMigrationController(
     private val networkManager: NetworkManager,
     private val moqPublisher: MoqPublisher,
     private val switchNetworkUseCase: SwitchNetworkUseCase,
-    private val runtime: PublisherRuntime
+    private val runtime: PublisherRuntime,
+    // 멀티패스(noq) 모드에서는 rebind 기반 전환이 DualSocket 을 파괴하므로 비활성화한다(#38).
+    // 경로 강등/폐기 정책(P3)이 이 컨트롤러의 멀티패스 대응 후계자.
+    private val enabled: Boolean = true,
 ) {
 
     private val migrationMutex = Mutex()
@@ -56,6 +59,10 @@ class AutoNetworkMigrationController(
     private var observeJob: Job? = null
 
     fun start(scope: CoroutineScope) {
+        if (!enabled) {
+            Log.i(TAG, "disabled (multipath/noq mode) — legacy rebind migration will not run")
+            return
+        }
         check(observeJob == null) { "AutoNetworkMigrationController already started" }
         this.scope = scope
         observeJob = scope.launch { observe() }
