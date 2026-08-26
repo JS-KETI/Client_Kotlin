@@ -450,20 +450,31 @@ class PublisherRuntime(
             val summary = ensureServerRegistered()
             streamStarted = true
             // publishingPath 는 OS default 로 추정하지 않는다 — 이전 Cellular bind 가 남아 있으면
-            // 실제 송출 바인딩과 태그가 어긋난다. null 로 두고, AutoNetworkMigrationController 가
-            // streamActive 관측 후 실제 경로를 claim/rebind 하면서 markPublishingPath() 로 태그한다.
+            // 실제 송출 바인딩과 태그가 어긋난다. 레거시(quinn) 모드에서는 null 로 두고,
+            // AutoNetworkMigrationController 가 streamActive 관측 후 실제 경로를 claim/rebind
+            // 하면서 markPublishingPath() 로 태그한다.
+            // 멀티패스(noq) 모드(#38)에서는 컨트롤러가 비활성이라 claim 주체가 없다 — null 로
+            // 두면 frameJob 의 path-null 게이트가 모든 프레임을 영구 드랍하므로 여기서 직접
+            // 태그한다: 멀티패스 armed 면 primary(path0)=Wi-Fi 소켓, 단일 폴백이면 OS default.
+            val selfClaimedPath = when {
+                migrationController?.isEnabled() == true -> null
+                moqPublisher.pathStats().isNotEmpty() -> NetworkPath.WIFI
+                else -> networkManager.activePath.value
+            }
             updateStatus {
                 it.copy(
                     deviceId = summary.deviceId,
                     broadcastPath = summary.broadcastPath,
                     publishState = PublishState.STREAMING,
                     streamActive = true,
-                    publishingPath = null
+                    publishingPath = selfClaimedPath
                 )
             }
             Log.i(
                 TAG,
-                "initial publishingPath left null; osDefault=${networkManager.activePath.value} " +
+                "initial publishingPath=$selfClaimedPath " +
+                    "claimBy=${if (selfClaimedPath == null) "controller" else "self(multipath)"} " +
+                    "osDefault=${networkManager.activePath.value} " +
                     "boundTarget=${migrationController?.boundTarget()}"
             )
             reportTelemetry(_status.value)

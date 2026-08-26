@@ -1,6 +1,6 @@
 # moq AAR 패치 + 빌드 파이프라인
 
-`app/libs/moq-rebind-stats-0.2.0.aar` 를 재현하는 전체 절차. 원본 소스는
+`app/libs/moq-rebind-stats-noq-0.2.0.aar` 를 재현하는 전체 절차. 원본 소스는
 [moq-dev/moq](https://github.com/moq-dev/moq) 태그 `moq-ffi-v0.2.0`
 (= Maven `dev.moq:moq:0.2.0` 과 동일 버전).
 
@@ -11,6 +11,8 @@
 | `moq-ffi-rebind.patch` | moq-ffi, moq-native | `MoqClient.rebind(addr)` 노출 — QUIC connection migration (Phase 1) |
 | `moq-send-stats.patch` | moq-lite, moq-ffi, Cargo.toml | `MoqSession.sendStats()` 노출 — 혼잡제어기 실측 송신 통계(estimated_send_rate/rtt/bytes_sent/packets_lost). 정체(tx stall) 판정용. Cargo.toml 의 `[patch.crates-io]` 포함 |
 | `web-transport-quinn-priority.patch` | vendor/web-transport-quinn | 우선순위 부호 반전 버그 수정 — 정체 시 최신 그룹 우선(newest-first)이라는 MoQ 설계가 quinn 의 higher-first 의미론과 만나 oldest-first FIFO 로 뒤집히는 문제 |
+| `moq-noq-backend.patch` | moq-native, moq-ffi, Cargo.toml | noq 백엔드 + 멀티패스 표면(이슈 #38) — noq rebind 패리티, `setBackend("quinn"/"noq")`, **DualUdpSocket**(learn-map, 경로=원격 포트) 및 `setMultipath/addPath/closePath/setPathBackup/pathStats` FFI, 옵트인 `noq_multipath` 설정, wtn vendor `[patch.crates-io]` 등록. 기본 동작은 여전히 quinn 단일 경로 |
+| `web-transport-noq-priority.patch` | vendor/web-transport-noq | wtq 와 동일한 우선순위 부호 반전 버그 수정 (noq 백엔드 경로용, `send.rs` 1줄) |
 
 ## 사전 준비 (이 머신 기준)
 
@@ -45,9 +47,13 @@ cd Client_Kotlin/external/moq   # 태그 moq-ffi-v0.2.0 checkout 상태
 # 0) 패치 적용 (이미 적용돼 있으면 생략)
 git apply ../../patches/moq-ffi-rebind.patch
 git apply ../../patches/moq-send-stats.patch
+git apply ../../patches/moq-noq-backend.patch
 REG=~/.cargo/registry/src/index.crates.io-*/web-transport-quinn-0.11.8
 mkdir -p vendor && cp -r $REG vendor/web-transport-quinn
 (cd vendor/web-transport-quinn && git apply ../../../../patches/web-transport-quinn-priority.patch)
+curl -sL -o /tmp/wtn.crate https://static.crates.io/crates/web-transport-noq/web-transport-noq-0.0.3.crate
+tar -xzf /tmp/wtn.crate -C vendor && mv vendor/web-transport-noq-0.0.3 vendor/web-transport-noq
+(cd vendor/web-transport-noq && git apply ../../../../patches/web-transport-noq-priority.patch)
 
 # 1) 환경 (git-bash)
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=rust-lld
@@ -83,7 +89,7 @@ cp external/moq/out-kt/uniffi/moq/moq.kt tools/moq-aar/src/main/java/uniffi/moq/
 cp external/moq/target/aarch64-linux-android/release/libmoq_ffi.so \
    tools/moq-aar/src/main/jniLibs/arm64-v8a/
 ./gradlew -p tools/moq-aar assembleRelease
-cp tools/moq-aar/build/outputs/aar/moq-aar-release.aar app/libs/moq-rebind-stats-0.2.0.aar
+cp tools/moq-aar/build/outputs/aar/moq-aar-release.aar app/libs/moq-rebind-stats-noq-0.2.0.aar
 ```
 
 ## 서버 relay (적용 완료 — 2026-06-10, Server_Springboot c0ed39d)
@@ -110,3 +116,55 @@ docker run --rm -v "$(pwd):/src" rust:1-bookworm bash -c \
 # 검증: --version 0.12.1 / --help 에 server-bind·tls-cert·tls-key·auth-public·log-level /
 #        동일 인자 스모크 기동 → Server_Springboot 리소스 교체 후 커밋 (deploy.yml 이 JAR 동봉·배포)
 ```
+
+### relay noq 멀티패스 단계 (이슈 #38 — 적용 준비 완료, 도커 빌드·배포 대기)
+
+위 0.12.1 워크트리(wtq 벤더 완료 상태) 기준으로 추가 적용:
+
+```bash
+cd Client_Kotlin/external/moq-relay-0.12.1
+
+# 1) noq 멀티패스 패치 (이중 리슨 --server-noq-second-bind + --server-noq-multipath + DualUdpSocket)
+git apply ../../patches/moq-relay-noq-multipath.patch
+
+# 2) wtn 벤더 + 우선순위 부호 반전 (quinn 벤더 패치와 동일 사유 — noq 경로용)
+curl -sL -o /tmp/wtn.crate https://static.crates.io/crates/web-transport-noq/web-transport-noq-0.0.3.crate
+tar -xzf /tmp/wtn.crate -C vendor && mv vendor/web-transport-noq-0.0.3 vendor/web-transport-noq
+(cd vendor/web-transport-noq && git apply ../../../../patches/web-transport-noq-priority.patch)
+printf 'web-transport-noq = { path = "vendor/web-transport-noq" }\n' >> Cargo.toml   # [patch.crates-io] 하단
+
+# 3) 리눅스 빌드 — noq feature 포함 (quinn 도 기본 포함되어 런타임 --server-backend 로 선택)
+docker run --rm -v "$(pwd):/src" rust:1-bookworm bash -c \
+  "apt-get update -qq && apt-get install -y -qq cmake && cp -r /src /build && cd /build && \
+   cargo build --release -p moq-relay --features noq && cp target/release/moq-relay /src/out-relay/"
+
+# 4) 배포 인자 (EmbeddedMoqRelay/Server_Springboot 측 — 멀티패스 활성 시):
+#    --server-backend noq --server-noq-multipath 4 --server-noq-second-bind "[::]:4444"
+#    + EC2 보안그룹 UDP 4444 오픈 필요. 인자 없이 기동하면 종전과 동일(quinn 단일 경로).
+```
+
+#### 대안: 도커 없이 WSL 에서 빌드 (2026-08-20 검증 — 정적 musl, glibc 무관)
+
+도커 엔진이 없거나 죽었을 때. sudo 불필요(전부 홈 디렉터리 설치):
+
+```bash
+# WSL Ubuntu 1회 준비
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+source ~/.cargo/env && rustup target add x86_64-unknown-linux-musl
+cd ~ && curl -sL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ && mv zig-linux-x86_64-0.13.0 zig
+curl -sL https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.0/cargo-zigbuild-x86_64-unknown-linux-musl.tar.xz | tar -xJ -C /tmp \
+  && cp /tmp/cargo-zigbuild-*/cargo-zigbuild ~/.cargo/bin/
+curl -sL https://github.com/Kitware/CMake/releases/download/v3.31.8/cmake-3.31.8-linux-x86_64.tar.gz | tar -xz && mv cmake-3.31.8-linux-x86_64 cmake
+
+# 빌드 (호스트에 gcc 가 없으므로 빌드스크립트 링커로 zigbuild 래퍼를 지정)
+export PATH="$HOME/zig:$HOME/cmake/bin:$HOME/.cargo/bin:$PATH"
+cd /mnt/c/.../Client_Kotlin/external/moq-relay-0.12.1
+cargo zigbuild --target x86_64-unknown-linux-gnu --target-dir ~/relay-target >/dev/null 2>&1 || true   # 래퍼 생성용
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=$(ls ~/.cache/cargo-zigbuild/*/wrappers/*/zigcc-x86_64-unknown-linux-gnu-*.sh | head -1)
+cargo zigbuild --release --target x86_64-unknown-linux-musl -p moq-relay --features noq --target-dir ~/relay-target
+# 산출물: ~/relay-target/x86_64-unknown-linux-musl/release/moq-relay (완전 정적 — ldd "not a dynamic executable")
+# 검증: --version 0.12.1 / --help 에 server-backend·server-noq-multipath·server-noq-second-bind
+```
+
+주의: 도커(bookworm·glibc 동적·aws-lc) 빌드와 달리 **musl 정적** 변종이다 — 기능 동일, 배포 호환성은 더 넓음.
+검증본: `out-relay/moq-relay-noq-musl` (기존 `out-relay/moq-relay` 앵커는 보존).

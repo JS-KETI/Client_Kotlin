@@ -19,13 +19,21 @@ import uniffi.moq.MoqSession
 
 private const val TAG = "MoqPublisherImpl"
 
+// 멀티패스(#38): 세션 확립 후 보조 경로 개설 재시도 — 셀룰러 라디오 웜업 지연 흡수.
+private const val MULTIPATH_ADD_PATH_TRIES = 3
+private const val MULTIPATH_ADD_PATH_RETRY_MS = 2_000L
+private const val DEFAULT_RELAY_PORT = 4443
+
 /**
  * Adapter: wraps moq-ffi UniFFI Kotlin bindings to the MoqPublisher port.
  *
  * Lifecycle: connect() prepares relay metadata, publishMedia() opens the MoQ session
  * after the H.264 init bytes are available, then writeFrame()* -> finish().
  */
-class MoqPublisherImpl : MoqPublisher {
+class MoqPublisherImpl(
+    // QUIC 백엔드: "quinn"(기본) | "noq". 멀티패스 전환 실험용 — connect 전 1회 적용.
+    private val quicBackend: String = "quinn",
+) : MoqPublisher {
 
     private val _txByteCounter = MutableStateFlow(0L)
     override val txByteCounter: StateFlow<Long> = _txByteCounter
@@ -34,6 +42,9 @@ class MoqPublisherImpl : MoqPublisher {
     override val sessionState: StateFlow<MoqSessionState> = _sessionState
 
     private var client: MoqClient? = null
+    private var multipathProvider: (() -> MultipathSockets)? = null
+    // 이번 connect 시도에서 멀티패스가 무장됐을 때의 보조 경로 원격 주소 ("IP:port").
+    private var multipathSecondaryAddr: String? = null
     private var session: MoqSession? = null
     private var origin: MoqOriginProducer? = null
     private var broadcast: MoqBroadcastProducer? = null
@@ -190,6 +201,77 @@ class MoqPublisherImpl : MoqPublisher {
         }
     }
 
+    override fun setMultipathProvider(provider: (() -> MultipathSockets)?) {
+        multipathProvider = provider
+        Log.i(TAG, "[multipath] provider ${if (provider != null) "armed" else "disarmed"}")
+    }
+
+    override suspend fun addPath(remote: String): Result<Long> =
+        runCatching {
+            val moqClient = checkNotNull(client) { "MoQ client is not connected" }
+            val t0 = System.nanoTime()
+            Log.i(TAG, "[addPath] ENTER remote=$remote")
+            val id = moqClient.addPath(remote).toLong()
+            val dtMs = (System.nanoTime() - t0) / 1_000_000
+            Log.i(TAG, "[addPath] OK remote=$remote id=$id dt=${dtMs}ms")
+            id
+        }.onFailure { e ->
+            Log.w(TAG, "[addPath] FAIL remote=$remote ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+    override fun closePath(pathId: Long): Result<Unit> =
+        runCatching {
+            val moqClient = checkNotNull(client) { "MoQ client is not connected" }
+            moqClient.closePath(pathId.toULong())
+            Log.i(TAG, "[closePath] OK id=$pathId")
+            Unit
+        }.onFailure { e ->
+            Log.w(TAG, "[closePath] FAIL id=$pathId ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+    override fun setPathBackup(pathId: Long, backup: Boolean): Result<Unit> =
+        runCatching {
+            val moqClient = checkNotNull(client) { "MoQ client is not connected" }
+            moqClient.setPathBackup(pathId.toULong(), backup)
+            Log.i(TAG, "[setPathBackup] OK id=$pathId backup=$backup")
+            Unit
+        }.onFailure { e ->
+            Log.w(TAG, "[setPathBackup] FAIL id=$pathId ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+    /**
+     * 멀티패스 활성 시 연결 단위 스탯(bytes_sent 등)이 경로별로 흩어져 0 에 수렴하는 문제 보정(#38):
+     * pathStats 합산으로 TransportSendStats 를 재구성한다. estimate 는 Σ(cwnd×8/rtt) 근사.
+     */
+    private fun aggregatedSendStats(): TransportSendStats? {
+        val paths = pathStats()
+        if (paths.isEmpty()) return null
+        val active = paths.filter { !it.backup }.ifEmpty { paths }
+        val estimate = active.sumOf { p -> if (p.rttMs > 0) p.cwnd * 8_000 / p.rttMs else 0L }
+        return TransportSendStats(
+            estimatedSendRateBps = estimate.takeIf { it > 0 },
+            rttMs = active.minOf { it.rttMs },
+            bytesSent = paths.sumOf { it.txBytes },
+            packetsLost = paths.sumOf { it.lostPackets },
+        )
+    }
+
+    override fun pathStats(): List<TransportPathStats> {
+        val current = client ?: return emptyList()
+        val stats = runCatching { current.pathStats() }.getOrNull() ?: return emptyList()
+        return stats.map {
+            TransportPathStats(
+                id = it.id.toLong(),
+                backup = it.backup,
+                rttMs = it.rttMs.toLong(),
+                txBytes = it.txBytes.toLong(),
+                rxBytes = it.rxBytes.toLong(),
+                lostPackets = it.lostPackets.toLong(),
+                cwnd = it.cwnd.toLong(),
+            )
+        }
+    }
+
     override suspend fun rebind(socketAddress: String): Result<Unit> =
         runCatching {
             val t0 = System.nanoTime()
@@ -244,6 +326,8 @@ class MoqPublisherImpl : MoqPublisher {
         }
 
     override fun transportSendStats(): TransportSendStats? {
+        // 멀티패스 활성 시 연결 단위 sendStats 가 0 에 수렴(#38 E2E 관측) → 경로 합산으로 대체.
+        aggregatedSendStats()?.let { return it }
         val current = session ?: return null
         val stats = runCatching { current.sendStats() }.getOrNull() ?: return null
         return TransportSendStats(
@@ -325,6 +409,26 @@ class MoqPublisherImpl : MoqPublisher {
                             "${e.javaClass.simpleName}: ${e.message} — proceeding with default TLS")
                     }
 
+                if (!quicBackend.equals("quinn", ignoreCase = true)) {
+                    attemptClient.setBackend(quicBackend)
+                    Log.i(TAG, "[connLoop] attempt=$attempt: QUIC backend=$quicBackend")
+                }
+
+                multipathSecondaryAddr = null
+                multipathProvider?.let { provider ->
+                    runCatching {
+                        val (primary, secondary) = resolveMultipathAddrs(relayUrl)
+                        val mp = provider()
+                        attemptClient.setMultipath(mp.wifiFd, mp.cellFd, primary, secondary)
+                        multipathSecondaryAddr = secondary
+                        Log.i(TAG, "[connLoop] attempt=$attempt: multipath armed " +
+                            "primary=$primary secondary=$secondary")
+                    }.onFailure { e ->
+                        Log.w(TAG, "[connLoop] attempt=$attempt: multipath arm FAIL " +
+                            "${e.javaClass.simpleName}: ${e.message} — falling back to single path")
+                    }
+                }
+
                 Log.d(TAG, "[connLoop] attempt=$attempt: setPublish(producer) …")
                 attemptClient.setPublish(producer)
                 Log.d(TAG, "[connLoop] attempt=$attempt: setPublish ok")
@@ -351,6 +455,30 @@ class MoqPublisherImpl : MoqPublisher {
                 firstPresentationTimeUs = null
                 _sessionState.value = MoqSessionState.CONNECTED
                 Log.i(TAG, "[connLoop] attempt=$attempt: session ESTABLISHED, awaiting closed() …")
+
+                // 멀티패스(#38): 세션 확립 직후 보조 경로 자동 개설. 실패해도 단일 경로로 지속.
+                multipathSecondaryAddr?.let { secondary ->
+                    publisherScope.launch {
+                        for (tryN in 1..MULTIPATH_ADD_PATH_TRIES) {
+                            if (connectionGeneration != generation || session !== established) return@launch
+                            val added = addPath(secondary)
+                            if (added.isSuccess) {
+                                // 보조 경로는 Backup 으로 운용(#38 E2E 관측): 두 경로가 동시에
+                                // Available 이면 noq 0.17 스케줄러가 비디오 스트림을 고RTT 경로에
+                                // 볼모로 잡아 정지시킨다. Backup 은 주 경로 사망 시에만 사용됨
+                                // ("used if there are no available paths") → 평시 단일경로 화질 +
+                                // 무중단 페일오버(G1)에 부합. 합산(G2)은 후속 연구로 분리.
+                                added.getOrNull()?.let { id ->
+                                    setPathBackup(id, backup = true)
+                                }
+                                return@launch
+                            }
+                            delay(MULTIPATH_ADD_PATH_RETRY_MS)
+                        }
+                        Log.w(TAG, "[addPath] giving up after $MULTIPATH_ADD_PATH_TRIES tries — " +
+                            "continuing on the primary path only")
+                    }
+                }
 
                 val tSession = System.nanoTime()
                 established.closed()
@@ -385,6 +513,21 @@ class MoqPublisherImpl : MoqPublisher {
             }
         }
         Log.i(TAG, "[connLoop] EXIT gen=$generation totalAttempts=$attempt")
+    }
+
+    /**
+     * relayUrl("https://host:4443/anon")에서 멀티패스 주/보조 원격 주소("IP:port")를 해석한다.
+     * 보조 포트 = 주 포트 + 1 (relay 이중 리슨 규약, #38). IO 디스패처에서만 호출(블로킹 DNS).
+     */
+    private fun resolveMultipathAddrs(relayUrl: String): Pair<String, String> {
+        val uri = java.net.URI(relayUrl)
+        val host = checkNotNull(uri.host) { "relayUrl has no host: $relayUrl" }
+        val primaryPort = if (uri.port > 0) uri.port else DEFAULT_RELAY_PORT
+        val ip = checkNotNull(java.net.InetAddress.getByName(host).hostAddress) {
+            "failed to resolve relay host: $host"
+        }
+        val fmt = { port: Int -> if (ip.contains(':')) "[$ip]:$port" else "$ip:$port" }
+        return fmt(primaryPort) to fmt(primaryPort + 1)
     }
 
     private fun dumpCauseChain(label: String, t: Throwable) {

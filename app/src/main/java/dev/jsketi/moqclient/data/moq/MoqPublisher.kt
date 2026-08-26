@@ -73,6 +73,34 @@ interface MoqPublisher {
      */
     fun transportSendStats(): TransportSendStats?
 
+    /**
+     * Arm dual-path (multipath) mode. The provider runs on every connect attempt to create two
+     * fresh pre-bound socket fds (wifiFd = primary path, cellFd = secondary) — fds are consumed
+     * by native code and cannot be reused across attempts. The publisher resolves the relay's
+     * primary/secondary addresses from the relay URL (secondary = primary port + 1) and opens
+     * the secondary path automatically after the session is established. Implies the noq backend.
+     * Pass null to disarm (single path). Must be armed before connect().
+     */
+    fun setMultipathProvider(provider: (() -> MultipathSockets)?)
+
+    /**
+     * Open an additional multipath path to remote ("IP:port", e.g. the relay's secondary port).
+     * Returns a path handle; 0 always refers to the primary path.
+     */
+    suspend fun addPath(remote: String): Result<Long>
+
+    /**
+     * Abandon a path — in-flight data is retransmitted on the remaining paths immediately.
+     * Use for dead paths (Wi-Fi loss); for cost-saving demotion use [setPathBackup] instead.
+     */
+    fun closePath(pathId: Long): Result<Unit>
+
+    /** Demote a live path to backup (kept alive, not scheduled) or promote it back. */
+    fun setPathBackup(pathId: Long, backup: Boolean): Result<Unit>
+
+    /** Per-path transport statistics. Empty when multipath is not active. */
+    fun pathStats(): List<TransportPathStats>
+
     /** Finish the broadcast and close the MoQ session cleanly. */
     suspend fun finish()
 }

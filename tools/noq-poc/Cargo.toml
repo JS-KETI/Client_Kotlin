@@ -1,0 +1,20 @@
+[package]
+name = "noq-poc"
+version = "0.1.0"
+edition = "2021"
+
+# P1-1 리눅스 PoC — noq 0.17.0 멀티패스 2경로 실측 (이슈 #38)
+# 클라이언트 AAR 락파일과 동일한 noq 버전으로 고정한다.
+
+[dependencies]
+noq = { version = "=0.17.0", default-features = false, features = ["runtime-tokio", "rustls-ring", "platform-verifier"] }
+# noq 0.17 루트가 PathStatus 를 재노출하지 않아(공백 API) proto 를 직접 의존한다.
+noq-proto = { version = "=0.16.0", default-features = false }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+panic = "abort"
