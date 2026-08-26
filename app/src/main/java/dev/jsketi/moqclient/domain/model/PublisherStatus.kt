@@ -11,6 +11,8 @@ data class PublisherStatus(
     // Network the active MoQ session is publishing over. Distinct from NetworkManager.activePath
     // (the OS default network), which is not necessarily the publishing path. Null when not publishing.
     val publishingPath: NetworkPath? = null,
+    // 멀티패스 송출 중 경로별 송신 분담(#48). 미가동(단일/레거시)이면 빈 목록.
+    val pathShares: List<PathShare> = emptyList(),
     val txBps: Long = 0L,
     // 송신 정체 여부 — RSSI 는 괜찮아도 간섭/throughput 붕괴로 실제 전송이 막힌 경우를 잡는다.
     // runMetricsLoop 가 QUIC 실측치(estimated send rate + bytesSent 기반 egress)로 판정하고,
