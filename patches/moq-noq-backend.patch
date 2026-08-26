@@ -24,10 +24,10 @@ index d04ff8f9..d287c4d4 100644
  tokio = { workspace = true, features = ["macros"] }
  tracing = "0.1"
 diff --git a/rs/moq-ffi/src/session.rs b/rs/moq-ffi/src/session.rs
-index e7210d20..02777420 100644
+index e7210d20..d42ac248 100644
 --- a/rs/moq-ffi/src/session.rs
 +++ b/rs/moq-ffi/src/session.rs
-@@ -11,10 +11,14 @@ struct Client {
+@@ -11,31 +11,144 @@ struct Client {
  	config: moq_native::ClientConfig,
  	publish: Option<Arc<MoqOriginProducer>>,
  	consume: Option<Arc<MoqOriginProducer>>,
@@ -39,11 +39,22 @@ index e7210d20..02777420 100644
  
  impl Client {
 -	async fn connect(&self, url: Url) -> Result<Arc<MoqSession>, MoqError> {
+-		let client = self
+-			.config
+-			.clone()
 +	async fn connect(&mut self, url: Url) -> Result<Arc<MoqSession>, MoqError> {
- 		let client = self
- 			.config
- 			.clone()
-@@ -24,18 +28,115 @@ impl Client {
++		let dual = self.dual.take();
++		let mut config = self.config.clone();
++		if dual.is_none() {
++			// Multipath is only sound with the dual socket installed. A plain wildcard
++			// socket negotiating multipath changes source address on a network
++			// transition, which multipath peers treat as an unknown path (issue #42).
++			config.noq_multipath = None;
++		}
++		let client = config
+ 			.init()
+ 			.map_err(|err| MoqError::Connect(format!("{err}")))?;
+ 
  		let publish = self.publish.as_ref().map(|o| o.inner().consume());
  		let consume = self.consume.as_ref().map(|o| o.inner().clone());
  
@@ -53,10 +64,16 @@ index e7210d20..02777420 100644
 -			.with_consume(consume)
 +			.with_consume(consume);
 +
-+		if let Some((a, b, seed)) = self.dual.take() {
++		if let Some((a, b, seed)) = dual {
 +			client
 +				.noq_install_dual_socket(a, b, &seed)
 +				.map_err(|err| MoqError::Connect(format!("dual socket: {err}")))?;
++		} else if matches!(self.config.backend, Some(moq_native::QuicBackend::Noq)) {
++			// Single-path noq fallback: transient send errors during an Android network
++			// transition must read as loss, not connection death (issue #42).
++			client
++				.noq_install_resilient_socket()
++				.map_err(|err| MoqError::Connect(format!("resilient socket: {err}")))?;
 +		}
 +
 +		let session = client
@@ -161,7 +178,7 @@ index e7210d20..02777420 100644
  }
  
  #[derive(uniffi::Object)]
-@@ -54,6 +155,8 @@ impl MoqClient {
+@@ -54,6 +167,8 @@ impl MoqClient {
  				config: moq_native::ClientConfig::default(),
  				publish: None,
  				consume: None,
@@ -170,7 +187,7 @@ index e7210d20..02777420 100644
  			}),
  		})
  	}
-@@ -65,6 +168,20 @@ impl MoqClient {
+@@ -65,6 +180,20 @@ impl MoqClient {
  		}
  	}
  
@@ -191,7 +208,7 @@ index e7210d20..02777420 100644
  	/// Set the origin to publish local broadcasts to the remote.
  	pub fn set_publish(&self, origin: Option<Arc<MoqOriginProducer>>) {
  		if let Some(mut state) = self.task.lock() {
-@@ -85,7 +202,95 @@ impl MoqClient {
+@@ -85,7 +214,95 @@ impl MoqClient {
  	pub async fn connect(&self, url: String) -> Result<Arc<MoqSession>, MoqError> {
  		let url = Url::parse(&url)?;
  
@@ -288,7 +305,7 @@ index e7210d20..02777420 100644
  	}
  
  	/// Cancel all current and future `connect()` calls.
-@@ -94,6 +299,40 @@ impl MoqClient {
+@@ -94,6 +311,40 @@ impl MoqClient {
  	}
  }
  
@@ -329,7 +346,7 @@ index e7210d20..02777420 100644
  #[derive(uniffi::Object)]
  pub struct MoqSession {
  	inner: Option<moq_lite::Session>,
-@@ -126,4 +365,18 @@ impl MoqSession {
+@@ -126,4 +377,18 @@ impl MoqSession {
  		// NOTE: we don't abort the closed Task because it will be aborted via above ^
  		// We'll get a slightly better error message instead of Cancelled.
  	}
@@ -371,7 +388,7 @@ index f37ee862..dea4ced9 100644
  web-transport-quiche = { workspace = true, optional = true }
  web-transport-quinn = { workspace = true, optional = true }
 diff --git a/rs/moq-native/src/client.rs b/rs/moq-native/src/client.rs
-index 01951a49..1c9b3e2d 100644
+index 01951a49..464ab225 100644
 --- a/rs/moq-native/src/client.rs
 +++ b/rs/moq-native/src/client.rs
 @@ -53,6 +53,12 @@ pub struct ClientConfig {
@@ -395,7 +412,7 @@ index 01951a49..1c9b3e2d 100644
  			max_streams: None,
  			version: Vec::new(),
  			tls: ClientTls::default(),
-@@ -274,6 +281,64 @@ impl Client {
+@@ -274,6 +281,73 @@ impl Client {
  		self
  	}
  
@@ -430,6 +447,15 @@ index 01951a49..1c9b3e2d 100644
 +			.install_dual_socket(a, b, seed)
 +	}
 +
++	/// Isolate socket send errors on a single-path noq connection (issue #42). Call before connect.
++	#[cfg(feature = "noq")]
++	pub fn noq_install_resilient_socket(&self) -> anyhow::Result<()> {
++		self.noq
++			.as_ref()
++			.context("noq backend not active")?
++			.install_resilient_socket()
++	}
++
 +	/// Open an additional multipath path to `remote`. Returns a path handle (0 = primary).
 +	#[cfg(feature = "noq")]
 +	pub async fn noq_open_path(&self, remote: net::SocketAddr) -> anyhow::Result<u64> {
@@ -462,10 +488,10 @@ index 01951a49..1c9b3e2d 100644
  		anyhow::bail!("no QUIC backend compiled; enable noq, quinn, quiche, or iroh feature");
 diff --git a/rs/moq-native/src/dual_socket.rs b/rs/moq-native/src/dual_socket.rs
 new file mode 100644
-index 00000000..898e8cd8
+index 00000000..1a17fd8e
 --- /dev/null
 +++ b/rs/moq-native/src/dual_socket.rs
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,291 @@
 +//! Dual-socket adapter for noq multipath (issue #38).
 +//!
 +//! Wraps two runtime-provided [`AsyncUdpSocket`]s as one endpoint socket.
@@ -482,6 +508,14 @@ index 00000000..898e8cd8
 +//! rewrites remote addresses to their IPv6-mapped form (`ensure_ipv6`), so an
 +//! un-normalized V4 seed key would never match `Transmit.destination` and all
 +//! datagrams would silently egress socket A.
++//!
++//! Fault isolation (issue #42): the noq connection driver treats ANY socket
++//! I/O error as fatal. One socket dying (Android tears its Network down along
++//! with sockets bound to it) must not kill the connection while the other
++//! socket still works — send errors are reported as success (the datagram is
++//! dropped, which QUIC treats as loss until the path policy abandons the
++//! path), and a socket whose recv errors is marked dead and skipped; only
++//! when both sockets are dead is the error propagated.
 +
 +use std::collections::HashMap;
 +use std::fmt;
@@ -489,6 +523,7 @@ index 00000000..898e8cd8
 +use std::net::{SocketAddr, SocketAddrV6};
 +use std::num::NonZeroUsize;
 +use std::pin::Pin;
++use std::sync::atomic::{AtomicU32, Ordering};
 +use std::sync::{Arc, Mutex};
 +use std::task::{Context, Poll};
 +
@@ -508,10 +543,23 @@ index 00000000..898e8cd8
 +	}
 +}
 +
++/// Report a send error as a dropped datagram instead of propagating it: the
++/// connection driver treats any send error as fatal, while loss is recovered
++/// by QUIC and a dead path is abandoned by the path policy.
++fn swallow_send_error(err: io::Error, err_count: &AtomicU32, label: &str) -> Poll<io::Result<()>> {
++	let n = err_count.fetch_add(1, Ordering::Relaxed);
++	if n < 3 || n % 256 == 0 {
++		tracing::warn!(socket = label, count = n + 1, "send error; dropping datagram: {err}");
++	}
++	Poll::Ready(Ok(()))
++}
++
 +pub struct DualUdpSocket {
 +	a: Box<dyn AsyncUdpSocket>,
 +	b: Box<dyn AsyncUdpSocket>,
 +	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
++	a_dead: bool,
++	b_dead: bool,
 +}
 +
 +impl fmt::Debug for DualUdpSocket {
@@ -532,7 +580,7 @@ index 00000000..898e8cd8
 +		let route = Arc::new(Mutex::new(
 +			seed.iter().map(|&(addr, idx)| (canon(addr), idx)).collect::<HashMap<_, _>>(),
 +		));
-+		Self { a, b, route }
++		Self { a, b, route, a_dead: false, b_dead: false }
 +	}
 +}
 +
@@ -542,6 +590,7 @@ index 00000000..898e8cd8
 +			a: self.a.create_sender(),
 +			b: self.b.create_sender(),
 +			route: self.route.clone(),
++			err_count: AtomicU32::new(0),
 +		})
 +	}
 +
@@ -551,28 +600,45 @@ index 00000000..898e8cd8
 +		bufs: &mut [IoSliceMut<'_>],
 +		meta: &mut [RecvMeta],
 +	) -> Poll<io::Result<usize>> {
-+		match self.a.poll_recv(cx, bufs, meta) {
-+			Poll::Ready(Ok(n)) => {
-+				let mut r = self.route.lock().unwrap();
-+				for m in meta.iter().take(n) {
-+					r.insert(canon(m.addr), 0);
++		if !self.a_dead {
++			match self.a.poll_recv(cx, bufs, meta) {
++				Poll::Ready(Ok(n)) => {
++					let mut r = self.route.lock().unwrap();
++					for m in meta.iter().take(n) {
++						r.insert(canon(m.addr), 0);
++					}
++					return Poll::Ready(Ok(n));
 +				}
-+				return Poll::Ready(Ok(n));
-+			}
-+			Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-+			Poll::Pending => {}
-+		}
-+		match self.b.poll_recv(cx, bufs, meta) {
-+			Poll::Ready(Ok(n)) => {
-+				let mut r = self.route.lock().unwrap();
-+				for m in meta.iter().take(n) {
-+					r.insert(canon(m.addr), 1);
++				Poll::Ready(Err(e)) => {
++					tracing::warn!("dual socket A recv error; marking dead: {e}");
++					self.a_dead = true;
 +				}
-+				Poll::Ready(Ok(n))
++				Poll::Pending => {}
 +			}
-+			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-+			Poll::Pending => Poll::Pending,
 +		}
++		if !self.b_dead {
++			match self.b.poll_recv(cx, bufs, meta) {
++				Poll::Ready(Ok(n)) => {
++					let mut r = self.route.lock().unwrap();
++					for m in meta.iter().take(n) {
++						r.insert(canon(m.addr), 1);
++					}
++					return Poll::Ready(Ok(n));
++				}
++				Poll::Ready(Err(e)) => {
++					tracing::warn!("dual socket B recv error; marking dead: {e}");
++					self.b_dead = true;
++				}
++				Poll::Pending => {}
++			}
++		}
++		if self.a_dead && self.b_dead {
++			return Poll::Ready(Err(io::Error::new(
++				io::ErrorKind::NotConnected,
++				"both sockets dead",
++			)));
++		}
++		Poll::Pending
 +	}
 +
 +	fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -592,6 +658,7 @@ index 00000000..898e8cd8
 +	a: Pin<Box<dyn UdpSender>>,
 +	b: Pin<Box<dyn UdpSender>>,
 +	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
++	err_count: AtomicU32,
 +}
 +
 +impl fmt::Debug for DualSender {
@@ -614,10 +681,16 @@ index 00000000..898e8cd8
 +			.get(&canon(transmit.destination))
 +			.copied()
 +			.unwrap_or(0);
-+		if idx == 0 {
++		let res = if idx == 0 {
 +			this.a.as_mut().poll_send(transmit, cx)
 +		} else {
 +			this.b.as_mut().poll_send(transmit, cx)
++		};
++		match res {
++			Poll::Ready(Err(e)) => {
++				swallow_send_error(e, &this.err_count, if idx == 0 { "A" } else { "B" })
++			}
++			other => other,
 +		}
 +	}
 +
@@ -627,6 +700,89 @@ index 00000000..898e8cd8
 +}
 +
 +impl Unpin for DualSender {}
++
++/// Single-socket wrapper with the same send-error isolation as
++/// [`DualUdpSocket`], for the noq single-path fallback (no dual socket
++/// armed): transient send errors during an Android network transition must
++/// read as loss, not connection death.
++pub struct ResilientUdpSocket {
++	inner: Box<dyn AsyncUdpSocket>,
++}
++
++impl ResilientUdpSocket {
++	pub fn new(inner: Box<dyn AsyncUdpSocket>) -> Self {
++		Self { inner }
++	}
++}
++
++impl fmt::Debug for ResilientUdpSocket {
++	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++		f.debug_struct("ResilientUdpSocket")
++			.field("inner", &self.inner.local_addr().ok())
++			.finish()
++	}
++}
++
++impl AsyncUdpSocket for ResilientUdpSocket {
++	fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
++		Box::pin(ResilientSender {
++			inner: self.inner.create_sender(),
++			err_count: AtomicU32::new(0),
++		})
++	}
++
++	fn poll_recv(
++		&mut self,
++		cx: &mut Context<'_>,
++		bufs: &mut [IoSliceMut<'_>],
++		meta: &mut [RecvMeta],
++	) -> Poll<io::Result<usize>> {
++		self.inner.poll_recv(cx, bufs, meta)
++	}
++
++	fn local_addr(&self) -> io::Result<SocketAddr> {
++		self.inner.local_addr()
++	}
++
++	fn max_receive_segments(&self) -> NonZeroUsize {
++		self.inner.max_receive_segments()
++	}
++
++	fn may_fragment(&self) -> bool {
++		self.inner.may_fragment()
++	}
++}
++
++struct ResilientSender {
++	inner: Pin<Box<dyn UdpSender>>,
++	err_count: AtomicU32,
++}
++
++impl fmt::Debug for ResilientSender {
++	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++		f.write_str("ResilientSender")
++	}
++}
++
++impl UdpSender for ResilientSender {
++	fn poll_send(
++		self: Pin<&mut Self>,
++		transmit: &Transmit<'_>,
++		cx: &mut Context<'_>,
++	) -> Poll<io::Result<()>> {
++		let this = self.get_mut();
++		match this.inner.as_mut().poll_send(transmit, cx) {
++			Poll::Ready(Err(e)) => swallow_send_error(e, &this.err_count, "single"),
++			other => other,
++		}
++	}
++
++	fn max_transmit_segments(&self) -> NonZeroUsize {
++		self.inner.max_transmit_segments()
++	}
++}
++
++impl Unpin for ResilientSender {}
 diff --git a/rs/moq-native/src/lib.rs b/rs/moq-native/src/lib.rs
 index 57df6c12..015bd7c8 100644
 --- a/rs/moq-native/src/lib.rs
@@ -641,7 +797,7 @@ index 57df6c12..015bd7c8 100644
  #[cfg(feature = "noq")]
  mod noq;
 diff --git a/rs/moq-native/src/noq.rs b/rs/moq-native/src/noq.rs
-index 865d0b19..74fc1492 100644
+index 865d0b19..1ed475b3 100644
 --- a/rs/moq-native/src/noq.rs
 +++ b/rs/moq-native/src/noq.rs
 @@ -2,13 +2,36 @@ use crate::client::ClientConfig;
@@ -703,7 +859,7 @@ index 865d0b19..74fc1492 100644
  		let max_streams = config.max_streams.unwrap_or(crate::DEFAULT_MAX_STREAMS);
  		let max_streams = noq::VarInt::from_u64(max_streams).unwrap_or(noq::VarInt::MAX);
  		transport.max_concurrent_bidi_streams(max_streams);
-@@ -46,9 +76,118 @@ impl NoqClient {
+@@ -46,9 +76,144 @@ impl NoqClient {
  			quic,
  			transport,
  			versions: config.versions(),
@@ -728,6 +884,21 @@ index 865d0b19..74fc1492 100644
 +			.context("failed to install dual socket")
 +	}
 +
++	/// Swap the endpoint socket for [`crate::dual_socket::ResilientUdpSocket`] (single-path
++	/// fallback, issue #42). The connection driver treats any send error as fatal, so
++	/// transient send errors during a network transition must be isolated here too.
++	pub fn install_resilient_socket(&self) -> anyhow::Result<()> {
++		let socket = std::net::UdpSocket::bind("[::]:0")
++			.or_else(|_| std::net::UdpSocket::bind("0.0.0.0:0"))
++			.context("failed to bind UDP socket")?;
++		let runtime = noq::default_runtime().context("no async runtime")?;
++		let socket = runtime.wrap_udp_socket(socket).context("wrap socket")?;
++		let single = crate::dual_socket::ResilientUdpSocket::new(socket);
++		self.quic
++			.rebind_abstract(Box::new(single))
++			.context("failed to install resilient socket")
++	}
++
 +	/// Open an additional path to `remote` (multipath must be negotiated).
 +	/// Returns an FFI-visible path handle (>= 1; 0 is the primary path).
 +	pub async fn open_path(&self, remote: net::SocketAddr) -> anyhow::Result<u64> {
@@ -750,6 +921,17 @@ index 865d0b19..74fc1492 100644
 +
 +	/// Abandon a path. In-flight data is retransmitted on the remaining paths.
 +	pub fn close_path(&self, id: u64) -> anyhow::Result<()> {
++		if id == 0 {
++			let conn = self
++				.multipath
++				.conn
++				.lock()
++				.unwrap()
++				.clone()
++				.context("no active connection")?;
++			let path = conn.path(noq::PathId::ZERO).context("primary path unavailable")?;
++			return path.close().map_err(|e| anyhow::anyhow!("close_path: {e}"));
++		}
 +		let entry = self.multipath.paths.lock().unwrap().remove(&id);
 +		match entry {
 +			Some((path, _)) => path.close().map_err(|e| anyhow::anyhow!("close_path: {e}")),
@@ -822,7 +1004,7 @@ index 865d0b19..74fc1492 100644
  	pub async fn connect(&self, tls: &rustls::ClientConfig, url: Url) -> anyhow::Result<web_transport_noq::Session> {
  		let mut url = url;
  		let mut config = tls.clone();
-@@ -110,6 +249,7 @@ impl NoqClient {
+@@ -110,6 +275,7 @@ impl NoqClient {
  
  		let connection = self.quic.connect_with(config, ip, &host)?.await?;
  		tracing::Span::current().record("id", connection.stable_id());
@@ -830,7 +1012,7 @@ index 865d0b19..74fc1492 100644
  
  		let mut request = web_transport_noq::proto::ConnectRequest::new(url.clone());
  		for alpn in self.versions.alpns() {
-@@ -136,6 +276,10 @@ impl NoqClient {
+@@ -136,6 +302,10 @@ impl NoqClient {
  
  		Ok(session)
  	}
