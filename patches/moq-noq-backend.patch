@@ -24,10 +24,10 @@ index d04ff8f9..d287c4d4 100644
  tokio = { workspace = true, features = ["macros"] }
  tracing = "0.1"
 diff --git a/rs/moq-ffi/src/session.rs b/rs/moq-ffi/src/session.rs
-index e7210d20..d42ac248 100644
+index e7210d20..514eb63d 100644
 --- a/rs/moq-ffi/src/session.rs
 +++ b/rs/moq-ffi/src/session.rs
-@@ -11,31 +11,144 @@ struct Client {
+@@ -11,31 +11,171 @@ struct Client {
  	config: moq_native::ClientConfig,
  	publish: Option<Arc<MoqOriginProducer>>,
  	consume: Option<Arc<MoqOriginProducer>>,
@@ -35,6 +35,10 @@ index e7210d20..d42ac248 100644
 +	// Multipath (issue #38): two pre-bound sockets (Wi-Fi / cellular) + remote→socket seed,
 +	// installed on the noq endpoint right before connect.
 +	dual: Option<(std::net::UdpSocket, std::net::UdpSocket, Vec<(std::net::SocketAddr, u8)>)>,
++	// Single-path fallback pin (issue #44): a pre-bound socket that fixes the connection's
++	// source network. A wildcard socket changes source address when the OS default network
++	// flips, and noq's classic migration stalls the connection.
++	single: Option<std::net::UdpSocket>,
  }
  
  impl Client {
@@ -70,9 +74,10 @@ index e7210d20..d42ac248 100644
 +				.map_err(|err| MoqError::Connect(format!("dual socket: {err}")))?;
 +		} else if matches!(self.config.backend, Some(moq_native::QuicBackend::Noq)) {
 +			// Single-path noq fallback: transient send errors during an Android network
-+			// transition must read as loss, not connection death (issue #42).
++			// transition must read as loss, not connection death (issue #42). A pre-bound
++			// socket additionally pins the source network (issue #44).
 +			client
-+				.noq_install_resilient_socket()
++				.noq_install_resilient_socket(self.single.take())
 +				.map_err(|err| MoqError::Connect(format!("resilient socket: {err}")))?;
 +		}
 +
@@ -166,6 +171,28 @@ index e7210d20..d42ac248 100644
 +		)))
 +	}
 +
++	#[cfg(target_family = "unix")]
++	fn set_bound_socket(&mut self, fd: i32) -> Result<(), MoqError> {
++		use std::os::fd::FromRawFd;
++
++		if fd < 0 {
++			return Err(MoqError::Connect(format!("setBoundSocket: invalid fd: {fd}")));
++		}
++
++		// Takes ownership of a dup fd supplied by Android/Kotlin. The caller must not close it.
++		let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
++		self.config.backend = Some(moq_native::QuicBackend::Noq);
++		self.single = Some(socket);
++		Ok(())
++	}
++
++	#[cfg(not(target_family = "unix"))]
++	fn set_bound_socket(&mut self, fd: i32) -> Result<(), MoqError> {
++		Err(MoqError::Connect(format!(
++			"setBoundSocket: fd-based sockets unsupported on this target (fd={fd})"
++		)))
++	}
++
 +	fn rebind_socket(&self, socket: std::net::UdpSocket) -> Result<(), MoqError> {
 +		let native = self
 +			.native
@@ -178,16 +205,17 @@ index e7210d20..d42ac248 100644
  }
  
  #[derive(uniffi::Object)]
-@@ -54,6 +167,8 @@ impl MoqClient {
+@@ -54,6 +194,9 @@ impl MoqClient {
  				config: moq_native::ClientConfig::default(),
  				publish: None,
  				consume: None,
 +				native: None,
 +				dual: None,
++				single: None,
  			}),
  		})
  	}
-@@ -65,6 +180,20 @@ impl MoqClient {
+@@ -65,6 +208,20 @@ impl MoqClient {
  		}
  	}
  
@@ -208,7 +236,7 @@ index e7210d20..d42ac248 100644
  	/// Set the origin to publish local broadcasts to the remote.
  	pub fn set_publish(&self, origin: Option<Arc<MoqOriginProducer>>) {
  		if let Some(mut state) = self.task.lock() {
-@@ -85,7 +214,95 @@ impl MoqClient {
+@@ -85,7 +242,105 @@ impl MoqClient {
  	pub async fn connect(&self, url: String) -> Result<Arc<MoqSession>, MoqError> {
  		let url = Url::parse(&url)?;
  
@@ -243,6 +271,16 @@ index e7210d20..d42ac248 100644
 +		let _guard = crate::ffi::RUNTIME.enter();
 +		let mut state = self.task.lock().ok_or(MoqError::Cancelled)?;
 +		state.set_multipath(fd_a, fd_b, primary, secondary)
++	}
++
++	/// Pin the single-path (fallback) connection to an already-bound UDP socket fd (issue #44).
++	/// Implies the noq backend. Must be called before `connect()`. Without this the fallback
++	/// uses a wildcard socket whose source address follows the OS default network — and noq's
++	/// classic migration stalls the connection when that flips.
++	pub fn set_bound_socket(&self, fd: i32) -> Result<(), MoqError> {
++		let _guard = crate::ffi::RUNTIME.enter();
++		let mut state = self.task.lock().ok_or(MoqError::Cancelled)?;
++		state.set_bound_socket(fd)
 +	}
 +
 +	/// Open an additional multipath path to `remote` ("IP:port").
@@ -305,7 +343,7 @@ index e7210d20..d42ac248 100644
  	}
  
  	/// Cancel all current and future `connect()` calls.
-@@ -94,6 +311,40 @@ impl MoqClient {
+@@ -94,6 +349,40 @@ impl MoqClient {
  	}
  }
  
@@ -346,7 +384,7 @@ index e7210d20..d42ac248 100644
  #[derive(uniffi::Object)]
  pub struct MoqSession {
  	inner: Option<moq_lite::Session>,
-@@ -126,4 +377,18 @@ impl MoqSession {
+@@ -126,4 +415,18 @@ impl MoqSession {
  		// NOTE: we don't abort the closed Task because it will be aborted via above ^
  		// We'll get a slightly better error message instead of Cancelled.
  	}
@@ -388,7 +426,7 @@ index f37ee862..dea4ced9 100644
  web-transport-quiche = { workspace = true, optional = true }
  web-transport-quinn = { workspace = true, optional = true }
 diff --git a/rs/moq-native/src/client.rs b/rs/moq-native/src/client.rs
-index 01951a49..464ab225 100644
+index 01951a49..05010746 100644
 --- a/rs/moq-native/src/client.rs
 +++ b/rs/moq-native/src/client.rs
 @@ -53,6 +53,12 @@ pub struct ClientConfig {
@@ -412,7 +450,7 @@ index 01951a49..464ab225 100644
  			max_streams: None,
  			version: Vec::new(),
  			tls: ClientTls::default(),
-@@ -274,6 +281,73 @@ impl Client {
+@@ -274,6 +281,74 @@ impl Client {
  		self
  	}
  
@@ -447,13 +485,14 @@ index 01951a49..464ab225 100644
 +			.install_dual_socket(a, b, seed)
 +	}
 +
-+	/// Isolate socket send errors on a single-path noq connection (issue #42). Call before connect.
++	/// Isolate socket send errors on a single-path noq connection (issue #42); a pre-bound
++	/// `socket` additionally pins the source network (issue #44). Call before connect.
 +	#[cfg(feature = "noq")]
-+	pub fn noq_install_resilient_socket(&self) -> anyhow::Result<()> {
++	pub fn noq_install_resilient_socket(&self, socket: Option<net::UdpSocket>) -> anyhow::Result<()> {
 +		self.noq
 +			.as_ref()
 +			.context("noq backend not active")?
-+			.install_resilient_socket()
++			.install_resilient_socket(socket)
 +	}
 +
 +	/// Open an additional multipath path to `remote`. Returns a path handle (0 = primary).
@@ -797,7 +836,7 @@ index 57df6c12..015bd7c8 100644
  #[cfg(feature = "noq")]
  mod noq;
 diff --git a/rs/moq-native/src/noq.rs b/rs/moq-native/src/noq.rs
-index 865d0b19..1ed475b3 100644
+index 865d0b19..454fd224 100644
 --- a/rs/moq-native/src/noq.rs
 +++ b/rs/moq-native/src/noq.rs
 @@ -2,13 +2,36 @@ use crate::client::ClientConfig;
@@ -859,7 +898,7 @@ index 865d0b19..1ed475b3 100644
  		let max_streams = config.max_streams.unwrap_or(crate::DEFAULT_MAX_STREAMS);
  		let max_streams = noq::VarInt::from_u64(max_streams).unwrap_or(noq::VarInt::MAX);
  		transport.max_concurrent_bidi_streams(max_streams);
-@@ -46,9 +76,144 @@ impl NoqClient {
+@@ -46,9 +76,150 @@ impl NoqClient {
  			quic,
  			transport,
  			versions: config.versions(),
@@ -887,10 +926,16 @@ index 865d0b19..1ed475b3 100644
 +	/// Swap the endpoint socket for [`crate::dual_socket::ResilientUdpSocket`] (single-path
 +	/// fallback, issue #42). The connection driver treats any send error as fatal, so
 +	/// transient send errors during a network transition must be isolated here too.
-+	pub fn install_resilient_socket(&self) -> anyhow::Result<()> {
-+		let socket = std::net::UdpSocket::bind("[::]:0")
-+			.or_else(|_| std::net::UdpSocket::bind("0.0.0.0:0"))
-+			.context("failed to bind UDP socket")?;
++	/// A pre-bound `socket` pins the connection's source network (issue #44): a wildcard
++	/// socket changes source address when the OS default network flips, and noq's classic
++	/// migration stalls the connection.
++	pub fn install_resilient_socket(&self, socket: Option<std::net::UdpSocket>) -> anyhow::Result<()> {
++		let socket = match socket {
++			Some(socket) => socket,
++			None => std::net::UdpSocket::bind("[::]:0")
++				.or_else(|_| std::net::UdpSocket::bind("0.0.0.0:0"))
++				.context("failed to bind UDP socket")?,
++		};
 +		let runtime = noq::default_runtime().context("no async runtime")?;
 +		let socket = runtime.wrap_udp_socket(socket).context("wrap socket")?;
 +		let single = crate::dual_socket::ResilientUdpSocket::new(socket);
@@ -1004,7 +1049,7 @@ index 865d0b19..1ed475b3 100644
  	pub async fn connect(&self, tls: &rustls::ClientConfig, url: Url) -> anyhow::Result<web_transport_noq::Session> {
  		let mut url = url;
  		let mut config = tls.clone();
-@@ -110,6 +275,7 @@ impl NoqClient {
+@@ -110,6 +281,7 @@ impl NoqClient {
  
  		let connection = self.quic.connect_with(config, ip, &host)?.await?;
  		tracing::Span::current().record("id", connection.stable_id());
@@ -1012,7 +1057,7 @@ index 865d0b19..1ed475b3 100644
  
  		let mut request = web_transport_noq::proto::ConnectRequest::new(url.clone());
  		for alpn in self.versions.alpns() {
-@@ -136,6 +302,10 @@ impl NoqClient {
+@@ -136,6 +308,10 @@ impl NoqClient {
  
  		Ok(session)
  	}
