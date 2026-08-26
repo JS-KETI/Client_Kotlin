@@ -239,6 +239,23 @@ class MoqPublisherImpl(
             Log.w(TAG, "[setPathBackup] FAIL id=$pathId ${e.javaClass.simpleName}: ${e.message}")
         }
 
+    /**
+     * 멀티패스 활성 시 연결 단위 스탯(bytes_sent 등)이 경로별로 흩어져 0 에 수렴하는 문제 보정(#38):
+     * pathStats 합산으로 TransportSendStats 를 재구성한다. estimate 는 Σ(cwnd×8/rtt) 근사.
+     */
+    private fun aggregatedSendStats(): TransportSendStats? {
+        val paths = pathStats()
+        if (paths.isEmpty()) return null
+        val active = paths.filter { !it.backup }.ifEmpty { paths }
+        val estimate = active.sumOf { p -> if (p.rttMs > 0) p.cwnd * 8_000 / p.rttMs else 0L }
+        return TransportSendStats(
+            estimatedSendRateBps = estimate.takeIf { it > 0 },
+            rttMs = active.minOf { it.rttMs },
+            bytesSent = paths.sumOf { it.txBytes },
+            packetsLost = paths.sumOf { it.lostPackets },
+        )
+    }
+
     override fun pathStats(): List<TransportPathStats> {
         val current = client ?: return emptyList()
         val stats = runCatching { current.pathStats() }.getOrNull() ?: return emptyList()
@@ -309,6 +326,8 @@ class MoqPublisherImpl(
         }
 
     override fun transportSendStats(): TransportSendStats? {
+        // 멀티패스 활성 시 연결 단위 sendStats 가 0 에 수렴(#38 E2E 관측) → 경로 합산으로 대체.
+        aggregatedSendStats()?.let { return it }
         val current = session ?: return null
         val stats = runCatching { current.sendStats() }.getOrNull() ?: return null
         return TransportSendStats(
