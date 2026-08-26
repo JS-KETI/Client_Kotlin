@@ -1,3 +1,170 @@
+diff --git a/rs/moq-native/src/dual_socket.rs b/rs/moq-native/src/dual_socket.rs
+new file mode 100644
+index 00000000..898e8cd8
+--- /dev/null
++++ b/rs/moq-native/src/dual_socket.rs
+@@ -0,0 +1,161 @@
++//! Dual-socket adapter for noq multipath (issue #38).
++//!
++//! Wraps two runtime-provided [`AsyncUdpSocket`]s as one endpoint socket.
++//! Paths are keyed by *remote address* (e.g. relay :4443 vs :4444): outgoing
++//! datagrams are routed by a learn-map ("reply through the socket that last
++//! received from this remote"), optionally pre-seeded by the caller so the
++//! first packet toward a known remote already egresses the right socket.
++//!
++//! In production socket A is bound to Wi-Fi and socket B to cellular via
++//! Android `Network.bindSocket`; the seed maps the relay's primary port to A
++//! and the secondary port to B. Validated by tools/noq-poc (T3/T4c).
++//!
++//! Every route-map key goes through [`canon`]: on dual-stack sockets noq
++//! rewrites remote addresses to their IPv6-mapped form (`ensure_ipv6`), so an
++//! un-normalized V4 seed key would never match `Transmit.destination` and all
++//! datagrams would silently egress socket A.
++
++use std::collections::HashMap;
++use std::fmt;
++use std::io::{self, IoSliceMut};
++use std::net::{SocketAddr, SocketAddrV6};
++use std::num::NonZeroUsize;
++use std::pin::Pin;
++use std::sync::{Arc, Mutex};
++use std::task::{Context, Poll};
++
++use web_transport_noq::noq;
++use noq::udp::{RecvMeta, Transmit};
++use noq::{AsyncUdpSocket, UdpSender};
++
++/// Normalize to the IPv6-mapped form. noq rewrites every remote to this form
++/// on dual-stack sockets (`ensure_ipv6`), so route-map keys must match it or
++/// lookups miss and fall back to socket A.
++fn canon(addr: SocketAddr) -> SocketAddr {
++	match addr {
++		SocketAddr::V4(v4) => {
++			SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
++		}
++		other => other,
++	}
++}
++
++pub struct DualUdpSocket {
++	a: Box<dyn AsyncUdpSocket>,
++	b: Box<dyn AsyncUdpSocket>,
++	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
++}
++
++impl fmt::Debug for DualUdpSocket {
++	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++		f.debug_struct("DualUdpSocket")
++			.field("a", &self.a.local_addr().ok())
++			.field("b", &self.b.local_addr().ok())
++			.finish()
++	}
++}
++
++impl DualUdpSocket {
++	pub fn new(
++		a: Box<dyn AsyncUdpSocket>,
++		b: Box<dyn AsyncUdpSocket>,
++		seed: &[(SocketAddr, u8)],
++	) -> Self {
++		let route = Arc::new(Mutex::new(
++			seed.iter().map(|&(addr, idx)| (canon(addr), idx)).collect::<HashMap<_, _>>(),
++		));
++		Self { a, b, route }
++	}
++}
++
++impl AsyncUdpSocket for DualUdpSocket {
++	fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
++		Box::pin(DualSender {
++			a: self.a.create_sender(),
++			b: self.b.create_sender(),
++			route: self.route.clone(),
++		})
++	}
++
++	fn poll_recv(
++		&mut self,
++		cx: &mut Context<'_>,
++		bufs: &mut [IoSliceMut<'_>],
++		meta: &mut [RecvMeta],
++	) -> Poll<io::Result<usize>> {
++		match self.a.poll_recv(cx, bufs, meta) {
++			Poll::Ready(Ok(n)) => {
++				let mut r = self.route.lock().unwrap();
++				for m in meta.iter().take(n) {
++					r.insert(canon(m.addr), 0);
++				}
++				return Poll::Ready(Ok(n));
++			}
++			Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
++			Poll::Pending => {}
++		}
++		match self.b.poll_recv(cx, bufs, meta) {
++			Poll::Ready(Ok(n)) => {
++				let mut r = self.route.lock().unwrap();
++				for m in meta.iter().take(n) {
++					r.insert(canon(m.addr), 1);
++				}
++				Poll::Ready(Ok(n))
++			}
++			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
++			Poll::Pending => Poll::Pending,
++		}
++	}
++
++	fn local_addr(&self) -> io::Result<SocketAddr> {
++		self.a.local_addr()
++	}
++
++	fn max_receive_segments(&self) -> NonZeroUsize {
++		self.a.max_receive_segments().min(self.b.max_receive_segments())
++	}
++
++	fn may_fragment(&self) -> bool {
++		self.a.may_fragment() || self.b.may_fragment()
++	}
++}
++
++struct DualSender {
++	a: Pin<Box<dyn UdpSender>>,
++	b: Pin<Box<dyn UdpSender>>,
++	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
++}
++
++impl fmt::Debug for DualSender {
++	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++		f.write_str("DualSender")
++	}
++}
++
++impl UdpSender for DualSender {
++	fn poll_send(
++		self: Pin<&mut Self>,
++		transmit: &Transmit<'_>,
++		cx: &mut Context<'_>,
++	) -> Poll<io::Result<()>> {
++		let this = self.get_mut();
++		let idx = this
++			.route
++			.lock()
++			.unwrap()
++			.get(&canon(transmit.destination))
++			.copied()
++			.unwrap_or(0);
++		if idx == 0 {
++			this.a.as_mut().poll_send(transmit, cx)
++		} else {
++			this.b.as_mut().poll_send(transmit, cx)
++		}
++	}
++
++	fn max_transmit_segments(&self) -> NonZeroUsize {
++		self.a.max_transmit_segments().min(self.b.max_transmit_segments())
++	}
++}
++
++impl Unpin for DualSender {}
 diff --git a/rs/moq-native/src/lib.rs b/rs/moq-native/src/lib.rs
 index 8fa30b33..e8cbdbc7 100644
 --- a/rs/moq-native/src/lib.rs
@@ -78,150 +245,3 @@ index 4134fb6b..ad3ae199 100644
  	/// Server ID to embed in connection IDs for QUIC-LB compatibility.
  	/// If set, connection IDs will be derived semi-deterministically.
  	#[arg(id = "server-quic-lb-id", long = "server-quic-lb-id", env = "MOQ_SERVER_QUIC_LB_ID")]
-diff --git a/rs/moq-native/src/dual_socket.rs b/rs/moq-native/src/dual_socket.rs
-new file mode 100644
---- /dev/null
-+++ b/rs/moq-native/src/dual_socket.rs
-@@ -0,0 +1,142 @@
-+//! Dual-socket adapter for noq multipath (issue #38).
-+//!
-+//! Wraps two runtime-provided [`AsyncUdpSocket`]s as one endpoint socket.
-+//! Paths are keyed by *remote address* (e.g. relay :4443 vs :4444): outgoing
-+//! datagrams are routed by a learn-map ("reply through the socket that last
-+//! received from this remote"), optionally pre-seeded by the caller so the
-+//! first packet toward a known remote already egresses the right socket.
-+//!
-+//! In production socket A is bound to Wi-Fi and socket B to cellular via
-+//! Android `Network.bindSocket`; the seed maps the relay's primary port to A
-+//! and the secondary port to B. Validated by tools/noq-poc (T3/T4c).
-+
-+use std::collections::HashMap;
-+use std::fmt;
-+use std::io::{self, IoSliceMut};
-+use std::net::SocketAddr;
-+use std::num::NonZeroUsize;
-+use std::pin::Pin;
-+use std::sync::{Arc, Mutex};
-+use std::task::{Context, Poll};
-+
-+use web_transport_noq::noq;
-+use noq::udp::{RecvMeta, Transmit};
-+use noq::{AsyncUdpSocket, UdpSender};
-+
-+pub struct DualUdpSocket {
-+	a: Box<dyn AsyncUdpSocket>,
-+	b: Box<dyn AsyncUdpSocket>,
-+	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
-+}
-+
-+impl fmt::Debug for DualUdpSocket {
-+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+		f.debug_struct("DualUdpSocket")
-+			.field("a", &self.a.local_addr().ok())
-+			.field("b", &self.b.local_addr().ok())
-+			.finish()
-+	}
-+}
-+
-+impl DualUdpSocket {
-+	pub fn new(
-+		a: Box<dyn AsyncUdpSocket>,
-+		b: Box<dyn AsyncUdpSocket>,
-+		seed: &[(SocketAddr, u8)],
-+	) -> Self {
-+		let route = Arc::new(Mutex::new(seed.iter().copied().collect::<HashMap<_, _>>()));
-+		Self { a, b, route }
-+	}
-+}
-+
-+impl AsyncUdpSocket for DualUdpSocket {
-+	fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
-+		Box::pin(DualSender {
-+			a: self.a.create_sender(),
-+			b: self.b.create_sender(),
-+			route: self.route.clone(),
-+		})
-+	}
-+
-+	fn poll_recv(
-+		&mut self,
-+		cx: &mut Context<'_>,
-+		bufs: &mut [IoSliceMut<'_>],
-+		meta: &mut [RecvMeta],
-+	) -> Poll<io::Result<usize>> {
-+		match self.a.poll_recv(cx, bufs, meta) {
-+			Poll::Ready(Ok(n)) => {
-+				let mut r = self.route.lock().unwrap();
-+				for m in meta.iter().take(n) {
-+					r.insert(m.addr, 0);
-+				}
-+				return Poll::Ready(Ok(n));
-+			}
-+			Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-+			Poll::Pending => {}
-+		}
-+		match self.b.poll_recv(cx, bufs, meta) {
-+			Poll::Ready(Ok(n)) => {
-+				let mut r = self.route.lock().unwrap();
-+				for m in meta.iter().take(n) {
-+					r.insert(m.addr, 1);
-+				}
-+				Poll::Ready(Ok(n))
-+			}
-+			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-+			Poll::Pending => Poll::Pending,
-+		}
-+	}
-+
-+	fn local_addr(&self) -> io::Result<SocketAddr> {
-+		self.a.local_addr()
-+	}
-+
-+	fn max_receive_segments(&self) -> NonZeroUsize {
-+		self.a.max_receive_segments().min(self.b.max_receive_segments())
-+	}
-+
-+	fn may_fragment(&self) -> bool {
-+		self.a.may_fragment() || self.b.may_fragment()
-+	}
-+}
-+
-+struct DualSender {
-+	a: Pin<Box<dyn UdpSender>>,
-+	b: Pin<Box<dyn UdpSender>>,
-+	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
-+}
-+
-+impl fmt::Debug for DualSender {
-+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-+		f.write_str("DualSender")
-+	}
-+}
-+
-+impl UdpSender for DualSender {
-+	fn poll_send(
-+		self: Pin<&mut Self>,
-+		transmit: &Transmit<'_>,
-+		cx: &mut Context<'_>,
-+	) -> Poll<io::Result<()>> {
-+		let this = self.get_mut();
-+		let idx = this
-+			.route
-+			.lock()
-+			.unwrap()
-+			.get(&transmit.destination)
-+			.copied()
-+			.unwrap_or(0);
-+		if idx == 0 {
-+			this.a.as_mut().poll_send(transmit, cx)
-+		} else {
-+			this.b.as_mut().poll_send(transmit, cx)
-+		}
-+	}
-+
-+	fn max_transmit_segments(&self) -> NonZeroUsize {
-+		self.a.max_transmit_segments().min(self.b.max_transmit_segments())
-+	}
-+}
-+
-+impl Unpin for DualSender {}
