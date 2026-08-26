@@ -80,6 +80,9 @@ class AutoNetworkMigrationController(
     /** 컨트롤러가 마지막으로 bind/rebind 한 송출 경로(없으면 null). 진단 로그용. */
     fun boundTarget(): NetworkPath? = boundTarget
 
+    /** false 면 이 컨트롤러는 publishingPath 를 claim 하지 않는다(멀티패스/noq 모드). */
+    fun isEnabled(): Boolean = enabled
+
     private suspend fun observe() {
         val publishSignals = runtime.status
             .map { PublishSnapshot(it.publishState, it.publishingPath, it.txStalled, it.txDegraded, it.streamActive) }
