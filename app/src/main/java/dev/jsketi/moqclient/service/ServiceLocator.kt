@@ -95,6 +95,15 @@ object ServiceLocator {
                     // noq(멀티패스) 모드에서는 rebind 전환이 DualSocket 을 파괴 → 비활성(#38 E2E 회귀)
                     enabled = !BuildConfig.MOQ_QUIC_BACKEND.equals("noq", ignoreCase = true)
                 )
+            },
+            multipathFailoverFactory = { runtime ->
+                MultipathFailoverController(
+                    networkManager = networkManager,
+                    moqPublisher = moqPublisher,
+                    runtime = runtime,
+                    // P3(#40): noq(멀티패스) 모드 전용 — Wi-Fi 사망/송신 정체 시 백업 승격 후 주경로 폐기
+                    enabled = BuildConfig.MOQ_QUIC_BACKEND.equals("noq", ignoreCase = true)
+                )
             }
         )
     }
