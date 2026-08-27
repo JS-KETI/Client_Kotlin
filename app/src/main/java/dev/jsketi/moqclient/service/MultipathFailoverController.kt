@@ -118,10 +118,12 @@ class MultipathFailoverController(
         if (primaryStat == null) {
             // 주(Wi-Fi) 경로 폐기 후 백업 단독 운행 중 — Wi-Fi 복귀 재합류(#46).
             // 품질 이탈로 떠난 경우엔 holdoff + USABLE 회복까지 재합류를 미룬다(#51, 핑퐁 방지).
-            if (s.wifiAlive && secondaryId != null) {
-                val holdoffOver = lastQualityFleeAtMs == 0L ||
-                    SystemClock.elapsedRealtime() - lastQualityFleeAtMs >= WIFI_READD_HOLDOFF_MS
-                if (holdoffOver && s.wifiHealth == NetworkHealth.USABLE) {
+            // holdoff 잔여분은 return 이 아니라 대기로 소화한다(#57) — 회복 후 신호가 전부
+            // 안정되면 만료 시점에 재평가를 깨울 이벤트가 없다. 신호가 바뀌면 collectLatest 가
+            // 이 대기를 취소하고 재진입한다(레거시 복귀 폴타이머의 등가물).
+            if (s.wifiAlive && secondaryId != null && s.wifiHealth == NetworkHealth.USABLE) {
+                waitOutQualityHoldoff()
+                if (networkManager.wifiHealth.value == NetworkHealth.USABLE) {
                     readdPrimaryPath(secondaryId)
                 }
             }
@@ -174,10 +176,9 @@ class MultipathFailoverController(
     private suspend fun handleDualQuality(s: Signals, primaryStat: TransportPathStats) {
         if (primaryStat.backup) {
             // 강등 중 — 회복(RSSI USABLE + 정체 해소 + holdoff + sustain) 시 재승격.
+            // holdoff 잔여분은 대기로 소화(#57) — return 하면 재평가를 깨울 이벤트가 없다.
             if (s.wifiHealth != NetworkHealth.USABLE || s.txStalled || s.txDegraded) return
-            val holdoffOver = lastQualityFleeAtMs == 0L ||
-                SystemClock.elapsedRealtime() - lastQualityFleeAtMs >= WIFI_READD_HOLDOFF_MS
-            if (!holdoffOver) return
+            waitOutQualityHoldoff()
             delay(WIFI_READD_SUSTAIN_MS)
             if (networkManager.wifiHealth.value != NetworkHealth.USABLE ||
                 runtime.status.value.txStalled || runtime.status.value.txDegraded
@@ -199,6 +200,20 @@ class MultipathFailoverController(
         moqPublisher.setPathBackup(primaryStat.id, backup = true)
             .onFailure { Log.w(TAG, "[demote] path${primaryStat.id} FAIL: ${it.message}") }
         runtime.markPublishingPath(NetworkPath.CELLULAR)
+    }
+
+    /**
+     * 품질 이탈 holdoff(#51)의 잔여 시간을 잠들어 소화한다(#57). collectLatest 하위이므로
+     * 대기 중 신호가 바뀌면 취소·재진입되고, 신호가 안정 유지되면 만료 시점에 그대로 이어진다.
+     */
+    private suspend fun waitOutQualityHoldoff() {
+        val fleeAt = lastQualityFleeAtMs
+        if (fleeAt == 0L) return
+        val remainingMs = WIFI_READD_HOLDOFF_MS - (SystemClock.elapsedRealtime() - fleeAt)
+        if (remainingMs > 0) {
+            Log.i(TAG, "[return] quality holdoff ${remainingMs}ms remaining — waiting")
+            delay(remainingMs)
+        }
     }
 
     private fun qualityFleeReason(s: Signals): String? = when {
