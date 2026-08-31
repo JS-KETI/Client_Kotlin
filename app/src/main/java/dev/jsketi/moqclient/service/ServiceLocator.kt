@@ -1,6 +1,7 @@
 package dev.jsketi.moqclient.service
 
 import android.content.Context
+import android.util.Log
 import dev.jsketi.moqclient.BuildConfig
 import dev.jsketi.moqclient.data.camera.CameraEncoderImpl
 import dev.jsketi.moqclient.data.location.LocationProviderImpl
@@ -60,6 +61,12 @@ object ServiceLocator {
     }
 
     private fun createRuntime(appContext: Context): PublisherRuntime {
+        // 빌드 식별(#59) — 로그 첫 줄로 남겨 어떤 변형의 로그인지 즉시 판별 가능하게 한다.
+        Log.i(
+            "MoqBuild",
+            "backend=${BuildConfig.MOQ_QUIC_BACKEND} " +
+                "scheduling=${BuildConfig.MOQ_MULTIPATH_SCHEDULING} stamp=${BuildConfig.BUILD_STAMP}"
+        )
         val networkManager = NetworkManagerImpl(appContext)
         val moqPublisher = MoqPublisherImpl(
             quicBackend = BuildConfig.MOQ_QUIC_BACKEND,

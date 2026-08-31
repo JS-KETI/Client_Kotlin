@@ -1,3 +1,8 @@
+// `java` 확장이 패키지명을 가리므로 정규화 참조가 안 된다 — 명시 import 필요.
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -53,6 +58,12 @@ android {
         // 실험 빌드는 -PmoqMultipathScheduling=dual 로, 커밋된 기본값은 항상 backup.
         val moqMultipathScheduling = (project.findProperty("moqMultipathScheduling") as String?) ?: "backup"
         buildConfigField("String", "MOQ_MULTIPATH_SCHEDULING", "\"$moqMultipathScheduling\"")
+
+        // 빌드 시각(#59). 앱 화면·로그에 노출해 어떤 빌드로 시험했는지 사후에도 특정할 수 있게 한다.
+        val buildStamp = DateTimeFormatter.ofPattern("MMdd-HHmm")
+            .withZone(ZoneId.of("Asia/Seoul"))
+            .format(Instant.now())
+        buildConfigField("String", "BUILD_STAMP", "\"$buildStamp\"")
 
         ndk {
             abiFilters += "arm64-v8a"

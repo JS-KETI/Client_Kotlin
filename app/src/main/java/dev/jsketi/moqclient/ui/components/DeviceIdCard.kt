@@ -15,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import dev.jsketi.moqclient.BuildConfig
 import dev.jsketi.moqclient.domain.model.PublishState
 import dev.jsketi.moqclient.ui.theme.MoqClientTheme
 
@@ -48,7 +49,25 @@ fun DeviceIdCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+            // 빌드 식별(#59): 어떤 변형으로 시험 중인지 화면에서 바로 확인 — 구버전·다른 변형으로
+            // 시험한 결과를 분석하는 사고를 막는다.
+            Text(
+                text = buildLabel(),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
+    }
+}
+
+/** 백엔드·스케줄링 모드 + 빌드 시각. 시험 전 어떤 APK 인지 눈으로 확인하는 용도(#59). */
+private fun buildLabel(): String {
+    val backend = BuildConfig.MOQ_QUIC_BACKEND
+    val scheduling = BuildConfig.MOQ_MULTIPATH_SCHEDULING
+    return if (backend.equals("noq", ignoreCase = true)) {
+        "build: $backend · $scheduling · ${BuildConfig.BUILD_STAMP}"
+    } else {
+        "build: $backend · ${BuildConfig.BUILD_STAMP}"
     }
 }
 
