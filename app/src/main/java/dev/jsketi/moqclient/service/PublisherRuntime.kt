@@ -1039,6 +1039,19 @@ class PublisherRuntime(
                         "lowStreak=$consecutiveLowSamples hardStreak=$hardStreak"
                 )
 
+                // 경로별 원본 통계를 로컬 로그로 남긴다(#59). 텔레메트리 전송 본문에만 의존하면
+                // 링크가 나쁜 구간에서 전송이 지연·생략되어 정작 분석이 필요한 순간의 데이터가
+                // 비어버린다. 특히 대기로 강등된 경로의 수신량 증가 여부가 여기서 판정된다.
+                moqPublisher.pathStats().takeIf { it.isNotEmpty() }?.let { paths ->
+                    Log.i(
+                        TAG,
+                        "path sample " + paths.joinToString(" ") { p ->
+                            "[id=${p.id} ${if (p.primary) "WIFI" else "CELL"} backup=${p.backup} " +
+                                "rtt=${p.rttMs} tx=${p.txBytes} rx=${p.rxBytes} lost=${p.lostPackets}]"
+                        }
+                    )
+                }
+
                 // 경로별 송신 분담률(#48): per-path tx delta 로 %를 산출해 UI 카드에 공급.
                 // 라벨은 primary(=relay 주 포트) 기준 — 재합류 후 경로 id 가 바뀌어도 유효.
                 val pathShares = if (moqPublisher.isMultipathArmed()) {
