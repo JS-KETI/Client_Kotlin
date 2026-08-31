@@ -18,4 +18,7 @@ data class PathTelemetry(
     val egressBps: Long?,
     val lostDelta: Long?,
     val bytesSentTotal: Long?,
+    // 경로 누적 수신량(#59 계측). 대기로 강등된 경로의 수신이 계속 증가하면, 상대가 그 경로로
+    // 계속 송신 중이라는 뜻이다(증상 A 판정 수단). 서버는 미지 필드를 무시하므로 추가 안전.
+    val bytesRecvTotal: Long?,
 )

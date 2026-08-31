@@ -10,6 +10,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.launch
 import uniffi.moq.MoqBroadcastProducer
 import uniffi.moq.MoqClient
@@ -20,6 +21,8 @@ import uniffi.moq.MoqSession
 private const val TAG = "MoqPublisherImpl"
 
 // 멀티패스(#38): 세션 확립 후 보조 경로 개설 재시도 — 셀룰러 라디오 웜업 지연 흡수.
+// 연결 시도 1회 상한(#59). 바깥 세션 대기 타임아웃보다 충분히 짧아야 재시도가 실제로 일어난다.
+private const val CONNECT_ATTEMPT_TIMEOUT_MS = 3_000L
 private const val MULTIPATH_ADD_PATH_TRIES = 3
 private const val MULTIPATH_ADD_PATH_RETRY_MS = 2_000L
 private const val DEFAULT_RELAY_PORT = 4443
@@ -483,7 +486,12 @@ class MoqPublisherImpl(
 
                 Log.i(TAG, "[connLoop] attempt=$attempt: calling moqClient.connect('$relayUrl') …")
                 val tConnect = System.nanoTime()
-                val established = attemptClient.connect(relayUrl)
+                // 시도 단위 타임아웃(#59): 첫 연결이 물리면 이 루프의 재시도가 발동하기도 전에
+                // 바깥 세션 대기 타임아웃이 루프를 파기해 사용자에게 실패로 보였다. 시도를 먼저
+                // 끊어 다음 attempt 로 넘긴다.
+                val established = withTimeout(CONNECT_ATTEMPT_TIMEOUT_MS) {
+                    attemptClient.connect(relayUrl)
+                }
                 val dtConnect = (System.nanoTime() - tConnect) / 1_000_000
                 Log.i(TAG, "[connLoop] attempt=$attempt: connect() RETURNED MoqSession in ${dtConnect}ms")
 

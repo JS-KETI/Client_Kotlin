@@ -575,10 +575,10 @@ index 01951a49..b25adc63 100644
  		anyhow::bail!("no QUIC backend compiled; enable noq, quinn, quiche, or iroh feature");
 diff --git a/rs/moq-native/src/dual_socket.rs b/rs/moq-native/src/dual_socket.rs
 new file mode 100644
-index 00000000..60ea178e
+index 00000000..ed6a81a6
 --- /dev/null
 +++ b/rs/moq-native/src/dual_socket.rs
-@@ -0,0 +1,345 @@
+@@ -0,0 +1,353 @@
 +//! Dual-socket adapter for noq multipath (issue #38).
 +//!
 +//! Wraps two runtime-provided [`AsyncUdpSocket`]s as one endpoint socket.
@@ -712,10 +712,14 @@ index 00000000..60ea178e
 +
 +impl AsyncUdpSocket for DualUdpSocket {
 +	fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
-+		let b = self.slots.lock().unwrap().b.create_sender();
++		let (a_gen, a, b) = {
++			let slots = self.slots.lock().unwrap();
++			(slots.a_gen, slots.a.create_sender(), slots.b.create_sender())
++		};
 +		Box::pin(DualSender {
 +			slots: self.slots.clone(),
-+			cached_a: None,
++			a_gen,
++			a,
 +			b,
 +			route: self.route.clone(),
 +			err_count: AtomicU32::new(0),
@@ -787,8 +791,10 @@ index 00000000..60ea178e
 +
 +struct DualSender {
 +	slots: Arc<Mutex<Slots>>,
-+	// (generation, sender) — re-created when slot A is replaced.
-+	cached_a: Option<(u64, Pin<Box<dyn UdpSender>>)>,
++	// Generation of the slot-A sender below; when it falls behind, slot A was replaced and
++	// the sender is re-created.
++	a_gen: u64,
++	a: Pin<Box<dyn UdpSender>>,
 +	b: Pin<Box<dyn UdpSender>>,
 +	route: Arc<Mutex<HashMap<SocketAddr, u8>>>,
 +	err_count: AtomicU32,
@@ -817,13 +823,12 @@ index 00000000..60ea178e
 +		let res = if idx == 0 {
 +			{
 +				let slots = this.slots.lock().unwrap();
-+				let stale = this.cached_a.as_ref().map(|(g, _)| *g) != Some(slots.a_gen);
-+				if stale {
-+					this.cached_a = Some((slots.a_gen, slots.a.create_sender()));
++				if this.a_gen != slots.a_gen {
++					this.a = slots.a.create_sender();
++					this.a_gen = slots.a_gen;
 +				}
 +			}
-+			let (_, sender) = this.cached_a.as_mut().expect("cached_a just ensured");
-+			sender.as_mut().poll_send(transmit, cx)
++			this.a.as_mut().poll_send(transmit, cx)
 +		} else {
 +			this.b.as_mut().poll_send(transmit, cx)
 +		};
@@ -836,7 +841,10 @@ index 00000000..60ea178e
 +	}
 +
 +	fn max_transmit_segments(&self) -> NonZeroUsize {
-+		self.b.max_transmit_segments()
++		// Must be the minimum of both slots: a batch sized for the cellular socket can exceed
++		// what the Wi-Fi socket accepts, and swallow_send_error() would report that failure as
++		// success, turning it into invisible loss on the Wi-Fi path.
++		self.a.max_transmit_segments().min(self.b.max_transmit_segments())
 +	}
 +}
 +
@@ -938,7 +946,7 @@ index 57df6c12..015bd7c8 100644
  #[cfg(feature = "noq")]
  mod noq;
 diff --git a/rs/moq-native/src/noq.rs b/rs/moq-native/src/noq.rs
-index 865d0b19..20994935 100644
+index 865d0b19..96c0bee4 100644
 --- a/rs/moq-native/src/noq.rs
 +++ b/rs/moq-native/src/noq.rs
 @@ -2,13 +2,42 @@ use crate::client::ClientConfig;
@@ -1006,7 +1014,7 @@ index 865d0b19..20994935 100644
  		let max_streams = config.max_streams.unwrap_or(crate::DEFAULT_MAX_STREAMS);
  		let max_streams = noq::VarInt::from_u64(max_streams).unwrap_or(noq::VarInt::MAX);
  		transport.max_concurrent_bidi_streams(max_streams);
-@@ -46,9 +82,170 @@ impl NoqClient {
+@@ -46,9 +82,178 @@ impl NoqClient {
  			quic,
  			transport,
  			versions: config.versions(),
@@ -1146,9 +1154,17 @@ index 865d0b19..20994935 100644
 +			return out;
 +		};
 +		if let Some(st) = conn.path_stats(noq::PathId::ZERO) {
++			// Query the live status: the primary path's demotion state is not tracked in the
++			// paths map, and reporting it as always-Available hides demotions from the policy
++			// layer (its re-promotion branch never runs) and from the control page.
++			let backup = conn
++				.path(noq::PathId::ZERO)
++				.and_then(|p| p.status().ok())
++				.map(|s| s == noq_proto::PathStatus::Backup)
++				.unwrap_or(false);
 +			out.push(NoqPathStats {
 +				id: 0,
-+				backup: false,
++				backup,
 +				rtt_ms: st.rtt.as_millis() as u64,
 +				tx_bytes: st.udp_tx.bytes,
 +				rx_bytes: st.udp_rx.bytes,
@@ -1177,7 +1193,7 @@ index 865d0b19..20994935 100644
  	pub async fn connect(&self, tls: &rustls::ClientConfig, url: Url) -> anyhow::Result<web_transport_noq::Session> {
  		let mut url = url;
  		let mut config = tls.clone();
-@@ -110,6 +307,7 @@ impl NoqClient {
+@@ -110,6 +315,7 @@ impl NoqClient {
  
  		let connection = self.quic.connect_with(config, ip, &host)?.await?;
  		tracing::Span::current().record("id", connection.stable_id());
@@ -1185,7 +1201,7 @@ index 865d0b19..20994935 100644
  
  		let mut request = web_transport_noq::proto::ConnectRequest::new(url.clone());
  		for alpn in self.versions.alpns() {
-@@ -136,6 +334,10 @@ impl NoqClient {
+@@ -136,6 +342,10 @@ impl NoqClient {
  
  		Ok(session)
  	}
