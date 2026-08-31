@@ -80,6 +80,7 @@ class TelemetryReporter(
                 egressBps = txDelta * 8 / TELEMETRY_INTERVAL_SECONDS,
                 lostDelta = lostDelta,
                 bytesSentTotal = s.txBytes,
+                bytesRecvTotal = s.rxBytes,
             )
         }
         prevPathStats.clear()
