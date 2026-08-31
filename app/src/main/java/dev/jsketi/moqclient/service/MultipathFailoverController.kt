@@ -1,6 +1,5 @@
 package dev.jsketi.moqclient.service
 
-import android.os.SystemClock
 import android.util.Log
 import dev.jsketi.moqclient.data.moq.MoqPublisher
 import dev.jsketi.moqclient.data.moq.MoqSessionState
@@ -29,12 +28,12 @@ import kotlinx.coroutines.launch
  * Triggers (#51 ports the legacy quinn controller's preemptive signals — detection parity,
  * multipath execution):
  *  - wifi-lost: the Wi-Fi [android.net.Network] vanished (Wi-Fi off / AP gone) — fires at once.
- *  - wifi-weak: RSSI health dropped to WEAK (≤ -78 dBm) — preemptive flee before death.
+ *  - wifi-weak: RSSI health dropped to WEAK (≤ -67 dBm) — preemptive flee before death.
  *  - tx-stalled / tx-degraded: egress collapsed / link capacity cannot sustain the target
  *    bitrate. All quality signals are debounced upstream, so only a short
  *    [FLEE_CONFIRM_MS] re-check runs here (legacy STALL_FLEE_DEBOUNCE_MS parity).
- * A quality-triggered flee latches [WIFI_READD_HOLDOFF_MS]; re-add then requires the holdoff
- * elapsed plus USABLE health, so a degraded-but-alive Wi-Fi cannot ping-pong.
+ * Return requires USABLE health (>= -60 dBm) held for [WIFI_READD_SUSTAIN_MS]; the 7 dB gap to
+ * the flee threshold is what prevents a degraded-but-alive Wi-Fi from ping-ponging.
  *
  * Out of scope (follow-ups): re-adding the Wi-Fi path after recovery (needs a fresh socket — the
  * DualUdpSocket Wi-Fi fd dies with its Network), cellular-death cleanup while it is the backup.
@@ -57,8 +56,6 @@ class MultipathFailoverController(
     // 세션당 1회 래치. 세션이 끊기면(reconnect) 해제되어 새 세션에서 다시 무장한다.
     private val failoverLatch = AtomicBoolean(false)
 
-    // 품질 이탈(weak/stalled/degraded) 시각 — 복귀 holdoff 게이트(#51, legacy 파리티).
-    @Volatile private var lastQualityFleeAtMs: Long = 0L
 
     fun start(scope: CoroutineScope) {
         if (!enabled) {
@@ -117,15 +114,10 @@ class MultipathFailoverController(
         val secondaryId = stats.firstOrNull { !it.primary }?.id
         if (primaryStat == null) {
             // 주(Wi-Fi) 경로 폐기 후 백업 단독 운행 중 — Wi-Fi 복귀 재합류(#46).
-            // 품질 이탈로 떠난 경우엔 holdoff + USABLE 회복까지 재합류를 미룬다(#51, 핑퐁 방지).
-            // holdoff 잔여분은 return 이 아니라 대기로 소화한다(#57) — 회복 후 신호가 전부
-            // 안정되면 만료 시점에 재평가를 깨울 이벤트가 없다. 신호가 바뀌면 collectLatest 가
-            // 이 대기를 취소하고 재진입한다(레거시 복귀 폴타이머의 등가물).
+            // 복귀 조건은 신호가 충분히 강할 것(USABLE)뿐이고, 유지 확인은 재합류 직전에 한다(#62).
+            // 대기 중 신호가 흔들리면 collectLatest 가 취소·재진입시킨다.
             if (s.wifiAlive && secondaryId != null && s.wifiHealth == NetworkHealth.USABLE) {
-                waitOutQualityHoldoff()
-                if (networkManager.wifiHealth.value == NetworkHealth.USABLE) {
-                    readdPrimaryPath(secondaryId)
-                }
+                readdPrimaryPath(secondaryId)
             }
             return
         }
@@ -157,7 +149,6 @@ class MultipathFailoverController(
         delay(FLEE_CONFIRM_MS)
         if (!qualityStillBad(reason)) return
         if (!failoverLatch.compareAndSet(false, true)) return
-        lastQualityFleeAtMs = SystemClock.elapsedRealtime()
         Log.i(TAG, "[failover] trigger=$reason promote=path$secondaryId close=path$primaryId")
         moqPublisher.setPathBackup(secondaryId, backup = false)
             .onFailure { Log.w(TAG, "[failover] promote path$secondaryId FAIL: ${it.message}") }
@@ -175,10 +166,8 @@ class MultipathFailoverController(
      */
     private suspend fun handleDualQuality(s: Signals, primaryStat: TransportPathStats) {
         if (primaryStat.backup) {
-            // 강등 중 — 회복(RSSI USABLE + 정체 해소 + holdoff + sustain) 시 재승격.
-            // holdoff 잔여분은 대기로 소화(#57) — return 하면 재평가를 깨울 이벤트가 없다.
+            // 강등 중 — 회복(RSSI USABLE + 정체 해소 + sustain) 시 재승격(#62).
             if (s.wifiHealth != NetworkHealth.USABLE || s.txStalled || s.txDegraded) return
-            waitOutQualityHoldoff()
             delay(WIFI_READD_SUSTAIN_MS)
             if (networkManager.wifiHealth.value != NetworkHealth.USABLE ||
                 runtime.status.value.txStalled || runtime.status.value.txDegraded
@@ -189,31 +178,15 @@ class MultipathFailoverController(
             moqPublisher.setPathBackup(primaryStat.id, backup = false)
                 .onFailure { Log.w(TAG, "[promote] path${primaryStat.id} FAIL: ${it.message}") }
             runtime.markPublishingPath(NetworkPath.WIFI)
-            lastQualityFleeAtMs = 0L
             return
         }
         val reason = qualityFleeReason(s) ?: return
         delay(FLEE_CONFIRM_MS)
         if (!qualityStillBad(reason)) return
-        lastQualityFleeAtMs = SystemClock.elapsedRealtime()
         Log.i(TAG, "[demote] trigger=$reason path${primaryStat.id} → Backup (전량 보조 인계)")
         moqPublisher.setPathBackup(primaryStat.id, backup = true)
             .onFailure { Log.w(TAG, "[demote] path${primaryStat.id} FAIL: ${it.message}") }
         runtime.markPublishingPath(NetworkPath.CELLULAR)
-    }
-
-    /**
-     * 품질 이탈 holdoff(#51)의 잔여 시간을 잠들어 소화한다(#57). collectLatest 하위이므로
-     * 대기 중 신호가 바뀌면 취소·재진입되고, 신호가 안정 유지되면 만료 시점에 그대로 이어진다.
-     */
-    private suspend fun waitOutQualityHoldoff() {
-        val fleeAt = lastQualityFleeAtMs
-        if (fleeAt == 0L) return
-        val remainingMs = WIFI_READD_HOLDOFF_MS - (SystemClock.elapsedRealtime() - fleeAt)
-        if (remainingMs > 0) {
-            Log.i(TAG, "[return] quality holdoff ${remainingMs}ms remaining — waiting")
-            delay(remainingMs)
-        }
     }
 
     private fun qualityFleeReason(s: Signals): String? = when {
@@ -251,7 +224,6 @@ class MultipathFailoverController(
 
                 runtime.markPublishingPath(NetworkPath.WIFI)
                 failoverLatch.set(false) // 다음 Wi-Fi 사망에 다시 대응
-                lastQualityFleeAtMs = 0L
                 return
             }
             Log.w(TAG, "[readd] attempt=$tryN FAIL: ${result.exceptionOrNull()?.message}")
@@ -264,10 +236,9 @@ class MultipathFailoverController(
         private const val TAG = "MultipathFailover"
         // legacy STALL_FLEE_DEBOUNCE_MS 파리티 — 품질 신호는 상류에서 이미 스트릭/판정을 거친다.
         private const val FLEE_CONFIRM_MS = 200L
-        // legacy WIFI_RETURN_SUSTAIN_MS 파리티.
-        private const val WIFI_READD_SUSTAIN_MS = 7_000L
-        // legacy WIFI_STALL_FLEE_HOLDOFF_MS 파리티 — 품질 이탈 직후 같은 Wi-Fi 로의 조기 복귀 차단.
-        private const val WIFI_READD_HOLDOFF_MS = 30_000L
+        // 복귀 유지 시간(#62). 핑퐁은 신호 세기 히스테리시스(이탈 -67dBm / 복귀 -60dBm)로 막고,
+        // 이탈 후 경과 시간 조건은 두지 않는다.
+        private const val WIFI_READD_SUSTAIN_MS = 5_000L
         private const val READD_TRIES = 3
         private const val READD_RETRY_MS = 2_000L
     }
