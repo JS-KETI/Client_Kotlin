@@ -66,6 +66,8 @@ class PublisherRuntime(
     private var serviceScope: CoroutineScope? = null
     private var cellularWarmup: CellularWarmup? = null
     private var metricsJob: Job? = null
+    // 진행 중인 텔레메트리 보고(#59). 감지 루프가 이 전송을 기다리지 않도록 분리 실행한다.
+    private var telemetryJob: Job? = null
     private var frameJob: Job? = null
     private var migrationController: AutoNetworkMigrationController? = null
     private var multipathFailoverController: MultipathFailoverController? = null
@@ -278,6 +280,8 @@ class PublisherRuntime(
         } finally {
             metricsJob?.cancelAndJoin()
             metricsJob = null
+            telemetryJob?.cancel()
+            telemetryJob = null
             multipathFailoverController?.stop()
             multipathFailoverController = null
             migrationController?.stop()
@@ -1093,7 +1097,13 @@ class PublisherRuntime(
                     )
                 }
 
-                reportTelemetry(_status.value)
+                // 텔레메트리 전송은 감지 루프를 막지 않게 분리한다(#59). 죽어가는 망 위에서 이
+                // 호출이 8초까지 지연된 사례가 있었고, 그동안 정체 감지 자체가 멈췄다. 직전 보고가
+                // 아직 진행 중이면 이번 샘플은 건너뛴다(보고는 3초 주기 스냅샷이라 누락돼도 무방).
+                if (telemetryJob?.isActive != true) {
+                    val snapshot = _status.value
+                    telemetryJob = serviceScope?.launch { reportTelemetry(snapshot) }
+                }
 
                 // Cellular 송출 중에는 실측 셀룰러 처리량을 별도 라인으로 남겨 현장 분석을 쉽게 한다.
                 // writeBps 는 "앱이 MoQ producer 에 투입한 바이트/s"(실제 셀룰러 업로드 속도가 아님),
