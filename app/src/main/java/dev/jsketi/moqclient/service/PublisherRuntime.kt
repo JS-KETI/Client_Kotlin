@@ -72,6 +72,10 @@ class PublisherRuntime(
     private var migrationController: AutoNetworkMigrationController? = null
     private var multipathFailoverController: MultipathFailoverController? = null
     private val frameWriteFailures = AtomicLong(0)
+
+    // 부하 이동 없는 멀티패스 전환(#66, dual 재합류)의 경량 보호 신호 — fast/heavy 루프가
+    // 값 변화를 감지해 판정 억제와 추세·기준선 리셋만 수행한다(선강하·키프레임 없음).
+    private val pathTransitionLightCount = AtomicLong(0)
     // Soft cut(latest-only refresh) 신호. frameJob 이 매 frame 이 값(elapsedRealtime)보다 오래된
     // 백로그를 버리도록 한다. requestLatestOnlyRefresh()가 now 로 갱신 → 그 시점 이전 인코더 backlog
     // 전부 폐기 + 다음 keyframe 까지 대기. 세션은 그대로 유지(reconnect 아님).
@@ -140,6 +144,20 @@ class PublisherRuntime(
         updateStatus { it.copy(migrationCount = next) }
         Log.i(TAG, "migrationCount incremented: $next; requesting fresh keyframe")
         cameraEncoder.requestKeyframe()
+    }
+
+    // 멀티패스 경로 전환 알림(#66). 컨트롤러의 전환(폐기/재합류)은 migrationCount 를 안 올려
+    // 전환 보호장치(선강하·판정 억제·추세 리셋)가 전혀 발동하지 않았다 — quinn 대비 후퇴.
+    // loadShifts=true(부하가 새 경로로 이동: 폐기 전환·backup 재합류)면 legacy 전환과 동일한
+    // 전면 보호, false(부하 유지: dual 재합류 — 재합류된 경로는 id 순서상 스필오버만 받는다)면
+    // 인코더 선강하·키프레임 없이 판정 억제와 추세·기준선 리셋만 적용한다.
+    fun notePathTransition(loadShifts: Boolean) {
+        if (loadShifts) {
+            incrementMigrationCount()
+        } else {
+            val n = pathTransitionLightCount.incrementAndGet()
+            Log.i(TAG, "path transition (light) #$n: suppress+reset only, no predrop")
+        }
     }
 
     /**
@@ -642,6 +660,7 @@ class PublisherRuntime(
         var lastBytesSentProgressAtMs = 0L
         // migrationCount 가 바뀐(= rebind/reconnect claim 직후) 샘플은 전환 잡음 — 판정을 쉰다.
         var previousMigrationCount = _status.value.migrationCount
+        var previousLightHeavy = pathTransitionLightCount.get()
         // 컨트롤러와 무관한 자발적 reconnect(relay 측 drop 등)는 migrationCount 를 안 바꾼다 —
         // 세션 상태 변화를 1s tick 마다 latch 해 같은 전환 마스킹을 적용한다.
         var previousSessionState = moqPublisher.sessionState.value
@@ -660,6 +679,7 @@ class PublisherRuntime(
         var heavySlowDegraded = false         // heavy 가 소유하는 loss/estimate 기반 degraded(fast 가 OR)
         var previousMigCountFast = _status.value.migrationCount
         var previousSessionFast = moqPublisher.sessionState.value
+        var previousLightFast = pathTransitionLightCount.get()
         var fastSuppressUntilMs = 0L          // 경로 불연속(전환/reconnect) 직후 fast flee 억제 만료 시각
         var rttPrevTick: Long? = null         // 직전 tick RTT(미분=상승 기울기 계산용)
         var rttPrevTickMs = 0L
@@ -710,16 +730,20 @@ class PublisherRuntime(
             // ── 빠른 flee 평가(매 tick) — RTT 기반 txDegraded 를 0.5s 단위로 당겨 감지 지연 축소.
             // 전환 직후(migrationCount 변화)엔 cold-start RTT 스파이크 오발을 막기 위해 일정시간 억제.
             run {
-                // 경로 불연속 처리: 전환(migrationCount 변화) 또는 자발적 reconnect(session 변화).
-                // 둘 다 fast flee 억제 + 미분/이전-경로 degraded(fastRttLatch·heavySlowDegraded) 리셋.
+                // 경로 불연속 처리: 전환(migrationCount 변화), 자발적 reconnect(session 변화),
+                // 부하 이동 없는 멀티패스 전환(#66 light) 셋 모두
+                // fast flee 억제 + 미분/이전-경로 degraded(fastRttLatch·heavySlowDegraded) 리셋.
                 // 단 인코더 선강하(predrop)와 heavy HOLD/RAMP 타이머(migrationPredropUntilMs)는 실제
-                // 전환(bitrate 강하)일 때만 — session flap 으로 heavy 판정이 과도 보류되지 않게.
+                // 전환(bitrate 강하)일 때만 — session flap/light 로 heavy 판정이 과도 보류되지 않게.
                 val migCountNow = _status.value.migrationCount
                 val migrationHappened = migCountNow != previousMigCountFast
                 val sessionChangedFast = sessionStateNow != previousSessionFast
-                if (migrationHappened || sessionChangedFast) {
+                val lightNowFast = pathTransitionLightCount.get()
+                val lightChangedFast = lightNowFast != previousLightFast
+                if (migrationHappened || sessionChangedFast || lightChangedFast) {
                     previousMigCountFast = migCountNow
                     previousSessionFast = sessionStateNow
+                    previousLightFast = lightNowFast
                     fastSuppressUntilMs = tickNowMs + MIGRATION_PREDROP_HOLD_MS
                     fastDegradedSinceMs = 0L
                     fastRttLatch = false
@@ -797,16 +821,20 @@ class PublisherRuntime(
                 // bytesSent delta 는 커넥션 경계에 걸친다.
                 val migrationCount = _status.value.migrationCount
                 val migrationChanged = migrationCount != previousMigrationCount
+                val lightCountHeavy = pathTransitionLightCount.get()
+                val lightChangedHeavy = lightCountHeavy != previousLightHeavy
                 val transitionSample = migrationChanged ||
-                    sessionStateChangedSinceSample
+                    sessionStateChangedSinceSample || lightChangedHeavy
                 if (transitionSample) {
                     Log.i(
                         TAG,
                         "tx sample marked transition: migrationCount $previousMigrationCount->$migrationCount " +
+                            "light=$previousLightHeavy->$lightCountHeavy " +
                             "sessionState=${moqPublisher.sessionState.value}"
                     )
                 }
                 previousMigrationCount = migrationCount
+                previousLightHeavy = lightCountHeavy
                 sessionStateChangedSinceSample = false
 
                 // 실측 UDP egress(재전송 포함). estimate(cwnd*8/RTT 추정치)와 달리 망이 실제로
