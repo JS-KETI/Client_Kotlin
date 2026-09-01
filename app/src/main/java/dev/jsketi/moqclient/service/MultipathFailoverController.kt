@@ -3,7 +3,6 @@ package dev.jsketi.moqclient.service
 import android.util.Log
 import dev.jsketi.moqclient.data.moq.MoqPublisher
 import dev.jsketi.moqclient.data.moq.MoqSessionState
-import dev.jsketi.moqclient.data.moq.TransportPathStats
 import dev.jsketi.moqclient.data.network.NetworkManager
 import dev.jsketi.moqclient.domain.model.NetworkHealth
 import dev.jsketi.moqclient.domain.model.NetworkPath
@@ -46,8 +45,10 @@ class MultipathFailoverController(
     private val wifiSocketFdFactory: () -> Int,
     // noq(멀티패스) 전용. quinn 레거시 전환은 AutoNetworkMigrationController 소관.
     private val enabled: Boolean,
-    // G2 분산 모드(#52/#55): 품질 신호 시 주경로를 강등(전량 인계)하고 회복 시 재승격한다 —
-    // noq 스케줄러는 loss 사후 반응형이라 급락을 스스로 흡수하지 못한다(151419Z 실측).
+    // G2 분산 모드(#52): 평시 양쪽 경로를 Available 로 두어 분배한다. 품질 이탈 대응은 backup
+    // 모드와 동일한 폐기(#64) — 강등(Backup)은 in-flight 를 그 경로에 묶어두고, relay 가
+    // 피어의 경로 대기 요청을 송신에 반영하지 않아 경로 사망 시 수신 전무 → 유휴 만료로
+    // 세션까지 죽는다(0828 현장 · 0901 자택 실측).
     private val dualScheduling: Boolean = false,
 ) {
 
@@ -137,12 +138,9 @@ class MultipathFailoverController(
             return
         }
 
-        if (dualScheduling) {
-            handleDualQuality(s, primaryStat)
-            return
-        }
-
-        // backup 모드 품질 이탈(#51): 보조 승격 + 주경로 폐기.
+        // 품질 이탈(#51, #64 두 모드 공통): 보조 승격 + 주경로 폐기. 폐기는 미완료 데이터를
+        // 살아있는 경로로 즉시 재전송시키고(강등은 묶어둔다), 경로가 양쪽에서 사라지므로
+        // relay 의 주경로 고착 송신도 함께 끊는다. 복귀는 아래 재합류(#46/#62)가 담당.
         val reason = qualityFleeReason(s) ?: return
         // 품질 신호는 상류(runtime 스트릭/RSSI 판정)에서 이미 디바운스됨 — legacy 파리티로
         // 짧게만 재확인. 신호가 바뀌면 collectLatest 가 이 대기를 취소한다.
@@ -154,38 +152,6 @@ class MultipathFailoverController(
             .onFailure { Log.w(TAG, "[failover] promote path$secondaryId FAIL: ${it.message}") }
         moqPublisher.closePath(primaryId)
             .onFailure { Log.w(TAG, "[failover] close path$primaryId FAIL: ${it.message}") }
-        runtime.markPublishingPath(NetworkPath.CELLULAR)
-    }
-
-    /**
-     * dual 하이브리드(#55): noq 스케줄러는 loss/RTT 사후 반응형이라 링크레이트 급락에 늦다
-     * (실측 151419Z: 큐 폭발 후에야 이동, 정지 6~12s). 품질 신호가 뜨면 주경로를 Backup 으로
-     * **강등**해 전량을 즉시 보조로 넘기고(close 아님 — 소켓·경로 무손상), 회복이 확인되면
-     * 재승격해 분배를 재개한다. 강등/재승격은 가역이라 래치 없이 pathStats 의 backup 플래그로
-     * 상태를 판정한다.
-     */
-    private suspend fun handleDualQuality(s: Signals, primaryStat: TransportPathStats) {
-        if (primaryStat.backup) {
-            // 강등 중 — 회복(RSSI USABLE + 정체 해소 + sustain) 시 재승격(#62).
-            if (s.wifiHealth != NetworkHealth.USABLE || s.txStalled || s.txDegraded) return
-            delay(WIFI_READD_SUSTAIN_MS)
-            if (networkManager.wifiHealth.value != NetworkHealth.USABLE ||
-                runtime.status.value.txStalled || runtime.status.value.txDegraded
-            ) {
-                return
-            }
-            Log.i(TAG, "[promote] Wi-Fi recovered — path${primaryStat.id} back to Available (분배 재개)")
-            moqPublisher.setPathBackup(primaryStat.id, backup = false)
-                .onFailure { Log.w(TAG, "[promote] path${primaryStat.id} FAIL: ${it.message}") }
-            runtime.markPublishingPath(NetworkPath.WIFI)
-            return
-        }
-        val reason = qualityFleeReason(s) ?: return
-        delay(FLEE_CONFIRM_MS)
-        if (!qualityStillBad(reason)) return
-        Log.i(TAG, "[demote] trigger=$reason path${primaryStat.id} → Backup (전량 보조 인계)")
-        moqPublisher.setPathBackup(primaryStat.id, backup = true)
-            .onFailure { Log.w(TAG, "[demote] path${primaryStat.id} FAIL: ${it.message}") }
         runtime.markPublishingPath(NetworkPath.CELLULAR)
     }
 
