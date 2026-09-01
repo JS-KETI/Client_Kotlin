@@ -135,6 +135,8 @@ class MultipathFailoverController(
             moqPublisher.closePath(primaryId)
                 .onFailure { Log.w(TAG, "[failover] close path$primaryId FAIL: ${it.message}") }
             runtime.markPublishingPath(NetworkPath.CELLULAR)
+            // 전량이 보조 경로로 이동 — 전면 보호(#66): 선강하·판정 억제·추세 리셋·키프레임.
+            runtime.notePathTransition(loadShifts = true)
             return
         }
 
@@ -153,6 +155,8 @@ class MultipathFailoverController(
         moqPublisher.closePath(primaryId)
             .onFailure { Log.w(TAG, "[failover] close path$primaryId FAIL: ${it.message}") }
         runtime.markPublishingPath(NetworkPath.CELLULAR)
+        // 전량이 보조 경로로 이동 — 전면 보호(#66): 선강하·판정 억제·추세 리셋·키프레임.
+        runtime.notePathTransition(loadShifts = true)
     }
 
     private fun qualityFleeReason(s: Signals): String? = when {
@@ -189,6 +193,10 @@ class MultipathFailoverController(
                 } // dual(#52): 양쪽 Available 유지
 
                 runtime.markPublishingPath(NetworkPath.WIFI)
+                // backup 모드: 전량이 새로 열린 Wi-Fi 경로로 이동(초기 성장 구간) — 전면 보호.
+                // dual 모드: 재합류된 경로는 배정 순서상 스필오버만 받아 부하 이동이 없다 —
+                // 판정 억제·기준선 리셋만(#66), 화질 선강하는 불필요한 저하라 생략.
+                runtime.notePathTransition(loadShifts = !dualScheduling)
                 failoverLatch.set(false) // 다음 Wi-Fi 사망에 다시 대응
                 return
             }
