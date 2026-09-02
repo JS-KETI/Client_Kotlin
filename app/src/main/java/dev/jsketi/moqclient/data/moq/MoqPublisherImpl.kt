@@ -1,6 +1,7 @@
 package dev.jsketi.moqclient.data.moq
 
 import android.util.Log
+import dev.jsketi.moqclient.BuildConfig
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -248,13 +249,45 @@ class MoqPublisherImpl(
             Log.w(TAG, "[setPathBackup] FAIL id=$pathId ${e.javaClass.simpleName}: ${e.message}")
         }
 
+    override fun setPathWeight(pathId: Long, weight: Int): Result<Unit> =
+        runCatching {
+            val moqClient = checkNotNull(client) { "MoQ client is not connected" }
+            moqClient.setPathWeight(pathId.toULong(), weight.coerceIn(0, 100).toUInt())
+            Log.i(TAG, "[setPathWeight] OK id=$pathId weight=$weight")
+            Unit
+        }.onFailure { e ->
+            Log.w(TAG, "[setPathWeight] FAIL id=$pathId ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+    // 고정 가중치 검증 토글(#68): 빌드 인자(moqPathWeights="주,보조")가 있으면 경로 수립·재합류
+    // 때 자동 적용한다. 비어 있으면(기본) 가중치 미사용 — 기존 스케줄링 그대로(무회귀).
+    private val fixedPathWeights: Pair<Int, Int>? = BuildConfig.MOQ_PATH_WEIGHTS
+        .split(",")
+        .mapNotNull { it.trim().toIntOrNull() }
+        .takeIf { it.size == 2 }
+        ?.let { it[0] to it[1] }
+
+    private fun applyFixedWeights(primaryId: Long, secondaryId: Long) {
+        val (wPrimary, wSecondary) = fixedPathWeights ?: return
+        setPathWeight(primaryId, wPrimary)
+        setPathWeight(secondaryId, wSecondary)
+        Log.i(TAG, "[weights] fixed $wPrimary:$wSecondary applied (primary=$primaryId secondary=$secondaryId)")
+    }
+
     override suspend fun readdPrimaryPath(socketFd: Int): Result<Long> =
         runCatching {
             val primary = checkNotNull(multipathPrimaryAddr) { "multipath is not armed" }
             val moqClient = checkNotNull(client) { "MoQ client is not connected" }
             moqClient.replacePrimarySocket(socketFd)
             Log.i(TAG, "[readdPrimary] Wi-Fi socket slot replaced fd=$socketFd")
-            addPath(primary).getOrThrow()
+            addPath(primary).getOrThrow().also { newId ->
+                // #68 고정 가중치 검증: 재합류된 주경로에 주 가중치 재적용(보조는 수립 때
+                // 받은 가중치 유지). 가중치가 있으면 경로 번호 순서와 무관하게 비중이 잡혀
+                // 재합류 후 LTE 편중(번호 역전) 문제도 함께 해소된다.
+                if (dualScheduling) {
+                    fixedPathWeights?.let { (wPrimary, _) -> setPathWeight(newId, wPrimary) }
+                }
+            }
         }.onFailure { e ->
             Log.w(TAG, "[readdPrimary] FAIL ${e.javaClass.simpleName}: ${e.message}")
         }
@@ -521,6 +554,8 @@ class MoqPublisherImpl(
                                     // G2 실험(#52): 양쪽 Available — 분배는 noq 스케줄러 몫이고
                                     // 실분배는 pathShares(%) 계기판으로 관찰한다.
                                     Log.i(TAG, "[connLoop] dual scheduling — secondary stays Available")
+                                    // #68 고정 가중치 검증: 토글이 켜져 있으면 즉시 적용.
+                                    added.getOrNull()?.let { id -> applyFixedWeights(0L, id) }
                                 } else {
                                     // 보조 경로는 Backup 으로 운용: 평시 주경로 단독 송출(G1 무중단
                                     // 우선), 주경로 사망 시에만 사용된다("used if there are no

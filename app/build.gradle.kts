@@ -59,6 +59,11 @@ android {
         val moqMultipathScheduling = (project.findProperty("moqMultipathScheduling") as String?) ?: "backup"
         buildConfigField("String", "MOQ_MULTIPATH_SCHEDULING", "\"$moqMultipathScheduling\"")
 
+        // 고정 가중치 검증 토글(#68): -PmoqPathWeights=70,30 → 경로 수립·재합류 때 주,보조
+        // 가중치 자동 적용(dual 전용). 커밋된 기본값은 빈 문자열 = 가중치 미사용(무회귀).
+        val moqPathWeights = (project.findProperty("moqPathWeights") as String?) ?: ""
+        buildConfigField("String", "MOQ_PATH_WEIGHTS", "\"$moqPathWeights\"")
+
         // 빌드 시각(#59). 앱 화면·로그에 노출해 어떤 빌드로 시험했는지 사후에도 특정할 수 있게 한다.
         val buildStamp = DateTimeFormatter.ofPattern("MMdd-HHmm")
             .withZone(ZoneId.of("Asia/Seoul"))

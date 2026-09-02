@@ -64,8 +64,13 @@ fun DeviceIdCard(
 private fun buildLabel(): String {
     val backend = BuildConfig.MOQ_QUIC_BACKEND
     val scheduling = BuildConfig.MOQ_MULTIPATH_SCHEDULING
+    // 고정 가중치 검증 빌드(#68)는 라벨로 구분한다 (예: "dual w70:30").
+    val weights = BuildConfig.MOQ_PATH_WEIGHTS
+        .takeIf { it.isNotBlank() }
+        ?.let { " w${it.replace(",", ":")}" }
+        ?: ""
     return if (backend.equals("noq", ignoreCase = true)) {
-        "build: $backend · $scheduling · ${BuildConfig.BUILD_STAMP}"
+        "build: $backend · $scheduling$weights · ${BuildConfig.BUILD_STAMP}"
     } else {
         "build: $backend · ${BuildConfig.BUILD_STAMP}"
     }
