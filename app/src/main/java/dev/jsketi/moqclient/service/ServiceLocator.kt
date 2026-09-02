@@ -127,6 +127,18 @@ object ServiceLocator {
                     enabled = BuildConfig.MOQ_QUIC_BACKEND.equals("noq", ignoreCase = true),
                     dualScheduling = BuildConfig.MOQ_MULTIPATH_SCHEDULING.equals("dual", ignoreCase = true)
                 )
+            },
+            pathWeightFactory = { runtime ->
+                PathWeightController(
+                    networkManager = networkManager,
+                    moqPublisher = moqPublisher,
+                    runtime = runtime,
+                    // 신호 연동 가중치(#70): noq dual 전용. 고정 가중치 검증 토글(#68) 빌드에서는
+                    // 산출 주체 충돌을 막기 위해 비활성.
+                    enabled = BuildConfig.MOQ_QUIC_BACKEND.equals("noq", ignoreCase = true) &&
+                        BuildConfig.MOQ_MULTIPATH_SCHEDULING.equals("dual", ignoreCase = true) &&
+                        BuildConfig.MOQ_PATH_WEIGHTS.isBlank()
+                )
             }
         )
     }
