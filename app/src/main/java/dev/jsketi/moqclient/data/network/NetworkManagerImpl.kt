@@ -81,6 +81,9 @@ class NetworkManagerImpl(
     private val _wifiSignalDbm = MutableStateFlow<Int?>(null)
     override val wifiSignalDbm: StateFlow<Int?> = _wifiSignalDbm.asStateFlow()
 
+    private val _wifiTxLinkMbps = MutableStateFlow<Int?>(null)
+    override val wifiTxLinkMbps: StateFlow<Int?> = _wifiTxLinkMbps.asStateFlow()
+
     private val _wifiHealth = MutableStateFlow(NetworkHealth.UNAVAILABLE)
     override val wifiHealth: StateFlow<NetworkHealth> = _wifiHealth.asStateFlow()
 
@@ -182,6 +185,7 @@ class NetworkManagerImpl(
         _wifiNetwork.value = null
         _cellularNetwork.value = null
         _wifiSignalDbm.value = null
+        _wifiTxLinkMbps.value = null
         _wifiHealth.value = NetworkHealth.UNAVAILABLE
     }
 
@@ -285,6 +289,7 @@ class NetworkManagerImpl(
                     Log.w(TAG, "WIFI onLost (active): $network")
                     _wifiNetwork.value = null
                     _wifiSignalDbm.value = null
+                    _wifiTxLinkMbps.value = null
                     if (_wifiHealth.value != NetworkHealth.UNAVAILABLE) {
                         _wifiHealth.value = NetworkHealth.UNAVAILABLE
                         Log.i(TAG, "wifi health changed: signal=n/a health=UNAVAILABLE")
@@ -387,6 +392,7 @@ class NetworkManagerImpl(
                 val dbm = if (rssi != null && rssi < 0 && rssi > -127) rssi else null
                 if (info != null && dbm != null) {
                     _wifiSignalDbm.value = dbm
+                    _wifiTxLinkMbps.value = readTxLinkMbps(info)
                     Log.d(
                         TAG,
                         "wifi rssi sample: signal=$dbm health=${_wifiHealth.value} ${wifiLinkSummary(info)}"
@@ -404,6 +410,15 @@ class NetworkManagerImpl(
             tick++
             delay(WIFI_RSSI_POLL_MS)
         }
+    }
+
+    /** 상향 링크 속도(Mbps). Q 미만이거나 무효값이면 총 링크 속도로 폴백, 그것도 없으면 null. */
+    @Suppress("DEPRECATION")
+    private fun readTxLinkMbps(info: WifiInfo): Int? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            info.txLinkSpeedMbps.takeIf { it > 0 }?.let { return it }
+        }
+        return info.linkSpeed.takeIf { it > 0 }
     }
 
     /** WifiInfo 의 현재 링크 속도(Mbps)/주파수(MHz) 요약. 미지원/무효값은 "n/a". */
