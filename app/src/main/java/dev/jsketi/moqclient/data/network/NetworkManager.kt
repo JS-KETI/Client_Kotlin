@@ -20,6 +20,12 @@ interface NetworkManager {
 
     val wifiSignalDbm: StateFlow<Int?>
 
+    /**
+     * Wi-Fi 상향 링크 속도(Mbps, 미상이면 null). RSSI 와 같은 주기로 갱신되는 선행 지표 —
+     * 전파는 정상인데 링크 속도만 무너지는 열화 유형을 가중치 산출(#70)에서 잡기 위해 노출.
+     */
+    val wifiTxLinkMbps: StateFlow<Int?>
+
     val wifiHealth: StateFlow<NetworkHealth>
 
     fun start()

@@ -56,7 +56,9 @@ class PublisherRuntime(
     // Deferred construction breaks the runtime <-> controller cycle: the controller needs `this`.
     private val migrationControllerFactory: (PublisherRuntime) -> AutoNetworkMigrationController,
     // P3(#40): 멀티패스(noq) 경로 사망 페일오버 정책. 위와 같은 사유로 지연 생성.
-    private val multipathFailoverFactory: (PublisherRuntime) -> MultipathFailoverController
+    private val multipathFailoverFactory: (PublisherRuntime) -> MultipathFailoverController,
+    // 신호 연동 연속 가중치 분배(#70, dual 전용). 위와 같은 사유로 지연 생성.
+    private val pathWeightFactory: (PublisherRuntime) -> PathWeightController
 ) {
     private val _status = MutableStateFlow(PublisherStatus())
     val status: StateFlow<PublisherStatus> = _status.asStateFlow()
@@ -71,6 +73,7 @@ class PublisherRuntime(
     private var frameJob: Job? = null
     private var migrationController: AutoNetworkMigrationController? = null
     private var multipathFailoverController: MultipathFailoverController? = null
+    private var pathWeightController: PathWeightController? = null
     private val frameWriteFailures = AtomicLong(0)
 
     // 부하 이동 없는 멀티패스 전환(#66, dual 재합류)의 경량 보호 신호 — fast/heavy 루프가
@@ -265,9 +268,12 @@ class PublisherRuntime(
             // then moves the tag. Replaces the old session/handle observers.
             migrationController = migrationControllerFactory(this).also { it.start(scope) }
             multipathFailoverController = multipathFailoverFactory(this).also { it.start(scope) }
+            pathWeightController = pathWeightFactory(this).also { it.start(scope) }
         } catch (t: Throwable) {
             metricsJob?.cancel()
             metricsJob = null
+            pathWeightController?.stop()
+            pathWeightController = null
             multipathFailoverController?.stop()
             multipathFailoverController = null
             migrationController?.stop()
@@ -300,6 +306,8 @@ class PublisherRuntime(
             metricsJob = null
             telemetryJob?.cancel()
             telemetryJob = null
+            pathWeightController?.stop()
+            pathWeightController = null
             multipathFailoverController?.stop()
             multipathFailoverController = null
             migrationController?.stop()
