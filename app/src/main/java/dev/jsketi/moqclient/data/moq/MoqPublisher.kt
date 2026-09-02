@@ -99,6 +99,14 @@ interface MoqPublisher {
     fun setPathBackup(pathId: Long, backup: Boolean): Result<Unit>
 
     /**
+     * Set the local send-scheduling weight (0..100) for a path (#68). Once two or more
+     * available paths carry a weight, outgoing data is split weight-proportionally
+     * (deficit ordering) instead of the ascending-id first-fit; paths without a weight
+     * keep the legacy order. Local scheduling only — no wire impact.
+     */
+    fun setPathWeight(pathId: Long, weight: Int): Result<Unit>
+
+    /**
      * Re-add the primary (Wi-Fi) path after its Network died and returned (#46): hot-swaps
      * the dual socket's Wi-Fi slot with the given pre-bound fd (the old fd died with its
      * Network), then opens a fresh path toward the relay's primary port. Multipath must be

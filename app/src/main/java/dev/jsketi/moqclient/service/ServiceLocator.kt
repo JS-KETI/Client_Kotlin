@@ -65,7 +65,9 @@ object ServiceLocator {
         Log.i(
             "MoqBuild",
             "backend=${BuildConfig.MOQ_QUIC_BACKEND} " +
-                "scheduling=${BuildConfig.MOQ_MULTIPATH_SCHEDULING} stamp=${BuildConfig.BUILD_STAMP}"
+                "scheduling=${BuildConfig.MOQ_MULTIPATH_SCHEDULING} " +
+                "weights=${BuildConfig.MOQ_PATH_WEIGHTS.ifBlank { "off" }} " +
+                "stamp=${BuildConfig.BUILD_STAMP}"
         )
         val networkManager = NetworkManagerImpl(appContext)
         val moqPublisher = MoqPublisherImpl(
