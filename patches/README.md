@@ -13,6 +13,7 @@
 | `web-transport-quinn-priority.patch` | vendor/web-transport-quinn | 우선순위 부호 반전 버그 수정 — 정체 시 최신 그룹 우선(newest-first)이라는 MoQ 설계가 quinn 의 higher-first 의미론과 만나 oldest-first FIFO 로 뒤집히는 문제 |
 | `moq-noq-backend.patch` | moq-native, moq-ffi, Cargo.toml | noq 백엔드 + 멀티패스 표면(이슈 #38) — noq rebind 패리티, `setBackend("quinn"/"noq")`, **DualUdpSocket**(learn-map, 경로=원격 포트) 및 `setMultipath/addPath/closePath/setPathBackup/pathStats` FFI, 옵트인 `noq_multipath` 설정, wtn vendor `[patch.crates-io]` 등록. 기본 동작은 여전히 quinn 단일 경로 |
 | `web-transport-noq-priority.patch` | vendor/web-transport-noq | wtq 와 동일한 우선순위 부호 반전 버그 수정 (noq 백엔드 경로용, `send.rs` 1줄) |
+| `noq-path-weights.patch` | vendor/noq-proto, vendor/noq, moq-native, moq-ffi, Cargo.toml | 경로별 송신 가중치(이슈 #68) — noq-proto 전송 루프의 경로 순서를 가중치-적자(DRR)로 교체(`set_path_weight`/`path_weight` 공개, 가중치 미설정 시 기존 오름차순 무회귀), noq `Path::set_weight` 래퍼, `setPathWeight` FFI. noq-proto·noq 를 vendor 내장하는 `[patch.crates-io]` 2줄 포함. 로컬 스케줄링 전용 — 와이어 무변경 |
 
 ## 사전 준비 (이 머신 기준)
 
@@ -54,6 +55,11 @@ mkdir -p vendor && cp -r $REG vendor/web-transport-quinn
 curl -sL -o /tmp/wtn.crate https://static.crates.io/crates/web-transport-noq/web-transport-noq-0.0.3.crate
 tar -xzf /tmp/wtn.crate -C vendor && mv vendor/web-transport-noq-0.0.3 vendor/web-transport-noq
 (cd vendor/web-transport-noq && git apply ../../../../patches/web-transport-noq-priority.patch)
+# noq 스케줄러 가중치(#68): noq-proto·noq 를 registry 원본에서 vendor 로 복사 후 패치 적용
+# (Cargo.toml 의 [patch.crates-io] 2줄과 rs/ 변경도 같은 패치 파일에 포함되어 함께 적용됨)
+NREG=~/.cargo/registry/src/index.crates.io-*
+cp -r $NREG/noq-proto-0.16.0 vendor/noq-proto && cp -r $NREG/noq-0.17.0 vendor/noq
+git apply ../../patches/noq-path-weights.patch
 
 # 1) 환경 (git-bash)
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=rust-lld

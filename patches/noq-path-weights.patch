@@ -1,0 +1,273 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -57,3 +57,5 @@
+ [patch.crates-io]
+ web-transport-quinn = { path = "vendor/web-transport-quinn" }
+ web-transport-noq = { path = "vendor/web-transport-noq" }
++noq = { path = "vendor/noq" }
++noq-proto = { path = "vendor/noq-proto" }
+--- a/rs/moq-native/src/noq.rs
++++ b/rs/moq-native/src/noq.rs
+@@ -209,6 +209,29 @@
+ 		*flag = backup;
+ 		Ok(())
+ 	}
++
++	/// Set the local send-scheduling weight (0..=100) for a path (#68).
++	/// Local only — no wire impact. Data is split weight-proportionally once two or
++	/// more Available paths carry a weight; unset paths keep legacy id-order.
++	pub fn set_path_weight(&self, id: u64, weight: u16) -> anyhow::Result<()> {
++		if id == 0 {
++			let conn = self
++				.multipath
++				.conn
++				.lock()
++				.unwrap()
++				.clone()
++				.context("no active connection")?;
++			let path = conn.path(noq::PathId::ZERO).context("primary path unavailable")?;
++			return path
++				.set_weight(Some(weight))
++				.map_err(|e| anyhow::anyhow!("set_path_weight: {e}"));
++		}
++		let mut paths = self.multipath.paths.lock().unwrap();
++		let (path, _, _) = paths.get_mut(&id).context("unknown path id")?;
++		path.set_weight(Some(weight))
++			.map_err(|e| anyhow::anyhow!("set_path_weight: {e}"))
++	}
+ 
+ 	/// Snapshot per-path statistics (primary path reported as id 0).
+ 	pub fn path_stats(&self) -> Vec<NoqPathStats> {
+--- a/rs/moq-native/src/client.rs
++++ b/rs/moq-native/src/client.rs
+@@ -351,6 +351,15 @@
+ 			.context("noq backend not active")?
+ 			.set_path_backup(id, backup)
+ 	}
++
++	/// Set the local send-scheduling weight (0..=100) for a path (#68).
++	#[cfg(feature = "noq")]
++	pub fn noq_set_path_weight(&self, id: u64, weight: u32) -> anyhow::Result<()> {
++		self.noq
++			.as_ref()
++			.context("noq backend not active")?
++			.set_path_weight(id, weight.min(100) as u16)
++	}
+ 
+ 	/// Per-path statistics snapshot (empty when not connected via noq).
+ 	#[cfg(feature = "noq")]
+--- a/rs/moq-ffi/src/session.rs
++++ b/rs/moq-ffi/src/session.rs
+@@ -353,6 +353,21 @@
+ 			.noq_set_path_backup(path_id, backup)
+ 			.map_err(|err| MoqError::Connect(format!("setPathBackup: {err}")))
+ 	}
++
++	/// Set the local send-scheduling weight (0..=100) for a path (#68). Local only —
++	/// once two or more available paths carry a weight, outgoing data is split
++	/// weight-proportionally; paths without a weight keep the legacy id-order.
++	pub fn set_path_weight(&self, path_id: u64, weight: u32) -> Result<(), MoqError> {
++		let _guard = crate::ffi::RUNTIME.enter();
++		let state = self.task.lock().ok_or(MoqError::Cancelled)?;
++		let native = state
++			.native
++			.as_ref()
++			.ok_or_else(|| MoqError::Connect("cannot set path weight before connect".to_string()))?;
++		native
++			.noq_set_path_weight(path_id, weight)
++			.map_err(|err| MoqError::Connect(format!("setPathWeight: {err}")))
++	}
+ 
+ 	/// Per-path statistics snapshot. Empty when multipath is not active.
+ 	pub fn path_stats(&self) -> Vec<MoqPathStats> {
+--- a/vendor/noq-proto/src/connection/mod.rs
++++ b/vendor/noq-proto/src/connection/mod.rs
+@@ -790,6 +790,31 @@
+             .ok_or(ClosedPath { _private: () })
+     }
+ 
++    /// Sets the local send-scheduling weight for a path (#68).
++    ///
++    /// Purely local: no frame is emitted and the wire format is unchanged. When two or
++    /// more validated `Available` paths carry a weight, outgoing data is split between
++    /// them proportionally to their weights (deficit-based ordering in `poll_transmit`)
++    /// instead of the default ascending-`PathId` first-fit. `None` removes the weight.
++    /// Values are clamped to `0..=100`.
++    pub fn set_path_weight(
++        &mut self,
++        path_id: PathId,
++        weight: Option<u16>,
++    ) -> Result<(), ClosedPath> {
++        let path = self.path_mut(path_id).ok_or(ClosedPath { _private: () })?;
++        path.weight = weight.map(|w| w.min(100));
++        path.weight_deficit = 0;
++        Ok(())
++    }
++
++    /// Gets the local send-scheduling weight for a path (#68).
++    pub fn path_weight(&self, path_id: PathId) -> Result<Option<u16>, ClosedPath> {
++        self.path(path_id)
++            .map(|path| path.weight)
++            .ok_or(ClosedPath { _private: () })
++    }
++
+     /// Sets the [`PathStatus`] for a known [`PathId`]
+     ///
+     /// Returns the previous path status on success.
+@@ -1043,6 +1068,11 @@
+         // TODO: how to avoid the allocation? Cannot use a for loop because of
+         // borrowing. Maybe SmallVec or similar.
+         let path_ids: Vec<_> = self.paths.keys().copied().collect();
++        // #68 weighted scheduling: when two or more data-eligible paths carry a local
++        // weight, order them by remaining byte credit (largest first) instead of the
++        // fixed ascending id order. All gates below (validation, status, congestion)
++        // stay authoritative; weightless paths keep their relative order at the back.
++        let path_ids = self.weighted_path_order(path_ids);
+ 
+         // If we end up not sending anything, we need to know if that was because there was
+         // nothing to send or because we were congestion blocked.
+@@ -1065,6 +1095,7 @@
+                 connection_close_pending,
+             ) {
+                 PollPathStatus::Send(transmit) => {
++                    self.weight_debit(path_id, transmit.size);
+                     return Some(transmit);
+                 }
+                 PollPathStatus::NothingToSend {
+@@ -1145,6 +1176,67 @@
+     }
+ 
+     /// poll_transmit logic for off-path data.
++    /// Weighted-deficit path ordering for `poll_transmit` (#68).
++    ///
++    /// Returns `path_ids` reordered so that data-eligible paths (validated, `Available`,
++    /// with remote CIDs) carrying a local weight come first, sorted by remaining byte
++    /// credit. Credits are replenished weight-proportionally once every weighted path
++    /// has consumed its round. With fewer than two weighted eligible paths the caller's
++    /// (ascending) order is returned unchanged, preserving legacy behavior.
++    fn weighted_path_order(&mut self, path_ids: Vec<PathId>) -> Vec<PathId> {
++        let mut weighted: Vec<(PathId, i64)> = Vec::new();
++        for &id in &path_ids {
++            let Some(path) = self.paths.get(&id) else {
++                continue;
++            };
++            if path.data.weight.is_some()
++                && path.data.validated
++                && path.data.local_status() == PathStatus::Available
++                && self.remote_cids.contains_key(&id)
++            {
++                weighted.push((id, path.data.weight_deficit));
++            }
++        }
++        if weighted.len() < 2 {
++            return path_ids;
++        }
++        // Replenish weight-proportionally when the whole round is consumed. Bounded:
++        // the first pass gives every positive-weight path a positive credit.
++        let mut guard = 0;
++        while weighted.iter().all(|&(_, d)| d <= 0) && guard < 2 {
++            guard += 1;
++            for (id, d) in weighted.iter_mut() {
++                if let Some(path) = self.paths.get_mut(id) {
++                    let cap = i64::from(path.data.weight.unwrap_or(0)) * WEIGHT_QUANTUM_BYTES;
++                    path.data.weight_deficit = (path.data.weight_deficit + cap).min(cap);
++                    *d = path.data.weight_deficit;
++                }
++            }
++        }
++        weighted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
++        let head: Vec<PathId> = weighted.iter().map(|&(id, _)| id).collect();
++        let tail: Vec<PathId> = path_ids
++            .into_iter()
++            .filter(|id| !head.contains(id))
++            .collect();
++        let mut ordered = head;
++        ordered.extend(tail);
++        ordered
++    }
++
++    /// Debits a weighted path's byte credit for a sent transmit (#68).
++    ///
++    /// The floor keeps overspend (spillover sends while other paths are congestion
++    /// blocked) bounded to one round, so recovery bursts stay short.
++    fn weight_debit(&mut self, path_id: PathId, size: usize) {
++        if let Some(path) = self.paths.get_mut(&path_id) {
++            if let Some(w) = path.data.weight {
++                let floor = -(i64::from(w) * WEIGHT_QUANTUM_BYTES);
++                path.data.weight_deficit = (path.data.weight_deficit - size as i64).max(floor);
++            }
++        }
++    }
++
+     fn poll_transmit_off_path(
+         &mut self,
+         now: Instant,
+@@ -7077,6 +7169,11 @@
+ // Prevents overflow and improves behavior in extreme circumstances
+ const MAX_BACKOFF_EXPONENT: u32 = 16;
+ 
++/// Byte credit granted per weight unit each replenish round of the weighted path
++/// scheduler (#68). A full round moves `sum(weights) * this` bytes, so ~1 MTU per
++/// weight unit keeps interleaving fine-grained without starving low-weight paths.
++const WEIGHT_QUANTUM_BYTES: i64 = 1024;
++
+ /// Minimal remaining size to allow packet coalescing, excluding cryptographic tag
+ ///
+ /// This must be at least as large as the header for a well-formed empty packet to be coalesced,
+--- a/vendor/noq-proto/src/connection/paths.rs
++++ b/vendor/noq-proto/src/connection/paths.rs
+@@ -164,6 +164,13 @@
+     /// Initially equal to `use_stateless_retry` for servers, and becomes false again on every
+     /// migration. Always true for clients.
+     pub(super) validated: bool,
++    /// Local send-scheduling weight (#68). `None` = legacy ascending-id scheduling.
++    ///
++    /// Purely local: never serialized, no wire-format impact. See
++    /// `Connection::set_path_weight` and `Connection::weighted_path_order`.
++    pub(super) weight: Option<u16>,
++    /// Remaining byte credit for weighted scheduling. Positive = owed service.
++    pub(super) weight_deficit: i64,
+     /// Total size of all UDP datagrams sent on this path
+     pub(super) total_sent: u64,
+     /// Total size of all UDP datagrams received on this path
+@@ -269,6 +276,8 @@
+             pending_on_path_challenge: false,
+             path_responses: PathResponses::default(),
+             validated: false,
++            weight: None,
++            weight_deficit: 0,
+             total_sent: 0,
+             total_recvd: 0,
+             mtud: config
+@@ -325,6 +334,8 @@
+             pending_on_path_challenge: false,
+             path_responses: PathResponses::default(),
+             validated: false,
++            weight: prev.weight,
++            weight_deficit: 0,
+             total_sent: 0,
+             total_recvd: 0,
+             mtud: prev.mtud.clone(),
+--- a/vendor/noq/src/path.rs
++++ b/vendor/noq/src/path.rs
+@@ -196,6 +196,20 @@
+         Ok(())
+     }
+ 
++    /// Sets the local send-scheduling weight of this path (#68).
++    ///
++    /// Purely local — no frame is emitted. When two or more `Available` paths carry a
++    /// weight, outgoing data is split proportionally; `None` restores default
++    /// scheduling for this path. Values are clamped to `0..=100`.
++    pub fn set_weight(&self, weight: Option<u16>) -> Result<(), ClosedPath> {
++        self.conn
++            .state
++            .lock("set path weight")
++            .inner
++            .set_path_weight(self.id, weight)?;
++        Ok(())
++    }
++
+     /// Returns the [`PathStats`] for this path.
+     pub fn stats(&self) -> PathStats {
+         // The `expect` is safe:
