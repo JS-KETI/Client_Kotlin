@@ -99,6 +99,11 @@ class CameraEncoderImpl(
     @Volatile private var encoderHeight: Int = 0
     private var cameraProvider: ProcessCameraProvider? = null
     private var cameraExecutor: ExecutorService? = null
+    // 송출 중 프리뷰 교체/해제(#72)를 위해 bind 문맥을 보관한다. Preview use case 는 UI 전용이라
+    // 단독으로 unbind/rebind 해도 ImageAnalysis(송출)는 영향 없이 계속된다.
+    private var boundOwner: LifecycleOwner? = null
+    private var boundResolutionSelector: ResolutionSelector? = null
+    private var previewUseCase: Preview? = null
     private var encoderScope: CoroutineScope? = null
     private var drainJob: Job? = null
 
@@ -206,6 +211,10 @@ class CameraEncoderImpl(
                     )
                 }
 
+                boundOwner = lifecycleOwner
+                boundResolutionSelector = resolutionSelector
+                previewUseCase = preview
+
                 // Surface camera error / state transitions in logs (open, opening, closed, error).
                 runCatching {
                     camera.cameraInfo.cameraState.observe(lifecycleOwner) { state ->
@@ -226,6 +235,43 @@ class CameraEncoderImpl(
         synchronized(lifecycleLock) {
             stopping = true
             cleanupInternalLocked()
+        }
+    }
+
+    /**
+     * 프리뷰 표시면 교체/해제(#72). Preview use case 만 내리거나 새로 붙인다 — ImageAnalysis 와
+     * MediaCodec 은 그대로라 송출은 끊기지 않는다. 앱이 화면에서 사라지면(다른 앱·화면 꺼짐)
+     * 런타임이 null 로 호출하고, 복귀하면 새 표시면으로 다시 호출한다.
+     */
+    @MainThread
+    override fun setPreviewView(previewView: PreviewView?) {
+        synchronized(lifecycleLock) {
+            if (stopping) return
+            val provider = cameraProvider ?: return // 시작 전 — 다음 start() 가 표시면을 사용
+            val owner = boundOwner ?: return
+            val selector = boundResolutionSelector ?: return
+            previewUseCase?.let { old ->
+                runCatching { provider.unbind(old) }
+                    .onFailure { Log.w(TAG, "preview unbind failed", it) }
+                previewUseCase = null
+            }
+            if (previewView == null) {
+                Log.i(TAG, "preview detached — capture continues on ImageAnalysis only")
+                return
+            }
+            val preview = Preview.Builder()
+                .setResolutionSelector(selector)
+                .setTargetRotation(previewView.display?.rotation ?: Surface.ROTATION_0)
+                .build()
+                .apply { setSurfaceProvider(previewView.surfaceProvider) }
+            runCatching {
+                provider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview)
+            }.onSuccess {
+                previewUseCase = preview
+                Log.i(TAG, "preview attached — Preview use case rebound")
+            }.onFailure {
+                Log.w(TAG, "preview rebind failed; capture continues without preview", it)
+            }
         }
     }
 
@@ -279,6 +325,9 @@ class CameraEncoderImpl(
 
         cameraProvider?.unbindAll()
         cameraProvider = null
+        boundOwner = null
+        boundResolutionSelector = null
+        previewUseCase = null
 
         cameraExecutor?.shutdown()
         cameraExecutor = null

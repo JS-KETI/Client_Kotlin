@@ -38,6 +38,14 @@ interface CameraEncoder {
     fun stop()
 
     /**
+     * 송출 중 프리뷰 표시면을 교체하거나 해제한다(#72). null 이면 Preview use case 만 내리고
+     * ImageAnalysis 는 그대로 캡처를 계속한다 — 앱이 화면에서 사라져 프리뷰 SurfaceView 가
+     * 파괴되면 캡처 세션이 유휴 상태로 멈추는 문제(송출 정지 → 정체 오판)의 대응.
+     * 다시 표시면이 주어지면 Preview 를 새로 붙인다. 인코더 시작 전이면 no-op.
+     */
+    fun setPreviewView(previewView: PreviewView?)
+
+    /**
      * 활성 인코더의 목표 비트레이트만 동적 변경한다 (ABR 용).
      *
      * 비트레이트 외(해상도/fps/profile)는 건드리지 않는다 — SPS/PPS 가 다시 생성되지 않아

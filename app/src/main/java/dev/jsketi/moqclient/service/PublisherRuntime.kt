@@ -106,11 +106,24 @@ class PublisherRuntime(
 
     fun attachPreviewView(view: PreviewView) {
         previewView = view
+        // 송출 중이면 프리뷰만 다시 붙인다(#72) — 앱 복귀 시 캡처는 이미 계속되고 있다.
+        if (streamStarted) forwardPreviewToCamera(view)
     }
 
     fun detachPreviewView(view: PreviewView) {
         if (previewView === view) {
             previewView = null
+            // 앱이 화면에서 사라짐: 프리뷰 use case 만 내리고 캡처(ImageAnalysis)는 유지(#72).
+            // 프리뷰 SurfaceView 가 파괴된 채 남아 있으면 캡처 세션이 유휴로 멈춰 송출이 끊긴다.
+            if (streamStarted) forwardPreviewToCamera(null)
+        }
+    }
+
+    private fun forwardPreviewToCamera(view: PreviewView?) {
+        val scope = serviceScope ?: return
+        scope.launch(Dispatchers.Main.immediate) {
+            runCatching { cameraEncoder.setPreviewView(view) }
+                .onFailure { Log.w(TAG, "preview ${if (view == null) "detach" else "attach"} forward failed", it) }
         }
     }
 
