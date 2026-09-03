@@ -18,7 +18,9 @@ import kotlinx.coroutines.launch
  * 연속 매핑하고, 전송 계층 가중치(#68)에 반영한다. 손실이 나기 전에 비중을 옮기는 것이
  * 목적 — noq 기본 스케줄러는 손실(혼잡창 붕괴) 후에야 재분배한다(실측 6~12s 지연).
  *
- *  - 점수: 전파 [-72,-60]dBm 선형 + 링크 속도 [10,200]Mbps 선형, 둘 중 낮은 쪽(보수적).
+ *  - 점수: 전파 [-72,-60]dBm 선형 + 링크 속도(세션 최고치 대비 비율 [20%,60%] 선형), 둘 중 낮은
+ *    쪽(보수적). 링크 점수는 절대값이 아니라 최고치 대비라 대역(2.4/5GHz)에 무관하고, 경로가
+ *    바뀌면(재합류) 최고치를 초기화해 재접속 초기의 낮은 링크 속도 보고에 흔들리지 않는다(#72).
  *  - 연속성: 지수 평활(α) + 비대칭 변화율 제한(하강 빠르게, 상승 느리게 — 핑퐁 억제).
  *  - 결과 지표 보정: 전송 정지/저하 신호가 뜨면 점수를 즉시 0 으로(선행 지표 낙관 안전판).
  *  - 하한 5% = 경로에 묶이는 데이터 방지 + 경로 활성 유지, 상한 95% = LTE 예열 유지.
@@ -45,7 +47,7 @@ class PathWeightController(
         job = scope.launch { loop() }
         Log.i(
             TAG,
-            "controller start: rssi[$RSSI_FLOOR_DBM..$RSSI_CEIL_DBM]dBm·link[$LINK_FLOOR_MBPS..$LINK_CEIL_MBPS]Mbps " +
+            "controller start: rssi[$RSSI_FLOOR_DBM..$RSSI_CEIL_DBM]dBm·link[${(LINK_RATIO_ZERO * 100).toInt()}..${(LINK_RATIO_FULL * 100).toInt()}% of peak] " +
                 "→ wifi weight [$WEIGHT_FLOOR..$WEIGHT_CEIL]% (α=$EWMA_ALPHA, step -$DOWN_STEP_PCT/+$UP_STEP_PCT)"
         )
     }
@@ -61,6 +63,10 @@ class PathWeightController(
         var smoothed: Double? = null
         // 마지막으로 전송 계층에 적용한 Wi-Fi 가중치. -1 = 미적용(재적용 필요).
         var appliedWifi = -1
+        // 링크 속도 최고치(경로별). 경로가 바뀌면 초기화 — 재접속 직후 낮은 보고값이 만점 기준이 되어
+        // 점수 1.0 에서 시작하고, 이후 붕괴(최고치 대비 하락)만 잡는다.
+        var peakLinkMbps = 0.0
+        var peakPathId = -1L
         while (currentCoroutineContext().isActive) {
             delay(TICK_MS)
             if (!runtime.status.value.streamActive || !moqPublisher.isMultipathArmed()) {
@@ -81,9 +87,20 @@ class PathWeightController(
             val linkMbps = networkManager.wifiTxLinkMbps.value
 
             val rssiScore = (rssi - RSSI_FLOOR_DBM).toDouble() / (RSSI_CEIL_DBM - RSSI_FLOOR_DBM)
-            val linkScore = linkMbps
-                ?.let { (it - LINK_FLOOR_MBPS).toDouble() / (LINK_CEIL_MBPS - LINK_FLOOR_MBPS) }
-                ?: 1.0
+            if (primary.id != peakPathId) {
+                peakPathId = primary.id
+                peakLinkMbps = 0.0
+            }
+            val linkScore = if (linkMbps == null) {
+                1.0
+            } else {
+                peakLinkMbps = maxOf(linkMbps.toDouble(), peakLinkMbps * LINK_PEAK_DECAY)
+                when {
+                    linkMbps <= LINK_ABS_FLOOR_MBPS -> 0.0
+                    peakLinkMbps <= 0.0 -> 1.0
+                    else -> (linkMbps / peakLinkMbps - LINK_RATIO_ZERO) / (LINK_RATIO_FULL - LINK_RATIO_ZERO)
+                }
+            }
             var raw = minOf(rssiScore, linkScore).coerceIn(0.0, 1.0)
             // 결과 지표 보정: 정체·저하가 이미 관측되면 선행 지표와 무관하게 바닥으로.
             val status = runtime.status.value
@@ -123,14 +140,19 @@ class PathWeightController(
         // 신호 점수 구간: 복귀 판정 상단(-60)과 즉시 이탈 하단(-72)에 정렬 — 초기값, 현장 재조정 전제.
         private const val RSSI_FLOOR_DBM = -72
         private const val RSSI_CEIL_DBM = -60
-        // 상향 링크 속도 구간(초기값): 200Mbps 이상 만점, 10Mbps 이하 0점.
-        private const val LINK_FLOOR_MBPS = 10
-        private const val LINK_CEIL_MBPS = 200
-        private const val EWMA_ALPHA = 0.3
+        // 링크 속도 점수(#72): 세션 최고치 대비 60% 이상 만점, 20% 이하 0점. 최고치는 틱당 0.5%
+        // 감쇠(약 70초 반감)해 환경 변화에 서서히 따라간다. 절대 하한 이하는 무조건 0.
+        private const val LINK_RATIO_FULL = 0.6
+        private const val LINK_RATIO_ZERO = 0.2
+        private const val LINK_PEAK_DECAY = 0.995
+        private const val LINK_ABS_FLOOR_MBPS = 6
+        // 평활 계수(#72: 0.3→0.5) — 0903 실측에서 대역 통과 6초 동안 95→82 밖에 못 움직였다.
+        private const val EWMA_ALPHA = 0.5
         private const val WEIGHT_FLOOR = 5
         private const val WEIGHT_CEIL = 95
-        // 틱(0.5s)당 변화 상한(%p): 하강은 빠르게(열화 대응), 상승은 느리게(핑퐁 억제).
-        private const val DOWN_STEP_PCT = 10
+        // 틱(0.5s)당 변화 상한(%p): 하강은 빠르게(열화 대응, #72: 10→15 = 95→5 약 3초), 상승은
+        // 느리게(핑퐁 억제).
+        private const val DOWN_STEP_PCT = 15
         private const val UP_STEP_PCT = 3
     }
 }
