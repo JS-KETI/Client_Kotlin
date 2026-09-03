@@ -60,6 +60,12 @@ object ServiceLocator {
         )
     }
 
+    // 신호 연동 가중치 분배(#70) 활성 조건 — 컨트롤러 2개(가중치 산출·폐기 정책)가 같은 기준을 쓴다.
+    private val weightedDistribution: Boolean =
+        BuildConfig.MOQ_QUIC_BACKEND.equals("noq", ignoreCase = true) &&
+            BuildConfig.MOQ_MULTIPATH_SCHEDULING.equals("dual", ignoreCase = true) &&
+            BuildConfig.MOQ_PATH_WEIGHTS.isBlank()
+
     private fun createRuntime(appContext: Context): PublisherRuntime {
         // 빌드 식별(#59) — 로그 첫 줄로 남겨 어떤 변형의 로그인지 즉시 판별 가능하게 한다.
         Log.i(
@@ -118,6 +124,7 @@ object ServiceLocator {
             },
             multipathFailoverFactory = { runtime ->
                 MultipathFailoverController(
+                    weightedDistribution = weightedDistribution,
                     networkManager = networkManager,
                     moqPublisher = moqPublisher,
                     runtime = runtime,
@@ -135,9 +142,7 @@ object ServiceLocator {
                     runtime = runtime,
                     // 신호 연동 가중치(#70): noq dual 전용. 고정 가중치 검증 토글(#68) 빌드에서는
                     // 산출 주체 충돌을 막기 위해 비활성.
-                    enabled = BuildConfig.MOQ_QUIC_BACKEND.equals("noq", ignoreCase = true) &&
-                        BuildConfig.MOQ_MULTIPATH_SCHEDULING.equals("dual", ignoreCase = true) &&
-                        BuildConfig.MOQ_PATH_WEIGHTS.isBlank()
+                    enabled = weightedDistribution
                 )
             }
         )

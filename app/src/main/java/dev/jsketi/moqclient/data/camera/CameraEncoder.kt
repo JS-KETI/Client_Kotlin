@@ -32,10 +32,24 @@ interface CameraEncoder {
     /** 모든 keyframe + delta frame NAL 단위 emit. SharedFlow extraBufferCapacity 권장. */
     val encodedFrames: SharedFlow<EncodedFrame>
 
+    /**
+     * 인코더가 산출한 프레임 누적 수(소비·전송 여부 무관, 오버플로 드롭분 포함). 카메라가 실제로
+     * 돌고 있는지의 근거 — 3초간 증가가 없으면 "카메라 유휴"로, 망 정체와 구분한다(#72).
+     */
+    val encodedFrameCount: Long
+
     /** previewView 는 optional — null 이면 Preview 없이 ImageAnalysis 단독으로 bind 한다. */
     fun start(lifecycleOwner: LifecycleOwner, previewView: PreviewView?)
 
     fun stop()
+
+    /**
+     * 송출 중 프리뷰 표시면을 교체하거나 해제한다(#72). null 이면 Preview use case 만 내리고
+     * ImageAnalysis 는 그대로 캡처를 계속한다 — 앱이 화면에서 사라져 프리뷰 SurfaceView 가
+     * 파괴되면 캡처 세션이 유휴 상태로 멈추는 문제(송출 정지 → 정체 오판)의 대응.
+     * 다시 표시면이 주어지면 Preview 를 새로 붙인다. 인코더 시작 전이면 no-op.
+     */
+    fun setPreviewView(previewView: PreviewView?)
 
     /**
      * 활성 인코더의 목표 비트레이트만 동적 변경한다 (ABR 용).

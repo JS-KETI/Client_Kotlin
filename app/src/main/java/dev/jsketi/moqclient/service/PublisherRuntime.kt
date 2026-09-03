@@ -106,11 +106,24 @@ class PublisherRuntime(
 
     fun attachPreviewView(view: PreviewView) {
         previewView = view
+        // 송출 중이면 프리뷰만 다시 붙인다(#72) — 앱 복귀 시 캡처는 이미 계속되고 있다.
+        if (streamStarted) forwardPreviewToCamera(view)
     }
 
     fun detachPreviewView(view: PreviewView) {
         if (previewView === view) {
             previewView = null
+            // 앱이 화면에서 사라짐: 프리뷰 use case 만 내리고 캡처(ImageAnalysis)는 유지(#72).
+            // 프리뷰 SurfaceView 가 파괴된 채 남아 있으면 캡처 세션이 유휴로 멈춰 송출이 끊긴다.
+            if (streamStarted) forwardPreviewToCamera(null)
+        }
+    }
+
+    private fun forwardPreviewToCamera(view: PreviewView?) {
+        val scope = serviceScope ?: return
+        scope.launch(Dispatchers.Main.immediate) {
+            runCatching { cameraEncoder.setPreviewView(view) }
+                .onFailure { Log.w(TAG, "preview ${if (view == null) "detach" else "attach"} forward failed", it) }
         }
     }
 
@@ -652,6 +665,10 @@ class PublisherRuntime(
         var previousFailures = frameWriteFailures.get()
         var msSinceTelemetry = 0L
         var streamingBpsSamples = 0
+        // 카메라 유휴 판정(#72): 인코더 산출 프레임 수가 샘플 사이에 안 늘면 앱이 쓸 게 없는 것이지
+        // 망 정체가 아니다(앱 비가시로 프리뷰가 파괴되던 사례 — 신호 -39dBm 에서 유령 폐기).
+        var previousEncodedFrames = cameraEncoder.encodedFrameCount
+        var cameraIdlePrev = false
         var consecutiveLowSamples = 0
         // egress 기반 전환(txDegraded) 연속 저하 샘플 수. consecutiveLowSamples(600k 바닥)와 별개로
         // 더 높은 문턱(WIFI_EGRESS_FLEE_BPS)에서 capacity 부족을 센다.
@@ -887,6 +904,15 @@ class PublisherRuntime(
                     previousPacketsLost = packetsLostNow
                 }
 
+                val encodedFramesNow = cameraEncoder.encodedFrameCount
+                val cameraIdle = streaming && encodedFramesNow == previousEncodedFrames
+                previousEncodedFrames = encodedFramesNow
+                if (cameraIdle != cameraIdlePrev) {
+                    cameraIdlePrev = cameraIdle
+                    val verdict = if (cameraIdle) "stall/ABR/degraded 판정 보류" else "판정 재개"
+                    Log.i(TAG, "camera idle changed: $cameraIdle (encoder frames=$encodedFramesNow) — $verdict")
+                }
+
                 if (streaming) {
                     streamingBpsSamples += 1
                     val nowMs = SystemClock.elapsedRealtime()
@@ -900,6 +926,14 @@ class PublisherRuntime(
                     } else if (nowMs < migrationPredropUntilMs) {
                         // 선강하 HOLD: 전환 직후 cold-start 구간 — 바닥 비트레이트 유지, stall/ABR/degraded
                         // 판정 보류(transition 과 동일). cold 경로의 일시적 RTT/egress 저하를 오탐하지 않는다.
+                        consecutiveLowSamples = 0
+                        consecutiveDegradedSamples = 0
+                        hardStreak = 0
+                        abrUpHoldSamples = 0
+                    } else if (cameraIdle) {
+                        // 카메라 유휴(#72): 인코더가 프레임을 안 내면 egress·estimate 가 0/붕괴로 보여도
+                        // 망 정체가 아니다 — stall/ABR/degraded/hard 판정 모두 보류. 프레임이 재개되면
+                        // 다음 샘플부터 정상 판정.
                         consecutiveLowSamples = 0
                         consecutiveDegradedSamples = 0
                         hardStreak = 0

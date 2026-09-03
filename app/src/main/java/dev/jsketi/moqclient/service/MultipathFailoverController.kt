@@ -27,7 +27,9 @@ import kotlinx.coroutines.launch
  * Triggers (#51 ports the legacy quinn controller's preemptive signals — detection parity,
  * multipath execution):
  *  - wifi-lost: the Wi-Fi [android.net.Network] vanished (Wi-Fi off / AP gone) — fires at once.
- *  - wifi-weak: RSSI health dropped to WEAK (≤ -67 dBm) — preemptive flee before death.
+ *  - wifi-weak: RSSI health dropped to WEAK (≤ -67 dBm) — preemptive flee before death. With
+ *    weighted distribution active (#70) the flee waits until ≤ -72 dBm (#72); the band above is
+ *    handled by continuous weight shifting instead of a hard switch.
  *  - tx-stalled / tx-degraded: egress collapsed / link capacity cannot sustain the target
  *    bitrate. All quality signals are debounced upstream, so only a short
  *    [FLEE_CONFIRM_MS] re-check runs here (legacy STALL_FLEE_DEBOUNCE_MS parity).
@@ -50,6 +52,10 @@ class MultipathFailoverController(
     // 피어의 경로 대기 요청을 송신에 반영하지 않아 경로 사망 시 수신 전무 → 유휴 만료로
     // 세션까지 죽는다(0828 현장 · 0901 자택 실측).
     private val dualScheduling: Boolean = false,
+    // 신호 연동 가중치 분배(#70) 활성 여부. 활성이면 신호 기준 폐기를 즉시 이탈 임계(-72dBm)까지
+    // 늦춘다(#72, 2체계 §6-6 기준 완화) — -67~-72 구간은 비중 이동이 담당하고, 전송 정지·저하
+    // 판정은 그대로 안전망으로 남는다.
+    private val weightedDistribution: Boolean = false,
 ) {
 
     private var observeJob: Job? = null
@@ -77,6 +83,9 @@ class MultipathFailoverController(
     private data class Signals(
         val wifiAlive: Boolean,
         val wifiHealth: NetworkHealth,
+        // 신호가 즉시 이탈 임계(-72dBm) 이하인지 — 임계 통과 시점에만 바뀌는 이진값으로 두어
+        // (원시 RSSI 를 넣으면 0.5s 마다 재진입해 재합류 유지 대기가 취소된다) 흐름을 흔들지 않는다.
+        val wifiDiscard: Boolean,
         val connected: Boolean,
         val streamActive: Boolean,
         val txStalled: Boolean,
@@ -87,12 +96,14 @@ class MultipathFailoverController(
         combine(
             networkManager.wifiNetwork,
             networkManager.wifiHealth,
+            networkManager.wifiSignalDbm,
             moqPublisher.sessionState,
             runtime.status,
-        ) { wifi, wifiHealth, session, status ->
+        ) { wifi, wifiHealth, rssi, session, status ->
             Signals(
                 wifiAlive = wifi != null,
                 wifiHealth = wifiHealth,
+                wifiDiscard = rssi != null && rssi <= WIFI_WEAK_DISCARD_DBM,
                 connected = session == MoqSessionState.CONNECTED,
                 streamActive = status.streamActive,
                 txStalled = status.txStalled,
@@ -159,15 +170,22 @@ class MultipathFailoverController(
         runtime.notePathTransition(loadShifts = true)
     }
 
+    // 신호 기준 폐기: 가중치 분배가 켜져 있으면 -67(WEAK)이 아니라 -72(즉시 이탈 임계)에서만.
+    private fun wifiWeakDiscard(health: NetworkHealth, discard: Boolean): Boolean =
+        health == NetworkHealth.WEAK && (!weightedDistribution || discard)
+
     private fun qualityFleeReason(s: Signals): String? = when {
-        s.wifiHealth == NetworkHealth.WEAK -> "wifi-weak"
+        wifiWeakDiscard(s.wifiHealth, s.wifiDiscard) -> "wifi-weak"
         s.txStalled -> "tx-stalled"
         s.txDegraded -> "tx-degraded"
         else -> null
     }
 
     private fun qualityStillBad(reason: String): Boolean = when (reason) {
-        "wifi-weak" -> networkManager.wifiHealth.value == NetworkHealth.WEAK
+        "wifi-weak" -> wifiWeakDiscard(
+            networkManager.wifiHealth.value,
+            (networkManager.wifiSignalDbm.value ?: 0) <= WIFI_WEAK_DISCARD_DBM
+        )
         "tx-stalled" -> runtime.status.value.txStalled
         else -> runtime.status.value.txDegraded
     }
@@ -215,5 +233,8 @@ class MultipathFailoverController(
         private const val WIFI_READD_SUSTAIN_MS = 5_000L
         private const val READD_TRIES = 3
         private const val READD_RETRY_MS = 2_000L
+        // 가중치 분배 모드의 신호 기준 폐기 임계(#72) = 즉시 이탈 임계와 동일. 이 위 구간(-60~-72)은
+        // 비중 이동(5~95%)이 담당한다. 복귀 기준(-60dBm 5초 유지)은 그대로.
+        private const val WIFI_WEAK_DISCARD_DBM = -72
     }
 }
