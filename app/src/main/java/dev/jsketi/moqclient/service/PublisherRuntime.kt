@@ -954,7 +954,10 @@ class PublisherRuntime(
                         }
                         val currentTargetBps = ABR_BITRATE_LADDER_BPS[abrLadderIndex]
                         var abrDownshifted = false
-                        if (available != null && available < currentTargetBps &&
+                        // 하향 여유(#74): 전달량은 인코더 출력(≈목표)에 묶여 목표와 거의 같게 측정된다
+                        // (1.995M vs 2M). 여유 없이 비교하면 정상 링크에서도 잡음으로 하향(0903 세션 4회).
+                        if (available != null &&
+                            available < currentTargetBps * ABR_DOWN_MARGIN_PCT / 100 &&
                             abrLadderIndex < ABR_BITRATE_LADDER_BPS.lastIndex
                         ) {
                             // 다운시프트는 즉시(1 샘플) — 백로그가 쌓이기 전에 내린다.
@@ -1007,8 +1010,14 @@ class PublisherRuntime(
                         // (estimate) 기반 term 은 유지 — 새 경로가 실제로 못 받치면 정상 판정.
                         val inPredropRamp = migrationPredropUntilMs != 0L &&
                             nowMs < migrationPredropUntilMs + MIGRATION_PREDROP_RAMP_MS
+                        // 적체 조건(#74): egress 기반 정체는 실측 전달량이 송출량의 일정 비율 미만일 때만.
+                        // 화질 바닥(500k)에선 정상 링크도 egress<600k 라 (b)가 항상 참이 되어 절단이
+                        // 오발했다(0903 실측: write 464k/egress 481k, 손실 0, rtt 71 에서 STALL-CUT).
+                        val egressBacklog = egressBps != null &&
+                            egressBps < bps * TX_STALL_BACKLOG_RATIO_PCT / 100
                         val sendRateCollapsed = (estimateLow && !egressHigh) ||
-                            (!inPredropRamp && egressLow && bps >= egressBacklogWriteThreshold)
+                            (!inPredropRamp && egressLow && egressBacklog &&
+                                bps >= egressBacklogWriteThreshold)
                         val writeNearZero = bps <= TX_STALL_LOW_BPS_THRESHOLD
                         // 절단은 최후수단 — 같은 샘플에서 ABR 강하와 soft cut 이 동시에 발동하지 않게,
                         // 강하한 샘플은 not-low 취급해 낮춘 비트레이트가 한 샘플(3s) 효과를 낼
@@ -1236,6 +1245,10 @@ class PublisherRuntime(
         // QUIC estimated send rate 가 이 값 미만이면 정체. 인코더 2 Mbps 의 30% — 그 아래면
         // 백로그가 누적되기 시작한 지 한참이고 시청 품질은 이미 무너져 있다.
         private const val TX_STALL_SEND_RATE_BPS = 600_000L
+        // egress 기반 정체의 적체 조건(#74): 전달량 < 송출량 × 이 비율 일 때만 정체 후보.
+        private const val TX_STALL_BACKLOG_RATIO_PCT = 80L
+        // ABR 하향 여유(#74): 가용량 < 목표 × 이 비율 일 때만 하향.
+        private const val ABR_DOWN_MARGIN_PCT = 90L
 
         // egress 기반 전환(txDegraded) 문턱(bps). txStalled 의 600k 바닥보다 높게 잡아 "거의 죽음"이
         // 아니라 "영상 목표를 못 받침" 단계에서 Cellular 로 선제 전환한다(영상 풀타깃 ~2M 기준 capacity
