@@ -59,6 +59,13 @@ class MultipathFailoverController(
 ) {
 
     private var observeJob: Job? = null
+    private var runScope: CoroutineScope? = null
+
+    // Wi-Fi 재합류 대기·시도(#76). handle() 은 collectLatest 안에서 돌아 신호가 바뀔 때마다
+    // 취소·재진입되는데, LTE 단독 운행 중엔 LTE 응답 급등이 전송 품질 신호를 계속 뒤집어
+    // 5초 유지 대기가 끝없이 재시작됐다(0903 실측: Wi-Fi -39dBm 인데 복귀 불가). 재합류는
+    // 별도 작업으로 두고 Wi-Fi 존재·신호 조건이 깨질 때만 취소한다.
+    private var readdJob: Job? = null
 
     // 세션당 1회 래치. 세션이 끊기면(reconnect) 해제되어 새 세션에서 다시 무장한다.
     private val failoverLatch = AtomicBoolean(false)
@@ -70,13 +77,17 @@ class MultipathFailoverController(
             return
         }
         check(observeJob == null) { "MultipathFailoverController already started" }
+        runScope = scope
         observeJob = scope.launch { observe() }
         Log.i(TAG, "controller start")
     }
 
     fun stop() {
+        readdJob?.cancel()
+        readdJob = null
         observeJob?.cancel()
         observeJob = null
+        runScope = null
         Log.i(TAG, "controller stop")
     }
 
@@ -115,6 +126,7 @@ class MultipathFailoverController(
     private suspend fun handle(s: Signals) {
         if (!s.connected) {
             failoverLatch.set(false)
+            cancelReadd("disconnected")
             return
         }
         if (!s.streamActive) return
@@ -127,12 +139,21 @@ class MultipathFailoverController(
         if (primaryStat == null) {
             // 주(Wi-Fi) 경로 폐기 후 백업 단독 운행 중 — Wi-Fi 복귀 재합류(#46).
             // 복귀 조건은 신호가 충분히 강할 것(USABLE)뿐이고, 유지 확인은 재합류 직전에 한다(#62).
-            // 대기 중 신호가 흔들리면 collectLatest 가 취소·재진입시킨다.
-            if (s.wifiAlive && secondaryId != null && s.wifiHealth == NetworkHealth.USABLE) {
-                readdPrimaryPath(secondaryId)
+            // 대기는 별도 작업(#76): Wi-Fi 가 사라지거나 약해지면 취소하고, 그 밖의 신호 변화
+            // (LTE 쪽 전송 품질 등)에는 흔들리지 않는다.
+            val eligible = s.wifiAlive && secondaryId != null && s.wifiHealth == NetworkHealth.USABLE
+            if (eligible) {
+                if (readdJob?.isActive != true) {
+                    val scope = runScope ?: return
+                    readdJob = scope.launch { readdPrimaryPath(secondaryId) }
+                }
+            } else {
+                cancelReadd("wifi not eligible (alive=${s.wifiAlive} health=${s.wifiHealth})")
             }
             return
         }
+        // 주경로가 있으면 진행 중인 재합류 대기는 무의미하다.
+        cancelReadd("primary present")
         val primaryId = primaryStat.id
         if (secondaryId == null) return // 보조 경로 미개설 — 페일오버할 곳이 없다
 
@@ -190,10 +211,19 @@ class MultipathFailoverController(
         else -> runtime.status.value.txDegraded
     }
 
+    private fun cancelReadd(reason: String) {
+        val job = readdJob ?: return
+        if (job.isActive) {
+            job.cancel()
+            Log.i(TAG, "[readd] wait cancelled — $reason")
+        }
+        readdJob = null
+    }
+
     /**
      * Wi-Fi 복귀 재합류(#46): sustain 후 새 Wi-Fi 소켓으로 슬롯을 교체하고 주 포트로 경로를
-     * 다시 연 뒤, Wi-Fi=Available·셀룰러=Backup 역할로 되돌린다. Wi-Fi 가 다시 사라지면
-     * collectLatest 가 sustain/재시도 대기를 취소한다.
+     * 다시 연 뒤, Wi-Fi=Available·셀룰러=Backup 역할로 되돌린다. Wi-Fi 가 다시 사라지거나
+     * 약해지면 handle() 이 이 작업을 취소한다(#76) — 그 외 신호 변화에는 영향받지 않는다.
      */
     private suspend fun readdPrimaryPath(secondaryId: Long) {
         delay(WIFI_READD_SUSTAIN_MS)
