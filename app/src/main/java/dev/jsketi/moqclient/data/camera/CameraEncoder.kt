@@ -32,6 +32,12 @@ interface CameraEncoder {
     /** 모든 keyframe + delta frame NAL 단위 emit. SharedFlow extraBufferCapacity 권장. */
     val encodedFrames: SharedFlow<EncodedFrame>
 
+    /**
+     * 인코더가 산출한 프레임 누적 수(소비·전송 여부 무관, 오버플로 드롭분 포함). 카메라가 실제로
+     * 돌고 있는지의 근거 — 3초간 증가가 없으면 "카메라 유휴"로, 망 정체와 구분한다(#72).
+     */
+    val encodedFrameCount: Long
+
     /** previewView 는 optional — null 이면 Preview 없이 ImageAnalysis 단독으로 bind 한다. */
     fun start(lifecycleOwner: LifecycleOwner, previewView: PreviewView?)
 

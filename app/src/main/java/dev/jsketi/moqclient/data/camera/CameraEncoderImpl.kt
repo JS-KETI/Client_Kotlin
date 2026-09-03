@@ -88,6 +88,10 @@ class CameraEncoderImpl(
     // Counts encoder-output frames dropped on overflow (best-effort visibility; DROP_OLDEST drops
     // silently at the flow layer).
     private val encodedDropCount = AtomicLong(0)
+    // 인코더 산출 프레임 누적(#72) — 소비 여부와 무관하게 emit 시점에 센다.
+    private val encodedFrameCounter = AtomicLong(0)
+    override val encodedFrameCount: Long
+        get() = encodedFrameCounter.get()
 
     private val lifecycleLock = Any()
 
@@ -515,6 +519,7 @@ class CameraEncoderImpl(
         }
 
         if (stopping) return
+        encodedFrameCounter.incrementAndGet()
         // DROP_OLDEST keeps tryEmit() from ever failing, so a slow downstream consumer must NOT
         // crash the encoder. The !emitted branch is defensive; the counter gives drop visibility.
         val emitted = _encodedFrames.tryEmit(
